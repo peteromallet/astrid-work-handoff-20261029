@@ -1,0 +1,506 @@
+"""Launch orchestration for RunPod pods with RAM-tier and storage fallback."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from typing import Any
+
+from . import api
+from .api import _is_capacity_error, create_pod, find_gpu_type, get_network_volumes, start_pod
+from .config import RunPodConfig
+from .errors import AllocationUnknown, LaunchFailure, PostCreateHookFailure
+from .events import EventHooks, PodState, _emit_error, _emit_state
+from .pod import Pod
+from .storage import check_and_expand_storage, get_storage_volume_id
+
+logger = logging.getLogger("runpod_lifecycle.lifecycle")
+
+
+def _record_callback_failure(error: LaunchFailure, callback_error: Exception) -> None:
+    """Keep the lifecycle error authoritative when a notification hook fails."""
+    error.callback_error = callback_error
+    error.callback_diagnostic = f"{type(callback_error).__name__}: {callback_error}"
+    logger.warning(
+        "Lifecycle notification hook failed while reporting %s: %s",
+        type(error).__name__,
+        error.callback_diagnostic,
+    )
+
+
+async def _emit_error_preserving(
+    hooks: EventHooks,
+    error: LaunchFailure,
+    detail: dict[str, Any],
+) -> None:
+    try:
+        await _emit_error(hooks, error, detail)
+    except Exception as callback_error:
+        _record_callback_failure(error, callback_error)
+
+
+def _resolve_public_key_string(config: RunPodConfig) -> str | None:
+    if config.ssh_public_key:
+        return config.ssh_public_key
+
+    if config.ssh_public_key_path:
+        expanded_path = os.path.expanduser(config.ssh_public_key_path)
+        try:
+            return open(expanded_path, "r", encoding="utf-8").read().strip()
+        except OSError as exc:
+            logger.warning("Could not read SSH public key from %s: %s", expanded_path, exc)
+
+    logger.warning("No SSH public key configured; pod access may require password auth")
+    return None
+
+
+def _build_ram_tiers(config: RunPodConfig) -> list[int]:
+    if not config.ram_tiers_enabled:
+        return [config.min_memory_gb]
+
+    ram_tiers = [tier for tier in config.ram_tiers if tier >= config.min_memory_gb]
+    return ram_tiers or [config.min_memory_gb]
+
+
+async def _resolve_storage_targets(config: RunPodConfig) -> list[tuple[str | None, str | None]]:
+    raw_targets: list[str] = []
+    for storage_name in [config.storage_name, *config.storage_volumes]:
+        if storage_name and storage_name not in raw_targets:
+            raw_targets.append(storage_name)
+
+    if not raw_targets:
+        return [(None, None)]
+
+    resolved_targets: list[tuple[str | None, str | None]] = []
+    for storage_name in raw_targets:
+        volume_id = await asyncio.to_thread(get_storage_volume_id, config.api_key, storage_name)
+        if volume_id:
+            resolved_targets.append((storage_name, volume_id))
+        else:
+            logger.warning("Storage '%s' not found, skipping", storage_name)
+
+    return resolved_targets
+
+
+class _GpuCandidateFailure(Exception):
+    """Internal: signals one candidate GPU exhausted its RAM x storage matrix."""
+
+    def __init__(
+        self,
+        gpu_type: str,
+        reason: str,
+        attempted_pairs: list[dict[str, Any]],
+        last_error: Exception | None,
+    ) -> None:
+        super().__init__(reason)
+        self.gpu_type = gpu_type
+        self.reason = reason
+        self.attempted_pairs = attempted_pairs
+        self.last_error = last_error
+
+
+async def _try_launch_one_gpu(
+    config: RunPodConfig,
+    gpu_type: str,
+    *,
+    pod_name: str,
+    hooks: EventHooks,
+    public_key_string: str | None,
+    ram_tiers: list[int],
+    storage_targets: list[tuple[str | None, str | None]],
+    expanded_storage_ids: set[str],
+) -> Pod:
+    """Resolve a single GPU type and walk the RAM-tier x storage matrix.
+
+    Returns a launched Pod on success, otherwise raises ``_GpuCandidateFailure``
+    summarising the per-pair errors for this candidate.
+    """
+    gpu_info = await asyncio.to_thread(find_gpu_type, gpu_type, config.api_key)
+    if not gpu_info:
+        raise _GpuCandidateFailure(
+            gpu_type=gpu_type,
+            reason=f"{gpu_type}: GPU type could not be resolved",
+            attempted_pairs=[],
+            last_error=None,
+        )
+
+    attempted_pairs: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+
+    for ram_tier in ram_tiers:
+        for storage_name, storage_volume_id in storage_targets:
+            attempted_pairs.append(
+                {
+                    "gpu_type": gpu_type,
+                    "ram_tier": ram_tier,
+                    "storage_name": storage_name,
+                    "storage_volume_id": storage_volume_id,
+                }
+            )
+
+            if storage_volume_id and not config.attach_only and storage_volume_id not in expanded_storage_ids:
+                await asyncio.to_thread(
+                    check_and_expand_storage,
+                    config.api_key,
+                    storage_volume_id,
+                    50,
+                    storage_name,
+                    config.disk_size_gb,
+                )
+                expanded_storage_ids.add(storage_volume_id)
+
+            try:
+                pod_details = await asyncio.to_thread(
+                    create_pod,
+                    api_key=config.api_key,
+                    gpu_type_id=gpu_info["id"],
+                    image_name=config.worker_image,
+                    name=pod_name,
+                    network_volume_id=storage_volume_id,
+                    volume_mount_path=config.volume_mount_path,
+                    disk_in_gb=config.disk_size_gb,
+                    container_disk_in_gb=config.container_disk_gb,
+                    public_key_string=public_key_string,
+                    env_vars=config.env_vars,
+                    min_vcpu_count=config.min_vcpu_count,
+                    min_memory_in_gb=ram_tier,
+                    template_id=config.template_id,
+                    ports=config.ports,
+                    **({"transport": config.transport, "https_token": config.https_token}
+                       if config.transport == "https" else {}),
+                    **({"engine_startup": config.engine_startup} if config.engine_startup is not None else {}),
+                    allowed_cuda_versions=config.allowed_cuda_versions or None,
+                    **({"min_cuda_version": config.min_cuda_version} if config.min_cuda_version else {}),
+                )
+            except Exception as exc:
+                # Only a definite capacity rejection permits another create.
+                # Timeouts, transport errors, and malformed responses can mean
+                # the provider allocated a pod without returning its ID.
+                if not isinstance(exc, (TimeoutError, ConnectionError, OSError)) and _is_capacity_error(exc):
+                    last_error = exc
+                    logger.warning("Capacity rejected create for gpu=%s storage=%s ram=%sGB: %s", gpu_type, storage_name, ram_tier, exc)
+                    continue
+                raise AllocationUnknown(
+                    pod_name, gpu_type, ram_tier, storage_name, storage_volume_id,
+                ) from exc
+
+            if not isinstance(pod_details, dict) or not pod_details.get("id"):
+                raise AllocationUnknown(
+                    pod_name, gpu_type, ram_tier, storage_name, storage_volume_id,
+                )
+
+            pod = Pod(
+                pod_id=pod_details["id"],
+                name=pod_name,
+                config=config,
+                hooks=hooks,
+                ram_tier=ram_tier,
+                storage_volume=storage_volume_id,
+            )
+            pod._gpu_type = gpu_type
+            pod._allowed_cuda_versions = config.allowed_cuda_versions
+            pod._storage_name = storage_name
+            pod.claim_id = pod_details.get("claim_id")
+            pod._engine_state_dir = pod_details.get("state_dir")
+            try:
+                await _emit_state(
+                    hooks,
+                    pod.id,
+                    PodState.PROVISIONING,
+                    {
+                        "name": pod_name,
+                        "gpu_type": gpu_type,
+                        "ram_tier": ram_tier,
+                        "storage_name": storage_name,
+                        "storage_volume_id": storage_volume_id,
+                        "pod_details": pod_details,
+                    },
+                )
+            except Exception as callback_error:
+                raise PostCreateHookFailure(pod.id, callback_error) from callback_error
+            return pod
+
+    reason = (
+        f"{gpu_type}: failed RAM tiers {ram_tiers} across storages "
+        f"{[pair['storage_name'] for pair in attempted_pairs] or [None]}"
+    )
+    if last_error is not None:
+        reason = f"{reason} ({last_error})"
+    raise _GpuCandidateFailure(
+        gpu_type=gpu_type,
+        reason=reason,
+        attempted_pairs=attempted_pairs,
+        last_error=last_error,
+    )
+
+
+async def launch(
+    config: RunPodConfig,
+    *,
+    name: str | None = None,
+    hooks: EventHooks | None = None,
+) -> Pod:
+    hooks = hooks or EventHooks()
+    pod_name = name or f"{config.name_prefix}-{int(time.time())}"
+
+    candidates = config.gpu_type_candidates
+    if not candidates:
+        error = LaunchFailure("No GPU types configured for launch")
+        await _emit_error(hooks, error, {"name": pod_name})
+        raise error
+
+    await _emit_state(hooks, None, PodState.PROVISIONING, {"name": pod_name})
+
+    public_key_string = _resolve_public_key_string(config)
+    ram_tiers = _build_ram_tiers(config)
+    storage_targets = await _resolve_storage_targets(config)
+
+    input_storages: list[str] = []
+    for value in [config.storage_name, *config.storage_volumes]:
+        if value and value not in input_storages:
+            input_storages.append(value)
+    if (input_storages and not storage_targets) or (config.attach_only and not input_storages):
+        error = LaunchFailure(
+            f"Attach-only requires a resolved existing storage volume: {', '.join(input_storages)}"
+            if config.attach_only else
+            f"Configured storage volumes could not be resolved: {', '.join(input_storages)}"
+        )
+        await _emit_error(
+            hooks,
+            error,
+            {"storages": input_storages, "name": pod_name},
+        )
+        raise error
+
+    expanded_storage_ids: set[str] = set()
+    candidate_failures: list[_GpuCandidateFailure] = []
+
+    for gpu_type in candidates:
+        await _emit_state(
+            hooks,
+            None,
+            PodState.PROVISIONING,
+            {"name": pod_name, "gpu_type": gpu_type},
+        )
+        try:
+            return await _try_launch_one_gpu(
+                config,
+                gpu_type,
+                pod_name=pod_name,
+                hooks=hooks,
+                public_key_string=public_key_string,
+                ram_tiers=ram_tiers,
+                storage_targets=storage_targets,
+                expanded_storage_ids=expanded_storage_ids,
+            )
+        except AllocationUnknown as error:
+            await _emit_error_preserving(hooks, error, {
+                "name": error.request_name,
+                "status": error.status,
+                "reconciliation_required": True,
+                "gpu_type": error.gpu_type,
+                "ram_tier": error.ram_tier,
+                "storage_name": error.storage_name,
+                "storage_volume_id": error.storage_volume_id,
+            })
+            raise
+        except _GpuCandidateFailure as failure:
+            candidate_failures.append(failure)
+            continue
+
+    reasons = "; ".join(failure.reason for failure in candidate_failures) or "no attempts made"
+    aggregated_pairs = [pair for failure in candidate_failures for pair in failure.attempted_pairs]
+    last_underlying = next(
+        (failure.last_error for failure in reversed(candidate_failures) if failure.last_error),
+        None,
+    )
+
+    error = LaunchFailure(
+        f"Failed to launch pod across GPU candidates {list(candidates)}: {reasons}"
+    )
+    await _emit_error(
+        hooks,
+        error,
+        {
+            "name": pod_name,
+            "gpu_candidates": list(candidates),
+            "ram_tiers": ram_tiers,
+            "attempted_pairs": aggregated_pairs,
+            "candidate_reasons": [failure.reason for failure in candidate_failures],
+            "last_error": str(last_underlying) if last_underlying else None,
+        },
+    )
+    if last_underlying is not None:
+        raise error from last_underlying
+    raise error
+
+
+async def launch_when_available(
+    config: RunPodConfig,
+    *,
+    name: str | None = None,
+    hooks: EventHooks | None = None,
+    max_wait_sec: int = 900,
+    retry_interval_sec: int = 30,
+) -> Pod:
+    """Keep trying to claim the requested launch matrix until capacity appears.
+
+    This is for cost-sensitive jobs that should wait for a specific cheaper GPU
+    and attached network volume instead of immediately escalating to a more
+    expensive candidate. It retries the exact same ``launch`` request until it
+    succeeds or the bounded wait expires.
+    """
+    if max_wait_sec <= 0:
+        return await launch(config, name=name, hooks=hooks)
+    if retry_interval_sec <= 0:
+        raise ValueError("retry_interval_sec must be positive")
+
+    hooks = hooks or EventHooks()
+    deadline = time.monotonic() + max_wait_sec
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await launch(config, name=name, hooks=hooks)
+        except AllocationUnknown:
+            raise
+        except LaunchFailure as exc:
+            if not exc.retryable:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await _emit_error(
+                    hooks,
+                    exc,
+                    {
+                        "name": name,
+                        "attempts": attempt,
+                        "max_wait_sec": max_wait_sec,
+                        "retry_interval_sec": retry_interval_sec,
+                    },
+                )
+                raise LaunchFailure(
+                    f"Capacity did not become available after {attempt} attempts "
+                    f"over {max_wait_sec}s: {exc}"
+                ) from exc
+            sleep_for = min(retry_interval_sec, max(0.0, remaining))
+            logger.warning(
+                "Launch attempt %s failed; retrying in %.1fs before escalating or failing: %s",
+                attempt,
+                sleep_for,
+                exc,
+            )
+            await _emit_state(
+                hooks,
+                None,
+                PodState.PROVISIONING,
+                {
+                    "name": name,
+                    "attempt": attempt,
+                    "retry_in_sec": sleep_for,
+                    "max_wait_sec": max_wait_sec,
+                    "last_error": str(exc),
+                },
+            )
+            await asyncio.sleep(sleep_for)
+
+
+async def resume_when_available(
+    pod: Pod,
+    *,
+    max_wait_sec: int = 900,
+    retry_interval_sec: int = 30,
+    hooks: EventHooks | None = None,
+) -> Pod:
+    """Resume an existing stopped Pod once its original host has capacity.
+
+    Unlike :func:`launch_when_available`, this never creates a replacement Pod
+    and never changes the Pod's GPU or storage. It retries the provider's
+    start request only for capacity failures, so the Pod's local ``/workspace``
+    volume remains the one being resumed.
+    """
+    if max_wait_sec < 0:
+        raise ValueError("max_wait_sec must be non-negative")
+    if retry_interval_sec <= 0:
+        raise ValueError("retry_interval_sec must be positive")
+
+    hooks = hooks or pod.hooks
+    deadline = time.monotonic() + max_wait_sec
+    attempt = 0
+
+    while True:
+        status = await pod.status()
+        desired_status = status.get("desired_status") if status else None
+        if desired_status == "RUNNING":
+            return pod
+        if desired_status in {"FAILED", "TERMINATED"}:
+            error = LaunchFailure(
+                f"Pod {pod.id} cannot be resumed from terminal state {desired_status}"
+            )
+            await _emit_error(hooks, error, {"pod_id": pod.id, "status": status or {}})
+            raise error
+
+        attempt += 1
+        try:
+            await asyncio.to_thread(start_pod, pod.id, pod.config.api_key)
+            await _emit_state(
+                hooks,
+                pod.id,
+                PodState.STARTING,
+                {"attempt": attempt, "pod_id": pod.id},
+            )
+            return pod
+        except Exception as exc:
+            if not api._is_capacity_error(exc):
+                error = LaunchFailure(f"Failed to resume pod {pod.id}: {exc}")
+                await _emit_error(hooks, error, {"pod_id": pod.id, "attempt": attempt})
+                raise error from exc
+
+            remaining = deadline - time.monotonic()
+            if max_wait_sec <= 0 or remaining <= 0:
+                error = LaunchFailure(
+                    f"Capacity did not become available to resume pod {pod.id} "
+                    f"after {attempt} attempts over {max_wait_sec}s: {exc}"
+                )
+                await _emit_error(
+                    hooks,
+                    error,
+                    {
+                        "pod_id": pod.id,
+                        "attempts": attempt,
+                        "max_wait_sec": max_wait_sec,
+                        "retry_interval_sec": retry_interval_sec,
+                    },
+                )
+                raise error from exc
+
+            sleep_for = min(retry_interval_sec, max(0.0, remaining))
+            logger.warning(
+                "Resume attempt %s failed; retrying in %.1fs before failing: %s",
+                attempt,
+                sleep_for,
+                exc,
+            )
+            await _emit_state(
+                hooks,
+                pod.id,
+                PodState.STARTING,
+                {
+                    "attempt": attempt,
+                    "retry_in_sec": sleep_for,
+                    "max_wait_sec": max_wait_sec,
+                    "last_error": str(exc),
+                },
+            )
+            await asyncio.sleep(sleep_for)
+
+
+__all__ = [
+    "find_gpu_type",
+    "get_network_volumes",
+    "launch",
+    "launch_when_available",
+    "resume_when_available",
+]
