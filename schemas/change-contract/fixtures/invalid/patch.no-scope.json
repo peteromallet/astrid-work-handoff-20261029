@@ -1,0 +1,22 @@
+{
+  "$provenance": "invalid on purpose: scope is required",
+  "instance": {
+    "version": 8,
+    "source": "haus.astrid.threejs-live-editor",
+    "operations": [
+      {
+        "op": "clip.update",
+        "target": "a-rocket",
+        "payload": {
+          "mode": "merge",
+          "app": {
+            "liveScene": {
+              "id": "scene-1"
+            }
+          }
+        },
+        "order": 0
+      }
+    ]
+  }
+}
