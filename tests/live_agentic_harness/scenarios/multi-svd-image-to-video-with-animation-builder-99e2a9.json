@@ -1,0 +1,41 @@
+{
+ "id": "multi-svd-image-to-video-with-animation-builder-99e2a9",
+ "query": "The generated video has severe flickering and jittery motion, with frames occasionally going black. What in the workflow could be causing this?",
+ "workflow_path": "tests/fixtures/live_agentic_corpus/corpus/99e2a967a579197f.json",
+ "apply": true,
+ "network": true,
+ "timeout": 420,
+ "assessment": {
+  "expect_graph_changed": true
+ },
+ "desired": {
+  "outcome": "Diagnose and fix.",
+  "quality": "Diagnosis identifies the correct root cause; fix actionable and directionally correct.",
+  "alternatives_ok": true
+ },
+ "hint_level": "none",
+ "_tags": {
+  "modality": "multi",
+  "query_type": "edit",
+  "abstraction": "med",
+  "complexity": "high",
+  "manifest_complexity": 4,
+  "task_type": "animation",
+  "requires_custom_nodes": true,
+  "techniques": [
+   "image-to-video",
+   "stable-video-diffusion",
+   "animation",
+   "svd",
+   "video-generation",
+   "conditioning",
+   "mtb"
+  ],
+  "source_workflow_id": "99e2a967a579197f",
+  "source": "external_workflows/corpus",
+  "staged": true,
+  "authored_by": "deepseek-v4-flash",
+  "author_rationale": "Specific symptom related to SVD video stability requires analyzing frame conditioning and noise settings, fitting the diagnose type.",
+  "solution_confirmed": false
+ }
+}

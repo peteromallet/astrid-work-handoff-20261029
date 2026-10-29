@@ -1,0 +1,14 @@
+{
+  "id": "hotshot-16-frames-agent-edit",
+  "query": "Switch to generating 16 frames with Hotshot",
+  "workflow_path": "tests/fixtures/agent_edit/hotshot_base_unsaved_workflow_4.json",
+  "apply": false,
+  "network": true,
+  "timeout": 300,
+  "assessment": {
+    "expect_graph_changed": false,
+    "allow_safe_refusal_outcome_kinds": ["requires_custom_nodes"],
+    "expected_no_candidate_reason": "The fixture graph is a plain SDXL image-to-image pipeline (CheckpointLoaderSimple/KSampler/VAEEncode) with no frame-count widget and no video output, and no Hotshot generation class exists anywhere in the authoritative object_info index (declared-family-prefix lookups return an empty result set). The query deliberately demands an absent tool; the typed terminal for a proven named-schema absence is a requires_custom_nodes refusal, not a generic clarify.",
+    "expected_no_candidate_absent_classes": ["Hotshot"]
+  }
+}

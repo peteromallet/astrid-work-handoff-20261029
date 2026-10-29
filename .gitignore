@@ -1,0 +1,85 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+.DS_Store
+*.pyc
+
+# Generated indexes and runtime artifacts
+.coverage
+coverage.xml
+.object_info.lock
+.object_info.mirror
+workflow_index.json
+external_workflow_index.json
+node_index.json
+out/
+/output/
+temp/
+/input/
+/input/.DS_Store
+
+# Large local runtime/vendor checkouts
+/recipes/
+/workflows/
+/vendor/ComfyUI/
+/vendor/workflow_templates/
+/vendor/external_workflows/
+/external_workflows/
+/custom_nodes/
+/user/
+
+# Tool working directories
+.agents/
+.claude/
+.desloppify/
+.megaplan/*
+!.megaplan/briefs/
+.megaplan/briefs/*
+!.megaplan/briefs/pristine-agent-architecture/
+.megaplan/briefs/pristine-agent-architecture/*
+!.megaplan/briefs/pristine-agent-architecture/**
+!.megaplan/briefs/messaging-boundary-cleanup.md
+docs/megaplan_chains/**/.megaplan/
+*.patch
+
+# Agent task briefs and prompts — historical scratchpads, not project docs
+docs/megaplan_briefs/
+docs/subagent_prompts/
+docs/megaplan_chains/node_resolution_epic/evidence/object_info_*.json
+docs/local_agent_text_to_graph_e2e.md
+.env
+.env.*
+!.env.example
+astrid.env
+this.env
+_debug_*.py
+_fix_t6.py
+_regen_templates.py
+finalize.json
+install.log
+.hypothesis/
+.tmp/
+node_modules/
+*.pid
+*.zip
+comfyui_*.png
+comfyui_screenshot*.png
+comfyui_panel_open*.png
+agent_edit_e2e.mjs
+local_env.sh
+
+# e2e test tier — isolated dependency management
+tests/e2e/node_modules/
+tests/e2e/playwright-report/
+tests/e2e/test-results/
+test-results/
+
+# Generated cache-busted web assets
+vibecomfy/comfy_nodes/web_dist/
+
+# Live agentic watchdog run artifacts (logs, backups, baselines, codex outputs)
+.watchdog-runs/
+.venv
+external_workflows

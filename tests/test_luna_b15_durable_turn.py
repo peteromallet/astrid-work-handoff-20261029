@@ -1,0 +1,901 @@
+"""Focused B15 durability tests for typed evidence and response publication."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from vibecomfy.comfy_nodes.agent import session as S
+
+
+def _allocation(tmp_path: Path, *, key: str = "retry-key") -> tuple[dict, S.TurnAllocation]:
+    request = {"task": "inspect", "idempotency_key": key}
+    allocation = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload=request,
+        idempotency_key=key,
+    )
+    allocation.turn_dir.mkdir(parents=True, exist_ok=True)
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps(request), encoding="utf-8"
+    )
+    return request, allocation
+
+
+def _record(allocation: S.TurnAllocation, response: dict[str, object]) -> None:
+    S.record_idempotent_response(
+        session_root=allocation.session_dir.parent,
+        session_id=allocation.context.session_id,
+        scope="edit",
+        idempotency_key=allocation.context.idempotency_key,
+        request_hash=allocation.request_hash,
+        response=response,
+        response_path=allocation.turn_dir / "response.json",
+        operation="edit",
+        turn_id=allocation.context.turn_id,
+    )
+
+
+def test_publication_recovers_when_state_cache_is_missing(tmp_path: Path) -> None:
+    request, allocation = _allocation(tmp_path)
+    response = {"ok": True, "message": "authoritative"}
+    _record(allocation, response)
+
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    replay = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload=request,
+        idempotency_key="retry-key",
+    )
+
+    assert replay.context.turn_id == allocation.context.turn_id
+    assert replay.replay is not None
+    assert replay.replay.response == response
+    assert (allocation.session_dir / S.STATE_FILE_NAME).is_file()
+
+
+def test_corrupt_state_refuses_turn_allocation(tmp_path: Path) -> None:
+    session_dir = tmp_path / "b15-session"
+    session_dir.mkdir()
+    (session_dir / S.STATE_FILE_NAME).write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            request_payload={"task": "must not mutate"},
+        )
+    assert exc_info.value.status == "corrupt"
+    assert not (session_dir / "turns").exists()
+
+
+def test_publication_recovers_after_state_write_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, allocation = _allocation(tmp_path)
+    original_write_state = S.write_state_atomic
+    failed = False
+
+    def fail_once(session_dir: Path, state: dict) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("crash after publication")
+        original_write_state(session_dir, state)
+
+    monkeypatch.setattr(S, "write_state_atomic", fail_once)
+    with pytest.raises(OSError, match="crash after publication"):
+        _record(allocation, {"ok": True, "message": "recover me"})
+    monkeypatch.setattr(S, "write_state_atomic", original_write_state)
+
+    replay = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload={"task": "inspect", "idempotency_key": "retry-key"},
+        idempotency_key="retry-key",
+    )
+    assert replay.replay is not None
+    assert replay.replay.response["message"] == "recover me"
+    assert replay.context.turn_id == allocation.context.turn_id
+
+
+def test_publication_recovers_after_response_projection_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request, allocation = _allocation(tmp_path)
+    original_write_response = S._write_response_atomic
+    failed = False
+
+    def fail_once(response_path: Path, response: dict) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("crash publishing projection")
+        original_write_response(response_path, response)
+
+    monkeypatch.setattr(S, "_write_response_atomic", fail_once)
+    with pytest.raises(OSError, match="crash publishing projection"):
+        _record(allocation, {"ok": True, "message": "recover projection"})
+    monkeypatch.setattr(S, "_write_response_atomic", original_write_response)
+
+    replay = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload=request,
+        idempotency_key="retry-key",
+    )
+    assert replay.replay is not None
+    assert replay.replay.response["message"] == "recover projection"
+    assert json.loads((allocation.turn_dir / "response.json").read_text())["message"] == "recover projection"
+
+
+def test_corrupt_publication_fails_closed_and_cannot_fork(tmp_path: Path) -> None:
+    request, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "do not fork"})
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            request_payload=request,
+            idempotency_key="retry-key",
+        )
+    assert exc_info.value.status == "corrupt"
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_missing_publication_for_state_key_fails_closed(tmp_path: Path) -> None:
+    request, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "must not trust projection"})
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            request_payload=request,
+            idempotency_key="retry-key",
+        )
+
+    assert exc_info.value.status == "unreadable"
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.record_idempotent_response(
+            session_root=tmp_path,
+            session_id="b15-session",
+            scope="edit",
+            idempotency_key="retry-key",
+            request_hash=allocation.request_hash,
+            response={"ok": True, "message": "must not win"},
+            response_path=allocation.turn_dir / "response.json",
+            operation="edit",
+            turn_id=allocation.context.turn_id,
+        )
+    assert exc_info.value.status == "unreadable"
+
+
+@pytest.mark.parametrize("reader_name", ["read_session_chat", "read_session_json"])
+def test_public_readers_reject_deleted_publication_with_valid_projection(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    request, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "authoritative"})
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    reader = {
+        "read_session_chat": read_session_chat,
+        "read_session_json": read_session_json,
+    }[reader_name]
+    with pytest.raises(S.DurableReadError) as exc_info:
+        reader(tmp_path, "b15-session")
+    assert exc_info.value.status == "unreadable"
+    assert json.loads((allocation.turn_dir / "response.json").read_text())["message"] == (
+        "authoritative"
+    )
+    assert request["idempotency_key"] == "retry-key"
+
+
+@pytest.mark.parametrize("reader_name", ["read_session_chat", "read_session_json"])
+def test_public_readers_reconcile_tampered_chat_from_valid_publication(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "immutable answer"})
+    (allocation.turn_dir / "chat.json").write_text(
+        json.dumps(
+            {
+                "session_id": "b15-session",
+                "turn_id": allocation.context.turn_id,
+                "messages": [
+                    {"role": "user", "text": "inspect", "turn_id": allocation.context.turn_id},
+                    {
+                        "role": "agent",
+                        "text": "tampered",
+                        "turn_id": allocation.context.turn_id,
+                        "outcome": {"kind": "tampered"},
+                        "change_details": {"secret": "tampered"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reader = {
+        "read_session_chat": read_session_chat,
+        "read_session_json": read_session_json,
+    }[reader_name]
+    result = reader(tmp_path, "b15-session")
+    assert result["messages"][-1]["text"] == "immutable answer"
+    repaired = json.loads((allocation.turn_dir / "chat.json").read_text())
+    assert repaired["messages"][-1]["text"] == "immutable answer"
+    assert repaired["messages"][-1].get("outcome", {}).get("kind") != "tampered"
+    assert repaired["messages"][-1].get("change_details", {}).get("secret") != "tampered"
+
+
+@pytest.mark.parametrize("reader_name", ["read_session_chat", "read_session_json"])
+def test_public_readers_reject_corrupt_publication_even_with_valid_projections(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "must fail closed"})
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).write_text(
+        "{broken", encoding="utf-8"
+    )
+
+    reader = {
+        "read_session_chat": read_session_chat,
+        "read_session_json": read_session_json,
+    }[reader_name]
+    with pytest.raises(S.DurableReadError) as exc_info:
+        reader(tmp_path, "b15-session")
+    assert exc_info.value.status == "corrupt"
+
+
+def test_public_readers_preserve_non_keyed_legacy_response_fallback(
+    tmp_path: Path,
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import (
+        _latest_session_candidate_payload,
+        read_session_chat,
+    )
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    allocation = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="legacy-session",
+        request_payload={"task": "legacy task"},
+    )
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps({"task": "legacy task"}), encoding="utf-8"
+    )
+    (allocation.turn_dir / "response.json").write_text(
+        json.dumps({"ok": True, "message": "legacy response"}), encoding="utf-8"
+    )
+
+    chat = read_session_chat(tmp_path, "legacy-session")
+    detail = read_session_json(tmp_path, "legacy-session")
+    records = list(S.iter_turn_records(tmp_path, "legacy-session"))
+    latest = _latest_session_candidate_payload(allocation.session_dir, ["0001"])
+    loaded = S._load_response(str(allocation.turn_dir / "response.json"))
+
+    assert chat["messages"][-1]["text"] == "legacy response"
+    assert detail["messages"][-1]["text"] == "legacy response"
+    assert records[0].summary == "legacy response"
+    assert latest is None
+    assert loaded is not None
+    assert loaded["message"] == "legacy response"
+
+
+@pytest.mark.parametrize("reader_name", ["chat", "detail", "list", "latest"])
+def test_all_readers_fail_closed_after_state_and_publication_loss(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import (
+        _latest_session_candidate_payload,
+        read_session_chat,
+    )
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    _, allocation = _allocation(tmp_path)
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps({"task": "durable request", "idempotency_key": "retry-key"}),
+        encoding="utf-8",
+    )
+    _record(allocation, {"ok": True, "message": "projection must not win"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        if reader_name == "chat":
+            read_session_chat(tmp_path, "b15-session")
+        elif reader_name == "detail":
+            read_session_json(tmp_path, "b15-session")
+        elif reader_name == "list":
+            list(S.iter_turn_records(tmp_path, "b15-session"))
+        else:
+            _latest_session_candidate_payload(allocation.session_dir, ["0001"])
+    assert exc_info.value.status == "unreadable"
+
+
+def test_latest_candidate_preserves_valid_publication_after_state_cache_loss(
+    tmp_path: Path,
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import _latest_session_candidate_payload
+
+    _, allocation = _allocation(tmp_path)
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps({"task": "candidate", "idempotency_key": "retry-key"}),
+        encoding="utf-8",
+    )
+    _record(
+        allocation,
+        {
+            "ok": True,
+            "message": "published candidate",
+            "graph": {"nodes": [], "links": []},
+            "outcome": {"kind": "candidate"},
+        },
+    )
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+
+    candidate = _latest_session_candidate_payload(allocation.session_dir, ["0001"])
+    assert candidate is not None
+    assert candidate["message"] == "published candidate"
+    assert candidate["turn_state"] == "candidate"
+
+
+@pytest.mark.parametrize("reader_name", ["chat", "detail", "list"])
+def test_publication_remains_authority_for_all_readers_after_state_cache_loss(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    _, allocation = _allocation(tmp_path)
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps({"task": "authoritative", "idempotency_key": "retry-key"}),
+        encoding="utf-8",
+    )
+    _record(
+        allocation,
+        {
+            "ok": True,
+            "message": "publication answer",
+            "graph": {"nodes": [], "links": []},
+            "outcome": {"kind": "candidate"},
+        },
+    )
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / "response.json").write_text(
+        json.dumps({"ok": True, "message": "tampered projection"}),
+        encoding="utf-8",
+    )
+
+    if reader_name == "chat":
+        result = read_session_chat(tmp_path, "b15-session")
+        assert result["messages"][-1]["text"] == "publication answer"
+    elif reader_name == "detail":
+        result = read_session_json(tmp_path, "b15-session")
+        assert result["messages"][-1]["text"] == "publication answer"
+    else:
+        result = list(S.iter_turn_records(tmp_path, "b15-session"))
+        assert result[0].summary == "publication answer"
+
+    assert json.loads((allocation.turn_dir / "response.json").read_text())["message"] == (
+        "publication answer"
+    )
+
+
+def test_allocation_does_not_fork_when_cache_and_publication_are_deleted(
+    tmp_path: Path,
+) -> None:
+    request, allocation = _allocation(tmp_path)
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps(request), encoding="utf-8"
+    )
+    _record(allocation, {"ok": True, "message": "durable only"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            request_payload=request,
+            idempotency_key="retry-key",
+        )
+    assert exc_info.value.status == "unreadable"
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_accept_fails_closed_on_deleted_publication_after_state_cache_loss(
+    tmp_path: Path,
+) -> None:
+    _, allocation = _allocation(tmp_path)
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps({"task": "accept me", "idempotency_key": "retry-key"}),
+        encoding="utf-8",
+    )
+    _record(allocation, {"ok": True, "message": "candidate"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.accept_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            turn_id=allocation.context.turn_id,
+            client_graph_hash=None,
+            request_payload={"turn_id": allocation.context.turn_id},
+            idempotency_key="accept-key",
+        )
+    assert exc_info.value.status == "unreadable"
+
+
+def test_corrupt_request_does_not_become_unkeyed_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "must not serve"})
+    (allocation.turn_dir / "request.json").write_text("{broken", encoding="utf-8")
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        read_session_chat(tmp_path, "b15-session")
+    assert exc_info.value.status == "corrupt"
+
+
+@pytest.mark.parametrize("reader_name", ["chat", "detail", "list", "latest", "load"])
+def test_missing_request_on_state_claimed_keyed_turn_fails_closed(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import (
+        _latest_session_candidate_payload,
+        read_session_chat,
+    )
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "must not serve"})
+    (allocation.turn_dir / "request.json").unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        if reader_name == "chat":
+            read_session_chat(tmp_path, "b15-session")
+        elif reader_name == "detail":
+            read_session_json(tmp_path, "b15-session")
+        elif reader_name == "list":
+            list(S.iter_turn_records(tmp_path, "b15-session"))
+        elif reader_name == "latest":
+            _latest_session_candidate_payload(allocation.session_dir, ["0001"])
+        else:
+            S._load_response(
+                str(allocation.turn_dir / "response.json"),
+                state=S.read_state(allocation.session_dir),
+                keyed=True,
+            )
+    assert exc_info.value.status == "unreadable"
+
+
+@pytest.mark.parametrize("reader_name", ["chat", "detail", "list"])
+def test_missing_request_still_uses_valid_publication_after_cache_loss(
+    tmp_path: Path, reader_name: str
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+    from vibecomfy.comfy_nodes.agent._frag_session_bundle import read_session_json
+
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "publication answer"})
+    (allocation.turn_dir / "request.json").unlink()
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / "response.json").write_text(
+        json.dumps({"ok": True, "message": "tampered projection"}),
+        encoding="utf-8",
+    )
+
+    if reader_name == "chat":
+        result = read_session_chat(tmp_path, "b15-session")
+        assert result["messages"][-1]["text"] == "publication answer"
+    elif reader_name == "detail":
+        result = read_session_json(tmp_path, "b15-session")
+        assert result["messages"][-1]["text"] == "publication answer"
+    else:
+        result = list(S.iter_turn_records(tmp_path, "b15-session"))
+        assert result[0].summary == "publication answer"
+
+
+def test_same_key_hash_mismatch_does_not_fork_after_cache_and_publication_loss(
+    tmp_path: Path,
+) -> None:
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "durable only"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    conflict = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload={"task": "different", "idempotency_key": "retry-key"},
+        idempotency_key="retry-key",
+    )
+    assert conflict.conflict is not None
+    assert conflict.context.turn_id == allocation.context.turn_id
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_reject_fails_closed_on_deleted_publication_after_state_cache_loss(
+    tmp_path: Path,
+) -> None:
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "candidate"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.reject_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            turn_id=allocation.context.turn_id,
+            client_graph_hash=None,
+            request_payload={"turn_id": allocation.context.turn_id},
+            idempotency_key="reject-key",
+        )
+    assert exc_info.value.status == "unreadable"
+
+
+def test_backend_and_repl_readers_fail_closed_after_state_and_publication_loss(
+    tmp_path: Path,
+) -> None:
+    from vibecomfy.comfy_nodes.agent._v2_scoped_validation import (
+        _load_turn_response_payload,
+    )
+
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "projection must not win"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+    (allocation.turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        _load_turn_response_payload(
+            session_dir=allocation.session_dir,
+            turn_id=allocation.context.turn_id,
+        )
+    assert exc_info.value.status == "unreadable"
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S._load_response(str(allocation.turn_dir / "response.json"))
+    assert exc_info.value.status == "unreadable"
+
+
+def test_idempotency_retry_conflict_still_does_not_allocate_second_turn(tmp_path: Path) -> None:
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "one turn"})
+
+    conflict = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload={"task": "different", "idempotency_key": "retry-key"},
+        idempotency_key="retry-key",
+    )
+    assert conflict.conflict is not None
+    assert conflict.context.turn_id == allocation.context.turn_id
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_publication_wins_over_tampered_projection_on_both_replay_doors(
+    tmp_path: Path,
+) -> None:
+    request, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "immutable answer"})
+    projection = allocation.turn_dir / "response.json"
+    projection.write_text(json.dumps({"ok": True, "message": "tampered"}), encoding="utf-8")
+
+    replay = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload=request,
+        idempotency_key="retry-key",
+    )
+    assert replay.replay is not None
+    assert replay.replay.response["message"] == "immutable answer"
+
+    projection.write_text(json.dumps({"ok": True, "message": "tampered again"}), encoding="utf-8")
+    inbound = {"ok": True, "message": "new inbound body"}
+    record = S.record_idempotent_response(
+        session_root=tmp_path,
+        session_id="b15-session",
+        scope="edit",
+        idempotency_key="retry-key",
+        request_hash=allocation.request_hash,
+        response=inbound,
+        response_path=projection,
+        operation="edit",
+        turn_id=allocation.context.turn_id,
+    )
+    assert record is not None
+    assert inbound["message"] == "immutable answer"
+    assert json.loads(projection.read_text(encoding="utf-8"))["message"] == "immutable answer"
+
+
+def test_state_reconstruction_advances_past_occupied_turn_for_new_key(tmp_path: Path) -> None:
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "first"})
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+
+    next_allocation = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload={"task": "different", "idempotency_key": "new-key"},
+        idempotency_key="new-key",
+    )
+
+    assert next_allocation.context.turn_id == "0002"
+    assert (allocation.session_dir / "turns" / "0001" / S.RESPONSE_PUBLICATION_FILE_NAME).is_file()
+    state = S.read_state(allocation.session_dir)
+    assert "0001" in state["turns"]
+    assert state["next_turn_index"] == 3
+
+
+def test_executor_only_same_key_conflict_returns_typed_failure(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from vibecomfy.comfy_nodes.agent.executor_durable import (
+        maybe_write_executor_only_durable_turn,
+    )
+
+    graph = {"nodes": [{"id": 1, "type": "LoadImage"}], "links": []}
+    first_request = SimpleNamespace(query="one", graph=graph)
+    first_payload = {
+        "query": "one",
+        "graph": graph,
+        "session_id": "executor-conflict",
+        "idempotency_key": "same-key",
+    }
+    first = maybe_write_executor_only_durable_turn(
+        response={
+            "ok": True,
+            "route": "inspect",
+            "reply": "one",
+            "message": "one",
+            "outcome": {"kind": "noop"},
+        },
+        result=None,
+        payload=first_payload,
+        request=first_request,
+        session_root=tmp_path,
+    )
+
+    second = maybe_write_executor_only_durable_turn(
+        response={
+            "ok": True,
+            "route": "inspect",
+            "reply": "two",
+            "message": "two",
+            "outcome": {"kind": "noop"},
+        },
+        result=None,
+        payload={**first_payload, "query": "two"},
+        request=SimpleNamespace(query="two", graph=graph),
+        session_root=tmp_path,
+    )
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["turn_id"] == first["turn_id"]
+
+
+def test_executor_key_survives_state_and_publication_loss_without_forking(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from vibecomfy.comfy_nodes.agent.executor_durable import (
+        maybe_write_executor_only_durable_turn,
+    )
+
+    key = "executor-loss-key"
+    request = SimpleNamespace(
+        query="inspect this",
+        graph={"nodes": [{"id": 1, "type": "LoadImage"}], "links": []},
+    )
+    stamped = maybe_write_executor_only_durable_turn(
+        response={
+            "ok": True,
+            "route": "inspect",
+            "reply": "durable answer",
+            "message": "durable answer",
+            "outcome": {"kind": "noop"},
+        },
+        result=None,
+        payload={
+            "query": request.query,
+            "graph": request.graph,
+            "session_id": "executor-loss",
+            "idempotency_key": key,
+        },
+        request=request,
+        session_root=tmp_path,
+    )
+    turn_dir = tmp_path / stamped["session_id"] / "turns" / stamped["turn_id"]
+    request_artifact = json.loads((turn_dir / "request.json").read_text())
+    assert request_artifact["idempotency_key"] == key
+
+    (turn_dir.parent.parent / S.STATE_FILE_NAME).unlink()
+    (turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id=stamped["session_id"],
+            request_payload=request_artifact,
+            idempotency_key=key,
+        )
+    assert exc_info.value.status == "unreadable"
+    assert not (turn_dir.parent / "0002").exists()
+
+
+def test_allocation_fails_closed_on_corrupt_request_with_valid_publication(
+    tmp_path: Path,
+) -> None:
+    request, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "authoritative"})
+    (allocation.turn_dir / "request.json").write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            request_payload=request,
+            idempotency_key="retry-key",
+        )
+    assert exc_info.value.status == "corrupt"
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_allocation_fails_closed_on_request_publication_key_mismatch(
+    tmp_path: Path,
+) -> None:
+    _, allocation = _allocation(tmp_path)
+    _record(allocation, {"ok": True, "message": "authoritative"})
+    (allocation.turn_dir / "request.json").write_text(
+        json.dumps({"task": "inspect", "idempotency_key": "other-key"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        S.allocate_turn(
+            session_root=tmp_path,
+            session_id="b15-session",
+            request_payload={"task": "inspect", "idempotency_key": "other-key"},
+            idempotency_key="retry-key",
+        )
+    assert exc_info.value.status == "corrupt"
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_allocation_recovers_valid_publication_when_request_is_genuinely_missing(
+    tmp_path: Path,
+) -> None:
+    request, allocation = _allocation(tmp_path)
+    response = {"ok": True, "message": "publication recovery"}
+    _record(allocation, response)
+    (allocation.turn_dir / "request.json").unlink()
+    (allocation.session_dir / S.STATE_FILE_NAME).unlink()
+
+    replay = S.allocate_turn(
+        session_root=tmp_path,
+        session_id="b15-session",
+        request_payload=request,
+        idempotency_key="retry-key",
+    )
+
+    assert replay.replay is not None
+    assert replay.replay.response == response
+    assert replay.context.turn_id == allocation.context.turn_id
+    assert not (allocation.session_dir / "turns" / "0002").exists()
+
+
+def test_executor_only_unkeyed_legacy_still_uses_response_fallback(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+    from vibecomfy.comfy_nodes.agent.executor_durable import (
+        maybe_write_executor_only_durable_turn,
+    )
+
+    request = SimpleNamespace(query="legacy inspect", graph={"nodes": [], "links": []})
+    stamped = maybe_write_executor_only_durable_turn(
+        response={
+            "ok": True,
+            "route": "inspect",
+            "reply": "legacy answer",
+            "message": "legacy answer",
+            "outcome": {"kind": "noop"},
+        },
+        result=None,
+        payload={
+            "query": request.query,
+            "graph": request.graph,
+            "session_id": "executor-legacy",
+        },
+        request=request,
+        session_root=tmp_path,
+    )
+    turn_dir = tmp_path / stamped["session_id"] / "turns" / stamped["turn_id"]
+    request_artifact = json.loads((turn_dir / "request.json").read_text())
+    assert "idempotency_key" not in request_artifact
+
+    (turn_dir.parent.parent / S.STATE_FILE_NAME).unlink()
+    (turn_dir / S.RESPONSE_PUBLICATION_FILE_NAME).unlink()
+
+    chat = read_session_chat(tmp_path, stamped["session_id"])
+    assert chat["messages"][-1]["text"] == "legacy answer"
+
+
+def test_session_iteration_raises_for_corrupt_state(tmp_path: Path) -> None:
+    session_dir = tmp_path / "iter-session"
+    session_dir.mkdir()
+    (session_dir / S.STATE_FILE_NAME).write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(S.DurableReadError) as exc_info:
+        list(S.iter_turn_records(tmp_path, "iter-session"))
+    assert exc_info.value.status == "corrupt"
+
+
+def test_chat_reconstruction_uses_publication_when_projection_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    from vibecomfy.comfy_nodes.agent._frag_chat import read_session_chat
+
+    request, allocation = _allocation(tmp_path)
+    request_path = allocation.turn_dir / "request.json"
+    request_path.write_text(json.dumps({"task": "remember this"}), encoding="utf-8")
+    _record(allocation, {"ok": True, "message": "published answer"})
+    (allocation.turn_dir / "response.json").write_text("{broken", encoding="utf-8")
+
+    result = read_session_chat(tmp_path, "b15-session")
+
+    assert result["ok"] is True
+    assert result["messages"][-1]["text"] == "published answer"
+
+
+def test_batch_repl_does_not_continue_after_typed_chat_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import vibecomfy.comfy_nodes.agent.edit as edit_module
+
+    def fail_chat(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise S.DurableReadError(
+            S.DurableRead("unreadable", path=tmp_path / "turns", error="walk failed")
+        )
+
+    monkeypatch.setattr(edit_module, "read_session_chat", fail_chat)
+
+    result = edit_module.handle_agent_edit(
+        {
+            "task": "inspect this workflow",
+            "graph": {"nodes": [], "links": []},
+            "session_id": "batch-chat-failure",
+        },
+        session_root=tmp_path,
+    )
+
+    assert result["ok"] is False
+    assert result["debug"]["failure"]["agent_failure_context"]["explanation"]

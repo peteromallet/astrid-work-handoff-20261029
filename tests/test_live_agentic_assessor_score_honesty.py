@@ -1,0 +1,2111 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+from vibecomfy.comfy_nodes.agent.candidate_transaction import (
+    build_candidate_transaction,
+    content_hash,
+)
+
+from tests.live_agentic_harness import assessor as assessor_module
+from tests.live_agentic_harness.assessor import (
+    AssessmentPublicationError,
+    assess_live_output_dir,
+)
+from tests.live_agentic_harness.intent_judge import (
+    judge_edit_intent,
+    judge_grounded_refusal,
+    judge_semantic_answer,
+)
+
+_LINEAGE_SHA = "b" * 64
+
+
+def _seed_lineage(output_dir: Path, scenario_id: str | None = None) -> None:
+    """Attach a typed artifact-lineage manifest (sidecar + envelope copy).
+
+    G5-B4-MUST-003 made absent lineage grade ``undetermined``; these
+    score-honesty tests exercise OTHER structured checks, so they seed
+    valid all-primary lineage instead of relying on the old fail-open
+    absence behavior. Mirrors tests/test_live_agentic_harness_guard_contract.py::_seed_lineage.
+    """
+    from vibecomfy.comfy_nodes.agent.artifact_lineage import (
+        LINK_KINDS,
+        build_artifact_lineage,
+        primary_row,
+    )
+
+    if scenario_id is None:
+        scenario_id = (
+            output_dir.name
+            if output_dir.name and "tmp" not in output_dir.name
+            else "s1"
+        )
+    manifest = build_artifact_lineage(
+        lineage={"scenario_id": scenario_id},
+        rows=[primary_row(kind, _LINEAGE_SHA) for kind in LINK_KINDS],
+    )
+    manifest["binding"] = {"scenario_id": scenario_id}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frozen = json.loads(json.dumps(manifest))
+    (output_dir / "artifact_lineage.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    response_path = output_dir / "response.json"
+    if response_path.is_file():
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+        report = response.setdefault("report", {})
+        executor = report.setdefault("executor", {})
+        executor["artifact_lineage"] = frozen
+        response_path.write_text(json.dumps(response), encoding="utf-8")
+
+
+def test_recovered_upstream_500_is_warning_when_candidate_succeeded(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": {"1": {"class_type": "TestNode"}},
+        "change_details": {"landed_operation_count": 1},
+        "warnings": ["Hivemind HTTP error 500: Internal Server Error"],
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    _seed_lineage(tmp_path)
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {"expect_graph_changed": True, "skip_intent_judge": True}
+        },
+    )
+
+    upstream = [
+        issue for issue in assessment["issues"] if issue["check"] == "upstream_failure"
+    ]
+    assert upstream
+    assert {issue["severity"] for issue in upstream} == {"warning"}
+    assert assessment["passed"] is True
+
+
+def test_upstream_500_remains_error_without_candidate(tmp_path: Path) -> None:
+    response = {
+        "ok": False,
+        "graph_unchanged": True,
+        "error": "Hivemind HTTP error 500: Internal Server Error",
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {"expect_graph_changed": True, "skip_intent_judge": True}
+        },
+    )
+
+    upstream = [
+        issue for issue in assessment["issues"] if issue["check"] == "upstream_failure"
+    ]
+    assert upstream
+    assert {issue["severity"] for issue in upstream} == {"error"}
+    assert assessment["passed"] is False
+
+
+def test_skipped_queue_validation_is_warning_when_candidate_succeeded(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": {"1": {"class_type": "SaveAudio"}},
+        "change_details": {"landed_operation_count": 1},
+        "gates": {
+            "ir_validate_ok": True,
+            "lower_ok": True,
+            "python_load_ok": True,
+            "queue_validate_ok": False,
+            "ui_emit_ok": True,
+            "ui_fidelity_ok": True,
+            "ui_load_safe_ok": True,
+        },
+        "debug": {
+            "stage_snapshots": [
+                {"stage": "ingest", "ok": True, "issues": []},
+                {"stage": "agent_batch", "ok": True, "issues": []},
+            ]
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    _seed_lineage(tmp_path)
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {"expect_graph_changed": True, "skip_intent_judge": True}
+        },
+    )
+
+    assert assessment["passed"] is True
+    assert [issue["check"] for issue in assessment["issues"]] == [
+        "queue_validate_skipped"
+    ]
+    assert assessment["issues"][0]["severity"] == "warning"
+
+
+def test_skipped_queue_validation_does_not_hide_other_failed_gates(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": {"1": {"class_type": "SaveAudio"}},
+        "change_details": {"landed_operation_count": 1},
+        "gates": {
+            "ir_validate_ok": True,
+            "lower_ok": False,
+            "python_load_ok": True,
+            "queue_validate_ok": False,
+            "ui_emit_ok": True,
+            "ui_fidelity_ok": True,
+            "ui_load_safe_ok": True,
+        },
+        "debug": {
+            "stage_snapshots": [
+                {"stage": "ingest", "ok": True, "issues": []},
+                {"stage": "agent_batch", "ok": True, "issues": []},
+            ]
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    _seed_lineage(tmp_path)
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {"expect_graph_changed": True, "skip_intent_judge": True}
+        },
+    )
+
+    assert assessment["passed"] is False
+    assert [issue["check"] for issue in assessment["issues"]] == [
+        "queue_validate_skipped",
+        "gates",
+    ]
+    gates_issue = assessment["issues"][1]
+    assert gates_issue["severity"] == "error"
+    assert "lower_ok" in gates_issue["detail"]
+    assert "queue_validate_ok" not in gates_issue["detail"]
+
+
+def test_queue_validation_stage_failure_still_fails(tmp_path: Path) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": {"1": {"class_type": "SaveAudio"}},
+        "change_details": {"landed_operation_count": 1},
+        "gates": {
+            "ir_validate_ok": True,
+            "lower_ok": True,
+            "python_load_ok": True,
+            "queue_validate_ok": False,
+            "ui_emit_ok": True,
+            "ui_fidelity_ok": True,
+            "ui_load_safe_ok": True,
+        },
+        "debug": {
+            "stage_snapshots": [
+                {
+                    "stage": "queue_validate",
+                    "ok": False,
+                    "issues": [{"code": "schema_less_queue_blocker"}],
+                },
+            ]
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    _seed_lineage(tmp_path)
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {"expect_graph_changed": True, "skip_intent_judge": True}
+        },
+    )
+
+    assert assessment["passed"] is False
+    assert [issue["check"] for issue in assessment["issues"]] == ["gates"]
+    assert "queue_validate_ok" in assessment["issues"][0]["detail"]
+
+
+def test_message_prose_never_affects_score(tmp_path: Path) -> None:
+    """G0-T2: scoring is structured-only — identical structured records score
+    identically no matter what prose the message carries.
+
+    The same record (an edit landed, candidate produced, gates passed) must
+    pass both with a grounded message and with message prose that the old
+    deterministic matcher misread as a contradiction ("unchanged" parts of the
+    graph).  The reverse also holds: a record with no landed edit and failed
+    gates fails identically whether the message admits it or falsely claims
+    success.
+    """
+    base = {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": {"1": {"class_type": "KSampler"}},
+        "outcome": {"kind": "candidate"},
+        "change_details": {"landed_operation_count": 1},
+        "gates": {
+            "ir_validate_ok": True,
+            "lower_ok": True,
+            "python_load_ok": True,
+            "queue_validate_ok": True,
+            "state_match_ok": True,
+            "ui_emit_ok": True,
+            "ui_fidelity_ok": True,
+            "ui_load_safe_ok": True,
+        },
+    }
+    scenario = {"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}}
+
+    passing_messages = (
+        "Applied 1 edit.",
+        "Updated the KSampler; the other nodes are unchanged.",
+        "Node connections are unchanged; only the seed changed.",
+        "I have not applied any further changes; this edit is complete.",
+    )
+    scores = []
+    for index, message in enumerate(passing_messages):
+        run_dir = tmp_path / f"pass-{index}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "response.json").write_text(
+            json.dumps({**base, "message": message}),
+            encoding="utf-8",
+        )
+        # G0R: the residual implementation_result prose gate is removed — the
+        # same "unchanged"-wording message in implementation_result.json must
+        # not affect scoring either.
+        (run_dir / "implementation_result.json").write_text(
+            json.dumps({"message": message}),
+            encoding="utf-8",
+        )
+        _seed_lineage(run_dir)
+        assessment = assess_live_output_dir(run_dir, scenario=scenario)
+        scores.append((assessment["passed"], assessment["error_count"]))
+
+    assert scores == [(True, 0)] * len(passing_messages), scores
+    assert all(
+        issue["check"] not in {"message_artifact", "implementation_result"}
+        for index in range(len(passing_messages))
+        for issue in assess_live_output_dir(
+            tmp_path / f"pass-{index}", scenario=scenario
+        )["issues"]
+    )
+
+    failing_base = {
+        "ok": True,
+        "graph_unchanged": True,
+        "no_candidate_reason": "no_changes",
+        "outcome": {"kind": "noop"},
+        "change_details": {"landed_operation_count": 0},
+        "gates": {
+            "ir_validate_ok": False,
+            "lower_ok": False,
+            "python_load_ok": False,
+            "queue_validate_ok": False,
+            "state_match_ok": True,
+            "ui_emit_ok": False,
+            "ui_fidelity_ok": False,
+            "ui_load_safe_ok": False,
+        },
+    }
+    failing_messages = (
+        "No changes were needed.",
+        "Applied 3 edits and the candidate is ready to apply.",
+        "Validation passed; everything landed.",
+    )
+    failing_scores = []
+    for index, message in enumerate(failing_messages):
+        run_dir = tmp_path / f"fail-{index}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "response.json").write_text(
+            json.dumps({**failing_base, "message": message}),
+            encoding="utf-8",
+        )
+        assessment = assess_live_output_dir(run_dir, scenario=scenario)
+        failing_scores.append((assessment["passed"], assessment["error_count"]))
+
+    # Four structured errors: graph_changed, no_candidate_reason,
+    # outcome_kind, and gates — identical for every message wording.
+    assert failing_scores == [(False, 4)] * len(failing_messages), failing_scores
+
+
+def test_implementation_result_unchanged_prose_does_not_gate_scoring(
+    tmp_path: Path,
+) -> None:
+    """G0R counterexample: an implementation_result message saying other
+    nodes are unchanged must NOT affect scoring when the structured record
+    proves an edit landed.
+
+    The residual ``"unchanged"`` substring gate (assessor.py:774 pre-G0R)
+    turned this into an error-severity ``implementation_result`` issue; it is
+    gone — prose never gates scoring.
+    """
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": {"1": {"class_type": "KSampler"}},
+        "outcome": {"kind": "candidate"},
+        "change_details": {"landed_operation_count": 1},
+        "gates": {
+            "ir_validate_ok": True,
+            "lower_ok": True,
+            "python_load_ok": True,
+            "queue_validate_ok": True,
+            "state_match_ok": True,
+            "ui_emit_ok": True,
+            "ui_fidelity_ok": True,
+            "ui_load_safe_ok": True,
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    (tmp_path / "implementation_result.json").write_text(
+        json.dumps({"message": "Updated the sampler; other nodes are unchanged."}),
+        encoding="utf-8",
+    )
+    _seed_lineage(tmp_path)
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {"expect_graph_changed": True, "skip_intent_judge": True}
+        },
+    )
+
+    assert assessment["passed"] is True, assessment["issues"]
+    assert assessment["verdict"] == "pass"
+    assert not [
+        issue
+        for issue in assessment["issues"]
+        if issue["check"] == "implementation_result"
+    ]
+
+
+def _successful_edit_response(*, candidate_graph: dict | None = None) -> dict:
+    if candidate_graph is None:
+        candidate_graph = {
+            "nodes": [{"id": 1, "type": "KSampler"}],
+            "links": [],
+        }
+    return {
+        "ok": True,
+        "graph_unchanged": False,
+        "candidate_graph": candidate_graph,
+        "outcome": {"kind": "candidate"},
+        "change_details": {"landed_operation_count": 1},
+        "gates": {
+            "ir_validate_ok": True,
+            "lower_ok": True,
+            "plan_validate_ok": True,
+            "python_load_ok": True,
+            "queue_validate_ok": True,
+            "state_match_ok": True,
+            "ui_emit_ok": True,
+            "ui_fidelity_ok": True,
+            "ui_load_safe_ok": True,
+        },
+    }
+
+
+def _frame_graph(
+    *, source_value: int, target_value: int, linked: bool, shared_source: bool = False
+) -> dict:
+    """A target node with a widget at index 0, optionally fed by a PrimitiveInt."""
+    link_id = 10 if linked else None
+    nodes = []
+    links = []
+    if linked:
+        nodes.append(
+            {"id": 1, "type": "PrimitiveInt", "widgets_values": [source_value]}
+        )
+        links.append([10, 1, 0, 2, 0, "INT"])
+    nodes.append(
+        {
+            "id": 2,
+            "type": "VideoGenerator",
+            "widgets_values": [target_value],
+            "inputs": [{"name": "frame_count", "type": "INT", "link": link_id}],
+        }
+    )
+    if linked and shared_source:
+        nodes.append(
+            {
+                "id": 4,
+                "type": "OtherConsumer",
+                "widgets_values": [8],
+                "inputs": [{"name": "other_count", "type": "INT", "link": 11}],
+            }
+        )
+        links.append([11, 1, 0, 4, 0, "INT"])
+    return {"nodes": nodes, "links": links}
+
+
+def _effective_edit_scenario(**assessment_overrides: object) -> dict:
+    scenario = {
+        "id": "effective-edit",
+        "assessment": {
+            "expect_graph_changed": True,
+            "skip_intent_judge": True,
+            "effective_edit_targets": [
+                {
+                    "label": "frame_count",
+                    "node_id": 2,
+                    "input_name": "frame_count",
+                    "widget_index": 0,
+                }
+            ],
+        },
+    }
+    scenario["assessment"].update(assessment_overrides)
+    return scenario
+
+
+def test_model_request_size_and_content_gates_removed(tmp_path: Path) -> None:
+    """B12/B13: max_model_request_bytes and forbid_model_request_substrings are
+    deleted scoring prejudice.  Even when a scenario still declares them, an
+    oversized model_request.json containing a forbidden substring must NOT
+    gate the run — prose length/content never gates."""
+    (tmp_path / "response.json").write_text(
+        json.dumps(_successful_edit_response()), encoding="utf-8"
+    )
+    (tmp_path / "model_request.json").write_text(
+        json.dumps(
+            {"turns": [{"messages": [{"content": 'raw "workflow_schema" leaked'}]}]}
+        )
+        * 200,
+        encoding="utf-8",
+    )
+    scenario = {
+        "id": "hotshot",
+        "assessment": {
+            "expect_graph_changed": True,
+            "skip_intent_judge": True,
+            "max_model_request_bytes": 100,
+            "forbid_model_request_substrings": ['"workflow_schema"'],
+        },
+    }
+    _seed_lineage(tmp_path, scenario_id=str(scenario["id"]))
+    assessment = assess_live_output_dir(tmp_path, scenario=scenario)
+
+    assert assessment["passed"] is True, assessment["issues"]
+    assert not [
+        issue
+        for issue in assessment["issues"]
+        if issue["check"].startswith("model_request")
+    ]
+
+
+def test_shared_source_effective_edit_passes_by_default(tmp_path: Path) -> None:
+    """B12/B13: a change landing through a shared linked source is a valid
+    edit by default — the agent may intentionally edit one source feeding
+    several consumers."""
+    run_dir = tmp_path / "shared-default"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    candidate_graph = _frame_graph(
+        source_value=16, target_value=8, linked=True, shared_source=True
+    )
+    (run_dir / "response.json").write_text(
+        json.dumps(_successful_edit_response(candidate_graph=candidate_graph)),
+        encoding="utf-8",
+    )
+    (run_dir / "original.ui.json").write_text(
+        json.dumps(
+            _frame_graph(
+                source_value=8, target_value=8, linked=True, shared_source=True
+            )
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "candidate.ui.json").write_text(
+        json.dumps(candidate_graph),
+        encoding="utf-8",
+    )
+    _seed_lineage(run_dir, scenario_id="effective-edit")
+
+    assessment = assess_live_output_dir(run_dir, scenario=_effective_edit_scenario())
+
+    assert assessment["passed"] is True, assessment["issues"]
+    assert not [
+        issue
+        for issue in assessment["issues"]
+        if issue["check"] == "shared_effective_source_edit"
+    ]
+
+
+def test_shared_source_effective_edit_fails_when_isolation_opted_in(
+    tmp_path: Path,
+) -> None:
+    """The shared-source error survives only as an explicit scenario opt-in:
+    assessment.isolate_shared_effective_sources=true."""
+    run_dir = tmp_path / "shared-isolated"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    candidate_graph = _frame_graph(
+        source_value=16, target_value=8, linked=True, shared_source=True
+    )
+    (run_dir / "response.json").write_text(
+        json.dumps(_successful_edit_response(candidate_graph=candidate_graph)),
+        encoding="utf-8",
+    )
+    (run_dir / "original.ui.json").write_text(
+        json.dumps(
+            _frame_graph(
+                source_value=8, target_value=8, linked=True, shared_source=True
+            )
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "candidate.ui.json").write_text(
+        json.dumps(candidate_graph),
+        encoding="utf-8",
+    )
+
+    assessment = assess_live_output_dir(
+        run_dir,
+        scenario=_effective_edit_scenario(isolate_shared_effective_sources=True),
+    )
+
+    assert assessment["passed"] is False
+    shared = [
+        issue
+        for issue in assessment["issues"]
+        if issue["check"] == "shared_effective_source_edit"
+    ]
+    assert shared
+    assert shared[0]["severity"] == "error"
+
+
+def test_equivalent_effect_different_paths_score_equally(tmp_path: Path) -> None:
+    """Effects determine edit correctness: a direct widget edit and an edit
+    through a linked source that land the SAME effective value must score
+    identically — implementation path never affects the score."""
+    direct_dir = tmp_path / "direct-widget"
+    direct_dir.mkdir(parents=True, exist_ok=True)
+    direct_candidate = _frame_graph(
+        source_value=8, target_value=16, linked=False
+    )
+    (direct_dir / "response.json").write_text(
+        json.dumps(_successful_edit_response(candidate_graph=direct_candidate)),
+        encoding="utf-8",
+    )
+    (direct_dir / "original.ui.json").write_text(
+        json.dumps(_frame_graph(source_value=8, target_value=8, linked=False)),
+        encoding="utf-8",
+    )
+    (direct_dir / "candidate.ui.json").write_text(
+        json.dumps(direct_candidate),
+        encoding="utf-8",
+    )
+    _seed_lineage(direct_dir, scenario_id="effective-edit")
+
+    linked_dir = tmp_path / "linked-source"
+    linked_dir.mkdir(parents=True, exist_ok=True)
+    linked_candidate = _frame_graph(source_value=16, target_value=8, linked=True)
+    (linked_dir / "response.json").write_text(
+        json.dumps(_successful_edit_response(candidate_graph=linked_candidate)),
+        encoding="utf-8",
+    )
+    (linked_dir / "original.ui.json").write_text(
+        json.dumps(_frame_graph(source_value=8, target_value=8, linked=True)),
+        encoding="utf-8",
+    )
+    (linked_dir / "candidate.ui.json").write_text(
+        json.dumps(linked_candidate),
+        encoding="utf-8",
+    )
+    _seed_lineage(linked_dir, scenario_id="effective-edit")
+
+    scenario = _effective_edit_scenario()
+    direct = assess_live_output_dir(direct_dir, scenario=scenario)
+    linked = assess_live_output_dir(linked_dir, scenario=scenario)
+
+    assert direct["passed"] is True, direct["issues"]
+    assert linked["passed"] is True, linked["issues"]
+    assert direct["issues"] == linked["issues"]
+    assert direct["error_count"] == linked["error_count"] == 0
+
+
+def test_research_health_control_cannot_pass_with_zero_calls_or_evidence(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "ok": True,
+        "route": "research",
+        "graph_unchanged": True,
+        "reply": "No graph attached; implementation skipped.",
+        "evidence": {"research": {}},
+        "report": {
+            "executor": {
+                "deepseek_usage": {"n_calls": 0},
+                "model_attempts": [],
+            }
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {
+                "expect_graph_changed": False,
+                "require_executed_research": True,
+            },
+            "classification": {"kind": "health_control"},
+        },
+    )
+
+    assert assessment["passed"] is False
+    assert {issue["check"] for issue in assessment["issues"]} >= {
+        "research_model_call",
+        "research_tool_execution",
+        "research_evidence_present",
+    }
+
+
+def test_research_health_control_accepts_executed_grounded_evidence(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "ok": True,
+        "route": "research",
+        "graph_unchanged": True,
+        "reply": "The retrieved precedent supports a lower-step option.",
+        "evidence": {
+            "research": {
+                "research_attempt": "grounded",
+                "tool_calls_executed": 2,
+                "evidence_artifacts": 1,
+                "citations": ["hivemind:1"],
+            }
+        },
+        "report": {
+            "executor": {
+                "deepseek_usage": {"n_calls": 2},
+                "model_attempts": [{"phase": "research", "outcome": "success"}],
+            }
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "assessment": {
+                "expect_graph_changed": False,
+                "require_executed_research": True,
+            },
+            "classification": {"kind": "health_control"},
+        },
+    )
+
+    assert assessment["passed"] is True, assessment["issues"]
+
+
+def test_inspect_health_control_rejects_reply_that_contradicts_locked_census(
+    tmp_path: Path,
+) -> None:
+    graph = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+    }
+    response = {
+        "ok": True,
+        "route": "inspect",
+        "graph_unchanged": True,
+        "reply": (
+            "Based on the workflow inspection, the graph is currently empty — "
+            "it contains 0 nodes and no links."
+        ),
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "graph": graph,
+            "assessment": {
+                "expect_graph_changed": False,
+                "require_graph_census_consistency": True,
+            },
+            "classification": {"kind": "health_control"},
+        },
+    )
+
+    assert assessment["passed"] is False
+    census = [
+        issue
+        for issue in assessment["issues"]
+        if issue["check"] == "graph_census_consistency"
+    ]
+    assert census and "2 nodes and 1 edges" in census[0]["detail"]
+
+
+def _snapshot_response_for_lane(lane: str) -> tuple[dict, dict]:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        "gates": {},
+        "artifacts": {},
+        "report": {"executor": {"plan": {"implement": False, "route": "respond"}}},
+    }
+    scenario: dict = {"id": f"snapshot-{lane}", "query": "perform the requested task"}
+    if lane == "edit":
+        response.update(
+            {
+                "graph_unchanged": False,
+                "route": "revise",
+                "outcome": {"kind": "candidate", "changes": []},
+                "change_details": {"landed_operation_count": 1},
+            }
+        )
+        scenario["apply"] = True
+    elif lane == "refusal":
+        response.update(
+            {
+                "route": "revise",
+                "outcome": {
+                    "kind": "requires_custom_nodes",
+                    "candidates": [],
+                },
+            }
+        )
+        scenario.update(
+            {
+                "apply": True,
+                "assessment": {
+                    "allow_safe_refusal_outcome_kinds": ["requires_custom_nodes"]
+                },
+            }
+        )
+    else:
+        scenario["answer_rubric"] = {
+            "expected_criteria": ["answer the question"],
+            "fail_conditions": [],
+            "pass_condition": "grounded answer",
+        }
+        response["message"] = "The graph is already configured."
+    return response, scenario
+
+
+@pytest.mark.parametrize("lane", ["edit", "refusal", "semantic"])
+def test_assessor_reads_once_and_injects_one_immutable_snapshot_per_judge_lane(
+    tmp_path: Path, monkeypatch, lane: str
+) -> None:
+    response, scenario = _snapshot_response_for_lane(lane)
+    response_path = tmp_path / "response.json"
+    response_path.write_text(json.dumps(response), encoding="utf-8")
+    reads = 0
+    real_read_text = Path.read_text
+    seen: dict[str, dict] = {}
+    real_load_response = assessor_module._load_response_json
+    loaded: dict[str, object] = {}
+
+    def capture_load_response(path: Path):
+        snapshot, state = real_load_response(path)
+        loaded["snapshot"] = snapshot
+        return snapshot, state
+
+    def counting_read_text(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal reads
+        if path == response_path:
+            reads += 1
+        return real_read_text(path, *args, **kwargs)
+
+    def judge(*args, response_snapshot, **kwargs):  # noqa: ANN002, ANN003
+        seen["snapshot"] = response_snapshot
+        assert response_snapshot is loaded["snapshot"]
+        assert json.loads(json.dumps(response_snapshot)) == response
+        with pytest.raises(TypeError, match="immutable"):
+            response_snapshot["outcome"]["kind"] = "mutated"
+        response_path.write_text(
+            json.dumps({"ok": False, "graph_unchanged": "not-a-boolean"}),
+            encoding="utf-8",
+        )
+        return {"pass_": True, "criteria": {}, "rationale": "injected snapshot"}
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+    monkeypatch.setattr(assessor_module, "_load_response_json", capture_load_response)
+    monkeypatch.setattr(
+        assessor_module,
+        {
+            "edit": "judge_edit_intent",
+            "refusal": "judge_grounded_refusal",
+            "semantic": "judge_semantic_answer",
+        }[lane],
+        judge,
+    )
+
+    assessment = assess_live_output_dir(tmp_path, scenario=scenario)
+
+    assert reads == 1
+    assert seen["snapshot"]["ok"] is True
+    assert assessment["expect_graph_changed"] is (lane != "semantic")
+
+
+@pytest.mark.parametrize("lane", ["edit", "refusal", "semantic"])
+def test_injected_judges_never_reopen_response_json(
+    tmp_path: Path, monkeypatch, lane: str
+) -> None:
+    response_path = tmp_path / "response.json"
+    response_path.write_text('{"mutated": true}', encoding="utf-8")
+    snapshot = {
+        "ok": True,
+        "graph_unchanged": True,
+        "outcome": {"kind": "respond"},
+        "message": "The graph is already configured.",
+    }
+    reads = 0
+    real_read_text = Path.read_text
+
+    def counting_read_text(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal reads
+        if path == response_path:
+            reads += 1
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+    if lane == "edit":
+        judge_edit_intent(
+            tmp_path,
+            {"query": "change the graph"},
+            response_snapshot=snapshot,
+        )
+    elif lane == "refusal":
+        judge_grounded_refusal(tmp_path, {}, response_snapshot=snapshot)
+    else:
+        judge_semantic_answer(
+            tmp_path,
+            {
+                "query": "explain the graph",
+                "answer_rubric": {"pass_condition": "grounded"},
+            },
+            response_snapshot=snapshot,
+        )
+
+    assert reads == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["ValidationError", "AuthError"])
+def test_typed_failed_apply_with_null_candidate_is_not_malformed(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    """A refused apply is product evidence: ok=false, typed failure, candidate null."""
+    message = f"{failure_kind}: apply refused"
+    response = {
+        "ok": False,
+        "candidate": None,
+        "error": message,
+        "failure_kind": failure_kind,
+        "failure_message": message,
+        "failure_stage": "implement",
+        "graph_unchanged": True,
+        "message": message,
+        "no_candidate_reason": "implementation_failed",
+        "route": "revise",
+        "evidence": {
+            "implementation": {
+                "failure": {
+                    "failure_kind": failure_kind,
+                    "message": message,
+                    "stage": "implement",
+                }
+            }
+        },
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    _seed_lineage(tmp_path)
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "id": "typed-failed-apply",
+            "assessment": {"expect_graph_changed": True},
+        },
+    )
+
+    checks = {issue["check"] for issue in assessment["issues"]}
+    assert "response_malformed" not in checks
+    assert assessment["verdict"] != "undetermined"
+    assert assessment["passed"] is False
+    assert "graph_changed" in checks or "no_candidate_reason" in checks
+
+
+def test_malformed_response_is_injected_as_none_without_semantic_disk_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    response_path = tmp_path / "response.json"
+    response_path.write_text(
+        '{"ok": true, "graph_unchanged": "wrong"}', encoding="utf-8"
+    )
+    reads = 0
+    real_read_text = Path.read_text
+
+    def counting_read_text(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal reads
+        if path == response_path:
+            reads += 1
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "query": "explain this graph",
+            "answer_rubric": {"pass_condition": "grounded"},
+        },
+    )
+
+    assert reads == 1
+    assert assessment["verdict"] == "undetermined"
+    assert any(issue["check"] == "response_malformed" for issue in assessment["issues"])
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"ok": "true", "graph_unchanged": True},
+        {"ok": True, "graph_unchanged": 0},
+        {"ok": True, "graph_unchanged": True, "outcome": []},
+        {"ok": True, "graph_unchanged": True, "readiness": "ready"},
+        {"ok": True, "graph_unchanged": True, "gates": []},
+        {"ok": True, "graph_unchanged": True, "artifacts": "paths"},
+        {"ok": True, "graph_unchanged": True, "route": []},
+        {"ok": True, "graph_unchanged": True, "outcome": None},
+        {"ok": True, "graph_unchanged": True, "outcome": {"kind": 1}},
+        {"ok": True, "graph_unchanged": True, "readiness": {"ready": "yes"}},
+        {"ok": True, "graph_unchanged": True, "gates": {"queue_validate_ok": 1}},
+        {"ok": True, "graph_unchanged": True, "artifacts": {"original_ui": 1}},
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "report": {"executor": {"plan": {"implement": "true"}}},
+        },
+        {"ok": True, "graph_unchanged": True, "report": []},
+        {"ok": True, "graph_unchanged": True, "report": {"executor": []}},
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "report": {"executor": {"plan": []}},
+        },
+    ],
+)
+def test_type_invalid_response_envelopes_are_malformed_and_never_pass(
+    tmp_path: Path, response: dict
+) -> None:
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+    assert {(issue["check"], issue["severity"]) for issue in assessment["issues"]} == {
+        ("response_malformed", "undetermined")
+    }
+
+
+def _candidate_assessment_response(**carrier: object) -> dict:
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "outcome": {"kind": "candidate"},
+        "change_details": {"landed_operation_count": 1},
+    }
+    response.update(carrier)
+    return response
+
+
+@pytest.mark.parametrize(
+    ("carrier", "payload"),
+    [
+        ("candidate_graph", {"nodes": [1], "links": []}),
+        ("candidate_graph", {"1": {"class_type": 3}}),
+        (
+            "candidate_graph",
+            {"vibecomfy_format_version": "1", "nodes": {"1": 1}},
+        ),
+        ("candidate_graph", {"nodes": [{"id": 1}], "links": [["bad"]]}),
+        (
+            "candidate_graph",
+            {
+                "nodes": [{"id": 1}, {"id": 2}],
+                "links": [[1, 1, 0, 99, 0, "IMAGE"]],
+            },
+        ),
+        ("candidate_graph", {}),
+    ],
+)
+def test_assessor_rejects_malformed_graph_products(
+    tmp_path: Path, carrier: str, payload: dict
+) -> None:
+    (tmp_path / "response.json").write_text(
+        json.dumps(_candidate_assessment_response(**{carrier: payload})),
+        encoding="utf-8",
+    )
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+
+
+@pytest.mark.parametrize(
+    ("carrier", "payload"),
+    [
+        ("candidate", {"garbage": "x"}),
+        ("candidate_graph", {"garbage": "x"}),
+        ("candidate_transaction", {"garbage": "x"}),
+        ("graph", {"nodes": [1]}),
+    ],
+)
+def test_assessor_rejects_nested_malformed_candidate_carriers(
+    tmp_path: Path, carrier: str, payload: dict
+) -> None:
+    response = _candidate_assessment_response()
+    response["outcome"][carrier] = payload
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+
+
+@pytest.mark.parametrize("carrier", ["candidate", "candidate_graph", "graph"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_assessor_rejects_explicit_null_candidate_aliases(
+    tmp_path: Path, carrier: str, nested: bool
+) -> None:
+    response = _candidate_assessment_response()
+    owner = response["outcome"] if nested else response
+    owner[carrier] = None
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+    assert any(issue["check"] == "response_malformed" for issue in assessment["issues"])
+
+
+def test_real_successful_non_edit_terminal_may_carry_sole_null_candidate() -> None:
+    from vibecomfy.executor.contracts import (
+        ClassifyDecision,
+        ExecutorResult,
+        ImplementationResult,
+        Report,
+    )
+
+    response = ExecutorResult.success(
+        report=Report(
+            plan=ClassifyDecision(
+                research=True,
+                implement=False,
+                route="research",
+                task="research_nodes",
+            ),
+            implementation=ImplementationResult(
+                message="Grounded answer.",
+                durable_response={"graph_unchanged": True},
+            ),
+        ),
+        reply="Grounded answer.",
+    ).to_dict()
+
+    assert response["candidate"] is None
+    assert response["graph_unchanged"] is True
+    assert response["route"] == "research"
+    assert assessor_module._response_envelope_is_valid(response) is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "route": "research",
+            "candidate": None,
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "route": "revise",
+            "candidate": None,
+        },
+        {
+            "ok": False,
+            "graph_unchanged": True,
+            "route": "research",
+            "candidate": None,
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "route": "research",
+            "candidate": None,
+            "candidate_graph": {"nodes": [], "links": []},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "route": "research",
+            "outcome": {"kind": "answer", "candidate": None},
+        },
+    ],
+)
+def test_null_candidate_exemption_rejects_changed_edit_failed_or_ambiguous_carriers(
+    response: dict,
+) -> None:
+    assert assessor_module._candidate_carriers_are_well_formed(response) is False
+
+
+def test_assessor_rejects_unsupported_nested_candidate_transaction_contract(
+    tmp_path: Path,
+) -> None:
+    response = _candidate_assessment_response()
+    response["outcome"]["candidate_transaction"] = {
+        "contract_version": "candidate_transaction_v99",
+        "nodes": [],
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {"expected_classes": ["Missing"], "pack": {"slug": 7}},
+        {"expected_classes": ["Missing"], "provisional_schema": {"schema": 7}},
+    ],
+)
+def test_assessor_rejects_malformed_custom_node_candidate_contents(
+    tmp_path: Path, candidate: dict
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "outcome": {"kind": "requires_custom_nodes", "candidates": [candidate]},
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+
+
+@pytest.mark.parametrize("changes", [[{"op": "definitely_not_an_op"}], "not-a-list"])
+def test_assessor_rejects_malformed_direct_changes_carrier(
+    tmp_path: Path, changes: object
+) -> None:
+    response = _candidate_assessment_response(
+        candidate_graph={"nodes": [{"id": 1}], "links": []},
+        changes=changes,
+    )
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _candidate_assessment_response(
+            candidate_graph={
+                "nodes": [{"id": 1, "type": "KSampler"}],
+                "links": [],
+            }
+        ),
+        _candidate_assessment_response(
+            candidate_graph={"1": {"class_type": "KSampler", "inputs": {}}}
+        ),
+        _candidate_assessment_response(
+            candidate={
+                "graph": {
+                    "nodes": [{"id": 1, "type": "KSampler"}],
+                    "links": [],
+                }
+            }
+        ),
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {
+                "kind": "requires_custom_nodes",
+                "candidates": [
+                    {
+                        "pack": {
+                            "slug": "ComfyUI-Example",
+                            "source": "registry",
+                            "version": "1.0.0",
+                            "url": "https://example.test/pack",
+                        },
+                        "expected_classes": ["ExampleNode"],
+                        "validation_mode": "class_validatable",
+                        "evidence": [
+                            {
+                                "tier": "registry",
+                                "source": "schema",
+                                "endpoint": "/nodes/example/schema",
+                                "cache_hit": False,
+                                "detail": {"version": "1.0.0"},
+                                "matched_classes": ["ExampleNode"],
+                            }
+                        ],
+                        "provisional_schema": {
+                            "version": "1.0.0",
+                            "schema": {"nodes": {"ExampleNode": {}}},
+                            "runnable": False,
+                        },
+                        "warnings": [],
+                        "runnable": False,
+                        "stable_install_hash": "hash",
+                    }
+                ],
+            },
+        },
+    ],
+)
+def test_valid_compatibility_carriers_remain_accepted(response: dict) -> None:
+    assert assessor_module._response_envelope_is_valid(response) is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"graph_unchanged": True},
+        {"ok": True, "graph_unchanged": True, "outcome": {}},
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "route": "revise",
+            "outcome": {"kind": "edit"},
+            "change_details": {"landed_operation_count": 1},
+            "accepted_batch": [{}],
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "noop", "changes": [{}]},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "requires_custom_nodes", "missing_classes": [1]},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "route": "revise",
+            "outcome": {
+                "kind": "candidate",
+                "changes": [{"uid": "sampler", "field_path": "steps"}],
+            },
+            "candidate_graph": {"nodes": [], "links": []},
+            "change_details": {"landed_operation_count": 1},
+            "accepted_batch": [
+                {"op": {"op": "set_node_field", "target": ["", "sampler"]}}
+            ],
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate"},
+            "candidate_graph": {"garbage": "x"},
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate_transaction"},
+            "candidate_transaction": {"garbage": "x"},
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {
+                "kind": "candidate",
+                "changes": [{"op": "set_node_field"}],
+            },
+            "candidate_graph": {"nodes": [], "links": []},
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {
+                "kind": "candidate",
+                "changes": [{"op": "definitely_not_an_op"}],
+            },
+            "candidate_graph": {"nodes": [], "links": []},
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {
+                "kind": "requires_custom_nodes",
+                "candidates": [{"expected_classes": [3]}],
+            },
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {
+                "kind": "requires_custom_nodes",
+                "missing_classes": [],
+            },
+            "message": "A custom node is required.",
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {
+                "kind": "requires_custom_nodes",
+                "candidates": [
+                    {
+                        "expected_classes": ["MissingNode"],
+                        "evidence": [],
+                    }
+                ],
+            },
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {
+                "kind": "requires_custom_nodes",
+                "candidates": [
+                    {
+                        "expected_classes": ["MissingNode"],
+                        "evidence": [{"garbage": "x"}],
+                    }
+                ],
+            },
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "clarify", "candidates": []},
+            "message": "Which node should change?",
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "budget", "candidates": []},
+            "message": "The execution budget was exhausted.",
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "noop", "reason": "No changes."},
+            "accepted_batch": {},
+        },
+    ],
+)
+def test_semantically_incomplete_response_envelopes_never_pass(
+    tmp_path: Path, response: dict
+) -> None:
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+    assert any(
+        issue["check"] == "response_malformed" and issue["severity"] == "undetermined"
+        for issue in assessment["issues"]
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "noop", "reason": "Nothing needed."},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "route": "adapt",
+            "outcome": {
+                "kind": "requires_custom_nodes",
+                "candidates": [{"expected_classes": ["MissingNode"]}],
+            },
+        },
+        {
+            "ok": False,
+            "graph_unchanged": True,
+            "error": "Provider failed before graph execution.",
+        },
+        {
+            "ok": False,
+            "outcome": {
+                "kind": "error",
+                "failure_kind": "ProviderError",
+                "stage": "ingest",
+                "retryable": True,
+                "next_action": "retry",
+                "graph_unchanged": True,
+            },
+        },
+    ],
+)
+def test_valid_terminal_response_variants_remain_accepted(response: dict) -> None:
+    assert assessor_module._response_envelope_is_valid(response) is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "error"},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "failure", "failure_kind": "ProviderError"},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": True,
+            "outcome": {"kind": "error", "graph_unchanged": True},
+        },
+        {
+            "ok": False,
+            "graph_unchanged": True,
+            "outcome": {
+                "kind": "error",
+                "failure_kind": "ProviderError",
+                "stage": "ingest",
+                "next_action": "retry",
+            },
+        },
+    ],
+)
+def test_sparse_or_contradictory_failure_outcomes_never_validate(
+    tmp_path: Path, response: dict
+) -> None:
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"skip_intent_judge": True}},
+    )
+
+    assert assessor_module._response_envelope_is_valid(response) is False
+    assert assessment["passed"] is False
+    assert assessment["verdict"] == "undetermined"
+    assert any(issue["check"] == "response_malformed" for issue in assessment["issues"])
+
+
+def test_ancillary_invalid_utf8_is_undetermined_and_published(tmp_path: Path) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        "message": "The graph is already configured.",
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    (tmp_path / "implementation_result.json").write_bytes(b"\xff\xfe")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+    assert (tmp_path / "assessment.json").is_file()
+    assert any(
+        issue["check"] == "ancillary_artifact_unavailable"
+        for issue in assessment["issues"]
+    )
+
+
+def test_ancillary_permission_read_error_is_undetermined_and_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        "message": "The graph is already configured.",
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    (tmp_path / "implementation_result.json").write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def denied_read(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        if path.name == "implementation_result.json":
+            raise PermissionError("denied")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied_read)
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+    assert (tmp_path / "assessment.json").is_file()
+
+
+def test_ancillary_presence_error_is_undetermined_and_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        "message": "The graph is already configured.",
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def denied_presence(path: Path) -> bool:
+        if path.name == "final.ui.json":
+            raise PermissionError("presence denied")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", denied_presence)
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+    assert (tmp_path / "assessment.json").is_file()
+
+
+def test_apply_true_is_authoritative_without_assessment_flag(tmp_path: Path) -> None:
+    (tmp_path / "response.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "graph_unchanged": True,
+                "route": "revise",
+                "outcome": {"kind": "noop"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={
+            "apply": True,
+            "query": "change the graph",
+            "assessment": {"skip_intent_judge": True},
+        },
+    )
+
+    assert assessment["expect_graph_changed"] is True
+    assert assessment["verdict"] == "fail"
+    assert any(issue["check"] == "graph_changed" for issue in assessment["issues"])
+
+
+def _landed_edit_response() -> dict:
+    return {
+        "ok": True,
+        "graph_unchanged": False,
+        "route": "revise",
+        "outcome": {"kind": "candidate"},
+        "candidate_graph": {"1": {"class_type": "TestNode"}},
+        "change_details": {"landed_operation_count": 1},
+    }
+
+
+def test_assessor_logic_exception_is_not_mislabeled_as_artifact_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "response.json").write_text(
+        json.dumps(_landed_edit_response()), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        assessor_module,
+        "_canonical_route",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("route bug")),
+    )
+
+    with pytest.raises(RuntimeError, match="route bug"):
+        assess_live_output_dir(
+            tmp_path,
+            scenario={"apply": True, "assessment": {"skip_intent_judge": True}},
+        )
+
+
+def test_judge_exception_is_not_mislabeled_as_artifact_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "response.json").write_text(
+        json.dumps(_landed_edit_response()), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        assessor_module,
+        "judge_edit_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("judge bug")),
+    )
+
+    with pytest.raises(RuntimeError, match="judge bug"):
+        assess_live_output_dir(tmp_path, scenario={"apply": True})
+
+
+def test_ancillary_failure_does_not_demote_determined_product_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "revise",
+        "outcome": {"kind": "noop"},
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    real_load_json = assessor_module._load_json
+
+    def unavailable_impl(path: Path):  # noqa: ANN001
+        if path.name == "implementation_result.json":
+            raise assessor_module.AssessmentArtifactError("impl unavailable")
+        return real_load_json(path)
+
+    monkeypatch.setattr(assessor_module, "_load_json", unavailable_impl)
+
+    assessment = assess_live_output_dir(tmp_path, scenario={"apply": True})
+
+    assert assessment["verdict"] == "fail"
+    checks = {issue["check"] for issue in assessment["issues"]}
+    assert "graph_changed" in checks
+    assert "ancillary_artifact_unavailable" in checks
+
+
+@pytest.mark.parametrize("sidecar_kind", ["missing", "non_object", "invalid_utf8", "stale", "fallback"])
+def test_landed_edit_sidecar_issues_cannot_pass(
+    tmp_path: Path, sidecar_kind: str
+) -> None:
+    response = _landed_edit_response()
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    if sidecar_kind == "non_object":
+        (tmp_path / "artifact_lineage.json").write_text("[]", encoding="utf-8")
+    elif sidecar_kind == "invalid_utf8":
+        (tmp_path / "artifact_lineage.json").write_bytes(b"\xff\xfe")
+    elif sidecar_kind in {"stale", "fallback"}:
+        _seed_lineage(tmp_path)
+        manifest = json.loads(
+            (tmp_path / "artifact_lineage.json").read_text(encoding="utf-8")
+        )
+        if sidecar_kind == "stale":
+            manifest["lineage"]["turn_id"] = "stale-turn"
+        else:
+            fallback_reasons = {
+                "accepted_delta": "no_accepted_operations",
+                "candidate": "no_candidate_built",
+                "replay_proof": "replay_not_run",
+            }
+            for row in manifest["rows"]:
+                reason = fallback_reasons.get(row["kind"])
+                if reason is not None:
+                    row.pop("digest", None)
+                    row["row_class"] = "fallback"
+                    row["reason"] = reason
+            response = json.loads(
+                (tmp_path / "response.json").read_text(encoding="utf-8")
+            )
+            response["report"]["executor"]["artifact_lineage"] = json.loads(
+                json.dumps(manifest)
+            )
+            (tmp_path / "response.json").write_text(
+                json.dumps(response), encoding="utf-8"
+            )
+        (tmp_path / "artifact_lineage.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"apply": True, "assessment": {"skip_intent_judge": True}},
+    )
+
+    assert assessment["passed"] is False
+    assert assessment["verdict"] != "pass"
+
+
+def test_response_authored_plan_cannot_create_scenario_edit_obligation(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "response.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "graph_unchanged": True,
+                "route": "respond",
+                "outcome": {"kind": "respond"},
+                "report": {
+                    "executor": {"plan": {"implement": True, "route": "revise"}}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"classification": {"kind": "health_control"}},
+    )
+
+    assert assessment["expect_graph_changed"] is False
+    assert not any(issue["check"] == "graph_changed" for issue in assessment["issues"])
+
+
+def test_assessment_publication_failure_preserves_stale_canonical_and_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    stale = '{"verdict": "stale"}\n'
+    assessment_path = tmp_path / "assessment.json"
+    assessment_path.write_text(stale, encoding="utf-8")
+    (tmp_path / "response.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "graph_unchanged": True,
+                "route": "respond",
+                "outcome": {"kind": "respond"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def deny_replace(source, destination):  # noqa: ANN001
+        assert Path(source).parent == assessment_path.parent
+        assert Path(destination) == assessment_path
+        assert Path(source).name.startswith(".assessment.")
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(assessor_module.os, "replace", deny_replace)
+
+    with pytest.raises(AssessmentPublicationError) as excinfo:
+        assess_live_output_dir(tmp_path)
+
+    assert isinstance(excinfo.value.__cause__, PermissionError)
+    assert assessment_path.read_text(encoding="utf-8") == stale
+    assert list(tmp_path.glob(".assessment.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate_transaction"},
+            "candidate_graph": {"nodes": [{"id": 1}], "links": []},
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {
+                "kind": "candidate_transaction",
+                "candidate": {"graph": {"nodes": [{"id": 1}], "links": []}},
+            },
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate_transaction"},
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate_transaction"},
+            "candidate_transaction": None,
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {
+                "kind": "candidate_transaction",
+                "candidate_transaction": None,
+            },
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate_transaction"},
+            "candidate_transaction": {
+                "contract_version": "candidate_transaction_v99",
+                "nodes": [],
+            },
+            "change_details": {"landed_operation_count": 1},
+        },
+        {
+            "ok": True,
+            "graph_unchanged": False,
+            "outcome": {"kind": "candidate_transaction"},
+            "candidate_transaction": {"garbage": "x"},
+            "change_details": {"landed_operation_count": 1},
+        },
+    ],
+)
+def test_candidate_transaction_outcome_never_falls_back_to_other_evidence(
+    tmp_path: Path, response: dict
+) -> None:
+    assert assessor_module._response_envelope_is_valid(response) is False
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(
+        tmp_path,
+        scenario={"assessment": {"expect_graph_changed": True, "skip_intent_judge": True}},
+    )
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+
+
+@pytest.mark.parametrize("warnings", [7, [3], [""], ["   "]])
+def test_malformed_outcome_warnings_fail_closed(
+    tmp_path: Path, warnings: object
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "outcome": {
+            "kind": "requires_custom_nodes",
+            "candidates": [],
+            "warnings": warnings,
+        },
+    }
+    assert assessor_module._response_envelope_is_valid(response) is False
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+
+
+def test_empty_custom_node_refusal_with_empty_warnings_remains_compatible() -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "outcome": {
+            "kind": "requires_custom_nodes",
+            "candidates": [],
+            "warnings": [],
+        },
+    }
+    assert assessor_module._response_envelope_is_valid(response) is True
+
+
+def test_response_depth_bound_fails_closed_without_recursion_error(tmp_path: Path) -> None:
+    bomb: object = 0
+    for _ in range(500):
+        bomb = [bomb]
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        "bomb": bomb,
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+
+
+def test_response_json_recursion_error_is_undetermined(tmp_path: Path) -> None:
+    nested = "[" * 1000 + "0" + "]" * 1000
+    (tmp_path / "response.json").write_text(
+        '{"ok":true,"graph_unchanged":true,"route":"respond",'
+        '"outcome":{"kind":"respond"},"bomb":'
+        + nested
+        + "}",
+        encoding="utf-8",
+    )
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+
+
+def test_response_byte_bound_rejects_twenty_megabyte_message(tmp_path: Path) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        "message": "x" * (20 * 1024 * 1024),
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"bomb": [0] * 10_001},
+        {"message": "x" * 1_000_001},
+    ],
+)
+def test_response_collection_and_string_bounds_fail_closed(
+    tmp_path: Path, payload: dict
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+        **payload,
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    assessment = assess_live_output_dir(tmp_path)
+
+    assert assessment["verdict"] == "undetermined"
+    assert assessment["passed"] is False
+
+
+@pytest.mark.parametrize("hook", ["validator", "freezer"])
+def test_response_loader_logic_exceptions_propagate(
+    tmp_path: Path, monkeypatch, hook: str
+) -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": True,
+        "route": "respond",
+        "outcome": {"kind": "respond"},
+    }
+    (tmp_path / "response.json").write_text(json.dumps(response), encoding="utf-8")
+
+    if hook == "validator":
+        def hostile_validator(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("hostile validator")
+
+        monkeypatch.setattr(
+            assessor_module, "_response_envelope_is_valid", hostile_validator
+        )
+    else:
+        def hostile_freezer(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise RecursionError("hostile freezer")
+
+        monkeypatch.setattr(assessor_module, "_freeze_json", hostile_freezer)
+
+    with pytest.raises((RuntimeError, RecursionError), match="hostile"):
+        assess_live_output_dir(tmp_path)
+
+
+def _valid_candidate_transaction() -> dict:
+    submit_graph = {
+        "nodes": [
+            {
+                "vibecomfy_uid": "node-1",
+                "type": "PreviewImage",
+                "pos": [0, 0],
+                "size": [200, 100],
+            }
+        ],
+        "links": [],
+        "groups": [],
+    }
+    candidate_graph = {
+        **submit_graph,
+        "nodes": [{**submit_graph["nodes"][0], "pos": [300, 100]}],
+    }
+    return build_candidate_transaction(
+        workflow_id="123e4567-e89b-12d3-a456-426614174000",
+        session_id="session",
+        turn_id="0001",
+        plan_hash="plan",
+        revision_id="a" * 64,
+        parent_revision="",
+        submit_graph=submit_graph,
+        candidate_graph=candidate_graph,
+        accepted_batch=[],
+        delta_hash=content_hash({"schema_version": "2.0.0", "ops": []}),
+        submit_graph_hash="submit",
+        submit_structural_graph_hash="submit-structural",
+        candidate_graph_hash="candidate",
+        candidate_structural_graph_hash="candidate-structural",
+        authority_receipt_hash="a" * 64,
+        schema_witness={},
+        replay_ok=True,
+        candidate_matches=True,
+        applyable=True,
+        verification_kind="delta_replay",
+        bundle_digests={
+            "revision_id": "a" * 64,
+            "parent_revision": "",
+            "workflow_identity": "123e4567-e89b-12d3-a456-426614174000",
+            "python_path": "/tmp/candidate.py",
+            "semantic_digest": "b" * 64,
+            "sidecar_state": "absent",
+            "ui_digest": "",
+        },
+    )
+
+
+def test_valid_candidate_transaction_v2_is_required_and_accepted() -> None:
+    response = {
+        "ok": True,
+        "graph_unchanged": False,
+        "outcome": {"kind": "candidate_transaction"},
+        "candidate_transaction": _valid_candidate_transaction(),
+        "change_details": {"landed_operation_count": 1},
+    }
+
+    assert assessor_module._response_envelope_is_valid(response) is True

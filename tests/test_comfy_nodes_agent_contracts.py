@@ -1,0 +1,3274 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import sys
+import types
+
+import pytest
+
+from vibecomfy.comfy_nodes.agent.contracts import (
+    AGENT_EDIT_TURN_CONTRACT_VERSION,
+    CANVAS_APPLY_GATE_NAMES,
+    DEFAULT_GATE_NAMES,
+    FAILURE_HINT_KEYS,
+    DiagnosticRecord,
+    FAILURE_SPECS,
+    INTERNAL_TO_PUBLIC_OUTCOME,
+    PUBLIC_OUTCOME_KINDS,
+    PLAN_VALIDATE_GATE_NAME,
+    REBASELINE_RECOVERY_FIELDS,
+    SCAN_CODE_FAILURE_KIND,
+    AgentError,
+    ApplyCandidate,
+    ApplyEligibility,
+    ArtifactRef,
+    FailureEnvelope,
+    FailureKind,
+    FieldChange as ContractFieldChange,
+    ProviderStatus,
+    StageResult,
+    StageSnapshot,
+    TURN_OUTCOME_KINDS,
+    TurnContext,
+    TurnIdentity,
+    TurnOutcome,
+    classify_failure,
+    derive_apply_candidate_key,
+    ensure_agent_edit_response_contract,
+    derive_pending_response_key,
+    failure_envelope,
+    product_failure_envelope_fields,
+    public_chat_rehydrate_payload,
+    public_latest_candidate,
+    public_response_details,
+    public_session_json_payload,
+    public_outcome_from_turn_outcome,
+    repair_field_changes,
+    success_envelope,
+    turn_envelope,
+)
+from vibecomfy.porting.edit.types import FieldChange
+from vibecomfy.security.agent_generated_loader import (
+    AgentGeneratedLoadError,
+    ScanFailure,
+    ScanReport,
+)
+
+
+EXPECTED_REBASELINE_RECOVERY_FIELDS = (
+    "action",
+    "endpoint",
+    "reason",
+    "last_known_baseline_graph_hash",
+    "submit_graph_hash",
+    "submit_structural_graph_hash",
+    "client_graph_hash",
+    "client_structural_graph_hash",
+)
+
+EXPECTED_SCOPED_ACCEPT_RECOVERY_FIELDS = (
+    "action",
+    "endpoint",
+    "reason",
+    "turn_id",
+    "submit_graph_hash",
+    "candidate_graph_hash",
+)
+
+
+def _json_paths_containing(value: object, needle: str, path: str = "$") -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, item in value.items():
+            paths.extend(_json_paths_containing(item, needle, f"{path}.{key}"))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(_json_paths_containing(item, needle, f"{path}[{index}]"))
+        return paths
+    if isinstance(value, str) and needle in value:
+        return [path]
+    return []
+
+
+def _json_key_paths(value: object, forbidden_keys: set[str], path: str = "$") -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, item in value.items():
+            child_path = f"{path}.{key}"
+            if key in forbidden_keys:
+                paths.append(child_path)
+            paths.extend(_json_key_paths(item, forbidden_keys, child_path))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(_json_key_paths(item, forbidden_keys, f"{path}[{index}]"))
+        return paths
+    return []
+
+
+def _assert_public_projection_has_no_forbidden_sentinels(value: object) -> None:
+    forbidden_keys = {
+        "audit_path",
+        "audit_ref",
+        "batch_turns",
+        "budget",
+        "budget_trace",
+        "debug_payload",
+        "detail_json_path",
+        "path",
+        "prompt",
+        "provider_diagnostics",
+        "raw_prompt",
+        "raw_session_state",
+        "request_path",
+        "response_path",
+    }
+    assert _json_key_paths(value, forbidden_keys) == []
+    assert _json_paths_containing(value, "SECRET_PUBLIC_PROJECTION_SENTINEL") == []
+
+
+def test_canonical_backend_contract_objects_serialize_snake_case() -> None:
+    identity = TurnIdentity(
+        session_id="sess-1",
+        turn_id="0007",
+        baseline_turn_id="0006",
+        idempotency_key="submit:key",
+    )
+    candidate = ApplyCandidate(
+        state="candidate",
+        graph={"nodes": [{"id": 1}], "links": []},
+        graph_hash="candidate-hash",
+        structural_graph_hash="candidate-structural-hash",
+        baseline_graph_hash="baseline-hash",
+        submit_graph_hash="submit-hash",
+        submit_structural_graph_hash="submit-structural-hash",
+        turn_identity=identity,
+    )
+    snapshot = StageSnapshot(
+        stage="ui_emit",
+        ok=True,
+        blocking=False,
+        duration_ms=12,
+        gates={"ui_emit_ok": True},
+        artifacts=(ArtifactRef(path="turns/0007/candidate.ui.json", sha256="abc"),),
+        issues=({"code": "warning"},),
+        value={"summary": ["ok"]},
+    )
+    provider = ProviderStatus(
+        provider="arnold",
+        provider_available=True,
+        ready=True,
+        model="gpt-5.1",
+        route="openai-codex",
+        message="ready",
+        error={"detail": {"code": "none"}},
+    )
+
+    assert identity.to_dict() == {
+        "session_id": "sess-1",
+        "turn_id": "0007",
+        "baseline_turn_id": "0006",
+        "idempotency_key": "submit:key",
+    }
+    assert candidate.to_dict() == {
+        "state": "candidate",
+        "graph": {"nodes": [{"id": 1}], "links": []},
+        "graph_hash": "candidate-hash",
+        "structural_graph_hash": "candidate-structural-hash",
+        "baseline_graph_hash": "baseline-hash",
+            "submit_graph_hash": "submit-hash",
+            "submit_structural_graph_hash": "submit-structural-hash",
+            "plan_hash": None,
+            "structural_hash_before": None,
+            "structural_hash_after": None,
+            "monotonic_generation": None,
+            "lease_nonce": None,
+            "turn_identity": identity.to_dict(),
+    }
+    assert snapshot.to_dict() == {
+        "stage": "ui_emit",
+        "ok": True,
+        "blocking": False,
+        "duration_ms": 12,
+        "gates": {"ui_emit_ok": True},
+        "artifacts": [
+            {
+                "path": "turns/0007/candidate.ui.json",
+                "sha256": "abc",
+                "byte_count": None,
+                "preview": None,
+            }
+        ],
+        "issues": [{"code": "warning"}],
+        "value": {"summary": ["ok"]},
+    }
+    assert provider.to_dict() == {
+        "provider": "arnold",
+        "provider_available": True,
+        "ready": True,
+        "contract_version": AGENT_EDIT_TURN_CONTRACT_VERSION,
+        "model": "gpt-5.1",
+        "route": "openai-codex",
+        "message": "ready",
+        "error": {"detail": {"code": "none"}},
+    }
+
+
+def test_contract_boundary_reexports_field_change_and_reuses_failure_envelope() -> None:
+    assert ContractFieldChange is FieldChange
+    assert AgentError is FailureEnvelope
+
+    change = ContractFieldChange(uid="n1", field_path="widgets.seed", old=1, new=2)
+    assert change.to_dict() == {
+        "uid": "n1",
+        "field_path": "widgets.seed",
+        "old": 1,
+        "new": 2,
+    }
+
+
+def test_backend_contract_dataclasses_validate_and_freeze_boundaries() -> None:
+    with pytest.raises(ValueError, match="Unknown Apply eligibility reason"):
+        ApplyEligibility(applyable=False, reason="not_a_reason", message="blocked")
+    with pytest.raises(ValueError, match="Unknown TurnOutcome kind"):
+        TurnOutcome(kind="not_a_kind")
+    with pytest.raises(ValueError, match="Only failure TurnOutcome"):
+        TurnOutcome(kind="noop", failure_kind=FailureKind.TIMEOUT_ERROR)
+    with pytest.raises(ValueError, match="Failure TurnOutcome requires"):
+        TurnOutcome(kind="failure", failure_kind=FailureKind.TIMEOUT_ERROR)
+
+    identity = TurnIdentity(session_id="sess-1", turn_id="0007")
+    with pytest.raises((TypeError, AttributeError)):
+        identity.turn_id = "0008"  # type: ignore[misc]
+
+    candidate = ApplyCandidate(
+        state="candidate",
+        graph={"nodes": [{"id": "1"}]},
+        graph_hash="candidate-hash",
+        structural_graph_hash="structural-hash",
+    )
+    with pytest.raises(TypeError):
+        candidate.graph["nodes"] = []  # type: ignore[index]
+    with pytest.raises(TypeError):
+        candidate.graph["nodes"][0]["id"] = "2"  # type: ignore[index]
+
+    snapshot = StageSnapshot(
+        stage="ui_emit",
+        ok=True,
+        blocking=False,
+        gates={"ui_emit_ok": True},
+        issues=({"detail": {"raw": "issue"}},),
+        value={"nested": {"ok": True}},
+    )
+    with pytest.raises(TypeError):
+        snapshot.gates["ui_emit_ok"] = False  # type: ignore[index]
+    with pytest.raises(TypeError):
+        snapshot.issues[0]["detail"]["raw"] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        snapshot.value["nested"]["ok"] = False  # type: ignore[index]
+
+
+def test_failure_contract_sanitizes_user_facing_payload_but_keeps_debug_details() -> None:
+    raw_detail = "Provider stack trace: api_key=sk-secret token=leaked"
+    failure = classify_failure(
+        "agent_response",
+        RuntimeError(raw_detail),
+        TurnContext(session_id="s1", turn_id="0009"),
+    )
+
+    payload = failure.to_dict()
+    product_payload = dict(payload)
+    product_payload.update(product_failure_envelope_fields(failure))
+
+    assert failure.kind is FailureKind.PROVIDER_ERROR
+    assert raw_detail not in payload["message"]
+    assert raw_detail not in payload["user_facing_message"]
+    assert raw_detail not in product_payload["message"]
+    assert raw_detail not in product_payload["user_facing_message"]
+    assert raw_detail not in product_payload["outcome"]["next_action"]
+    assert raw_detail not in product_payload["outcome"].get("agent_failure_context", {})
+    assert raw_detail not in product_payload["agent_failure_context"].get("explanation", "")
+    assert payload["agent_failure_context"]["explanation"] == raw_detail
+    assert (
+        product_payload["debug"]["failure"]["agent_failure_context"]["explanation"]
+        == raw_detail
+    )
+    assert _json_paths_containing(product_payload, raw_detail) == [
+        "$.debug.failure.agent_failure_context.explanation"
+    ]
+
+
+def test_boundary_only_key_derivation_helpers_are_stable() -> None:
+    identity = TurnIdentity(session_id="sess-1", turn_id="0007", idempotency_key="submit:key")
+    candidate = ApplyCandidate(
+        state="candidate",
+        graph={"nodes": []},
+        graph_hash="candidate-hash",
+        structural_graph_hash="candidate-structural-hash",
+        turn_identity=identity,
+    )
+
+    assert derive_pending_response_key(identity) == "pending:sess-1:0007"
+    assert derive_pending_response_key(
+        {"session_id": "sess-1", "idempotency_key": "submit:key"}
+    ) == "pending:sess-1:submit:key"
+    assert derive_pending_response_key({}) == "pending:no-session:no-turn"
+    assert derive_apply_candidate_key(candidate) == "candidate:sess-1:0007:candidate-hash"
+    assert derive_apply_candidate_key({"graph_hash": "candidate-hash"}) == (
+        "candidate:candidate-hash"
+    )
+
+
+def test_turn_identity_key_derivation_rejects_invalid_boundary_values() -> None:
+    assert derive_pending_response_key(
+        {"session_id": 123, "turn_id": 456, "idempotency_key": object()}
+    ) == "pending:no-session:no-turn"
+
+    assert derive_apply_candidate_key(
+        {"graph_hash": 123, "turn_identity": {"session_id": "sess-1", "turn_id": 7}}
+    ) == "candidate:no-graph-hash"
+    assert derive_apply_candidate_key(
+        {"graph_hash": "candidate-hash"},
+        identity={"session_id": "sess-2", "turn_id": "0008"},
+    ) == "candidate:sess-2:0008:candidate-hash"
+    assert derive_apply_candidate_key(
+        {
+            "graph_hash": "candidate-hash",
+            "turn_identity": {"session_id": "sess-1", "turn_id": "0007"},
+        },
+        identity={"session_id": "sess-2"},
+    ) == "candidate:candidate-hash"
+
+
+def test_stage_snapshot_can_be_built_from_stage_result_without_aliases() -> None:
+    result = StageResult(
+        stage="validate",
+        ok=True,
+        blocking=False,
+        duration_ms=4,
+        value={"count": 1},
+        artifacts=(ArtifactRef(path="audit.json"),),
+        issues=({"code": "info"},),
+        gate_updates={"ir_validate_ok": True},
+    )
+
+    assert StageSnapshot.from_stage_result(result).to_dict() == {
+        "stage": "validate",
+        "ok": True,
+        "blocking": False,
+        "duration_ms": 4,
+        "gates": {"ir_validate_ok": True},
+        "artifacts": [
+            {
+                "path": "audit.json",
+                "sha256": None,
+                "byte_count": None,
+                "preview": None,
+            }
+        ],
+        "issues": [{"code": "info"}],
+        "value": {"count": 1},
+    }
+
+
+def test_failure_kind_enum_matches_closed_contract_exactly() -> None:
+    assert [kind.value for kind in FailureKind] == [
+        "SyntaxError",
+        "ASTScanFailure",
+        "OversizedPayload",
+        "MalformedModelJSON",
+        "MissingRequiredField",
+        "ProviderError",
+        "ProviderCreditError",
+        "AgentRuntimeUnavailable",
+        "AuthError",
+        "TimeoutError",
+        "ValidationError",
+        "UnsatisfiedInputError",
+        "RefusedEmit",
+        "EditorAheadConflict",
+        "StaleStateMismatch",
+        "UnsupportedNonDAG",
+        "LoweringFailure",
+        "SchemaLessQueueBlocker",
+        "LowConfidenceQueueBlocker",
+        "EditorOnlyNodeQueueBlocker",
+        "AuditWriteWarning",
+        "AuditWriteFailure",
+        "BatchBudgetExhausted",
+        "ClarificationRequired",
+        "ModelMistake",
+        "Unrepresentable",
+        "SchemaGap",
+    ]
+
+
+def test_turn_context_defaults_all_named_gates_false() -> None:
+    context = TurnContext(session_id="s1")
+
+    assert tuple(context.gate_results) == DEFAULT_GATE_NAMES
+    assert context.gate_snapshot() == {name: False for name in DEFAULT_GATE_NAMES}
+    assert context.canvas_apply_allowed is False
+    assert context.apply_allowed is False
+    assert context.queue_allowed is False
+
+
+def test_turn_context_preserves_protocol_identity_fields() -> None:
+    context = TurnContext(
+        session_id="s1",
+        turn_id="0007",
+        baseline_turn_id="0006",
+        client_graph_hash="submit-hash",
+        idempotency_key="accept:s1:0007:abc",
+    )
+
+    assert context.session_id == "s1"
+    assert context.turn_id == "0007"
+    assert context.baseline_turn_id == "0006"
+    assert context.client_graph_hash == "submit-hash"
+    assert context.idempotency_key == "accept:s1:0007:abc"
+    assert context.gate_snapshot() == {name: False for name in DEFAULT_GATE_NAMES}
+
+
+# ── Characterization: absent plan_validate_ok must fail closed ────────────
+
+
+def test_rehydrated_turn_context_without_plan_validate_ok_blocks_apply() -> None:
+    """Rehydrated TurnContext missing ``plan_validate_ok`` must block Apply.
+
+    When a ``TurnContext`` is rebuilt from durable storage (rehydrated) and the
+    serialized gate set omits ``plan_validate_ok``, the context MUST NOT
+    silently default the gate to passing.  ``canvas_apply_allowed`` requires
+    *every* gate in ``CANVAS_APPLY_GATE_NAMES`` to be ``True``, so a missing
+    ``plan_validate_ok`` must behave as ``False`` — fail-closed.
+
+    The existing ``__post_init__`` synthesizes ``plan_validate_ok=True`` with
+    evidence ``legacy_no_execution_plan`` when the gate is absent from a
+    non-empty ``gate_results`` dict.  This test documents that behaviour as a
+    leak: Apply should be **blocked** until the plan validator explicitly
+    sets the gate.
+    """
+    # All canvas-apply gates *except* plan_validate_ok are explicitly True.
+    rehydrated_gates: dict[str, bool] = {
+        name: True
+        for name in CANVAS_APPLY_GATE_NAMES
+        if name != PLAN_VALIDATE_GATE_NAME
+    }
+    # Ensure the test precondition is correct: plan_validate_ok is absent.
+    assert PLAN_VALIDATE_GATE_NAME not in rehydrated_gates
+
+    context = TurnContext(
+        session_id="s1",
+        turn_id="0023",
+        gate_results=rehydrated_gates,  # type: ignore[arg-type]
+    )
+
+    # The gate snapshot MUST include plan_validate_ok (it is a DEFAULT_GATE).
+    assert PLAN_VALIDATE_GATE_NAME in context.gate_snapshot()
+
+    # Characterisation: missing plan_validate_ok means Apply is blocked.
+    # The current code synthesizes ok=True, making this assertion fail.
+    assert context.canvas_apply_allowed is False, (
+        f"plan_validate_ok gate={context.gate_snapshot()[PLAN_VALIDATE_GATE_NAME]}, "
+        f"but canvas_apply_allowed should be False when plan_validate_ok is absent "
+        f"from rehydrated gates.  Evidence on plan_validate_ok: "
+        f"{context.gate_results[PLAN_VALIDATE_GATE_NAME].evidence}"
+    )
+
+    # apply_allowed delegates to derive_apply_eligibility which
+    # checks canvas_apply_allowed, so it should also be blocked.
+    assert context.apply_allowed is False
+
+
+def test_rehydrated_turn_context_absent_plan_shows_failing_evidence() -> None:
+    """The evidence on a rehydrated absent-plan gate must indicate failure."""
+    rehydrated_gates: dict[str, bool] = {
+        name: True
+        for name in CANVAS_APPLY_GATE_NAMES
+        if name != PLAN_VALIDATE_GATE_NAME
+    }
+
+    context = TurnContext(
+        session_id="s1",
+        turn_id="0024",
+        gate_results=rehydrated_gates,  # type: ignore[arg-type]
+    )
+
+    plan_gate = context.gate_results[PLAN_VALIDATE_GATE_NAME]
+    # The gate must be False (fail-closed) when absent from rehydrated data.
+    assert plan_gate.ok is False, (
+        f"plan_validate_ok should be False when absent from rehydrated gates. "
+        f"Got ok={plan_gate.ok} with evidence={plan_gate.evidence}"
+    )
+    # Evidence should clearly state the plan is missing, not that the
+    # absence is acceptable.
+    evidence = dict(plan_gate.evidence)
+    assert evidence.get("stage") == "rehydrate", (
+        f"Expected rehydrate stage in evidence, got {evidence}"
+    )
+    # The reason must not be 'legacy_no_execution_plan' which is a
+    # fail-open classification.
+    assert evidence.get("reason") != "legacy_no_execution_plan", (
+        "Absent plan_validate_ok must not be classified as "
+        f"'legacy_no_execution_plan' (fail-open). Got: {evidence}"
+    )
+
+
+def test_scan_code_mapping_is_exact_and_closed() -> None:
+    assert dict(SCAN_CODE_FAILURE_KIND) == {
+        "syntax_error": FailureKind.SYNTAX_ERROR,
+        "source_too_large": FailureKind.OVERSIZED_PAYLOAD,
+        "source_type": FailureKind.VALIDATION_ERROR,
+        "forbidden_node": FailureKind.AST_SCAN_FAILURE,
+        "forbidden_import": FailureKind.AST_SCAN_FAILURE,
+        "forbidden_name": FailureKind.AST_SCAN_FAILURE,
+        "forbidden_call": FailureKind.AST_SCAN_FAILURE,
+        "dunder_access": FailureKind.AST_SCAN_FAILURE,
+    }
+
+
+def test_classify_failure_uses_loader_scan_mappings() -> None:
+    context = TurnContext(session_id="s1", turn_id="0001", baseline_turn_id="0000")
+    load_error = AgentGeneratedLoadError(
+        "scan failed",
+        report=ScanReport(
+            ok=False,
+            failures=(ScanFailure(code="source_type", message="source must be str"),),
+        ),
+    )
+
+    failure = classify_failure("load_python", load_error, context)
+
+    assert failure.kind is FailureKind.VALIDATION_ERROR
+    assert failure.stage == "load_python"
+    assert failure.session_id == "s1"
+    assert failure.turn_id == "0001"
+    assert failure.baseline_turn_id == "0000"
+    assert failure.canvas_apply_allowed is False
+    assert failure.queue_allowed is False
+    assert failure.apply_allowed is False
+    assert failure.agent_failure_context["scan_code"] == "source_type"
+
+
+def test_failure_envelope_shape_is_frozen_and_uses_apply_alias() -> None:
+    context = TurnContext(session_id="s1", turn_id="0001")
+    failure = failure_envelope(
+        FailureKind.MISSING_REQUIRED_FIELD,
+        "agent_response",
+        context,
+        agent_failure_context={"explanation": "missing python"},
+    )
+
+    payload = failure.to_dict()
+
+    assert payload["ok"] is False
+    assert payload["kind"] == "MissingRequiredField"
+    assert payload["stage"] == "agent_response"
+    assert payload["session_id"] == "s1"
+    assert payload["turn_id"] == "0001"
+    assert payload["baseline_turn_id"] is None
+    assert payload["canvas_apply_allowed"] is False
+    assert payload["apply_allowed"] is False
+    assert payload["queue_allowed"] is False
+    assert payload["graph_unchanged"] is True
+    assert payload["message"] == payload["user_facing_message"]
+    assert payload["agent_failure_context"] == {"explanation": "missing python"}
+    assert payload["audit_ref"] is None
+    assert payload["audit_error"] is None
+
+    with pytest.raises(TypeError):
+        failure.agent_failure_context["other"] = "nope"  # type: ignore[index]
+
+
+def test_turn_outcome_kinds_are_closed_and_ordered() -> None:
+    assert TURN_OUTCOME_KINDS == (
+        "edit",
+        "clarify",
+        "edit+clarify",
+        "failure",
+        "noop",
+        "budget",
+    )
+
+
+def test_public_outcome_kinds_are_closed_and_ordered() -> None:
+    assert PUBLIC_OUTCOME_KINDS == (
+        "candidate",
+        "candidate_transaction",
+        "noop",
+        "clarify",
+        "error",
+        "requires_custom_nodes",
+    )
+
+
+def test_turn_outcome_to_dict_serializes_edit_and_clarify_discriminants() -> None:
+    outcome = TurnOutcome.edit_and_clarify(
+        changes=(
+            FieldChange(
+                uid="node-7",
+                field_path="widgets.seed",
+                old={"value": 7},
+                new={"value": 9},
+            ),
+        ),
+        question="Should I also rename the output prefix?",
+    )
+
+    assert outcome.to_dict() == {
+        "kind": "edit+clarify",
+        "changes": [
+            {
+                "uid": "node-7",
+                "field_path": "widgets.seed",
+                "old": {"value": 7},
+                "new": {"value": 9},
+            }
+        ],
+        "question": "Should I also rename the output prefix?",
+    }
+
+
+def test_turn_outcome_failure_to_dict_includes_required_discriminants() -> None:
+    failure = failure_envelope(
+        FailureKind.TIMEOUT_ERROR,
+        "agent_response",
+        TurnContext(session_id="s1", turn_id="0001"),
+        agent_failure_context={"explanation": "provider timed out"},
+    )
+
+    assert TurnOutcome.from_failure(failure).to_dict() == {
+        "kind": "failure",
+        "failure_kind": FailureKind.TIMEOUT_ERROR.value,
+        "stage": "agent_response",
+        "retryable": True,
+        "next_action": "retry with the same request",
+        "graph_unchanged": True,
+    }
+
+
+def test_public_outcome_from_turn_outcome_maps_internal_variants_to_public_union() -> None:
+    edit = public_outcome_from_turn_outcome(
+        TurnOutcome.edit(
+            changes=(
+                FieldChange(uid="n1", field_path="widgets.seed", old=1, new=2),
+            )
+        )
+    )
+    edit_and_clarify = public_outcome_from_turn_outcome(
+        TurnOutcome.edit_and_clarify(question="before or after?")
+    )
+    clarify = public_outcome_from_turn_outcome(TurnOutcome.clarify(question="which model?"))
+    noop = public_outcome_from_turn_outcome(TurnOutcome.noop(reason="nothing changed"))
+
+    assert edit == {
+        "kind": "candidate",
+        "changes": [
+            {
+                "uid": "n1",
+                "field_path": "widgets.seed",
+                "old": 1,
+                "new": 2,
+            }
+        ],
+    }
+    assert edit_and_clarify == {
+        "kind": "candidate",
+        "changes": [],
+        "question": "before or after?",
+        "clarification": {"message": "before or after?"},
+    }
+    assert clarify == {
+        "kind": "clarify",
+        "question": "which model?",
+        "clarification": {"message": "which model?"},
+    }
+    assert noop == {
+        "kind": "noop",
+        "reason": "nothing changed",
+    }
+
+
+def test_public_outcome_from_turn_outcome_maps_budget_without_failure_to_candidate_or_noop() -> None:
+    assert public_outcome_from_turn_outcome(
+        TurnOutcome.budget(reason="ran out of turns"),
+        response={"candidate": {"graph_hash": "abc123"}},
+    ) == {
+        "kind": "candidate",
+        "budget_exhausted": True,
+        "reason": "ran out of turns",
+        "changes": [],
+    }
+    assert public_outcome_from_turn_outcome(
+        TurnOutcome.budget(reason="ran out of turns"),
+        response={"candidate": None},
+    ) == {
+        "kind": "noop",
+        "budget_exhausted": True,
+        "reason": "ran out of turns",
+    }
+
+
+def test_public_outcome_from_turn_outcome_maps_failure_to_error_and_promotes_recovery() -> None:
+    failure = failure_envelope(
+        FailureKind.STALE_STATE_MISMATCH,
+        "ingest",
+        TurnContext(session_id="s1", turn_id="0002"),
+        agent_failure_context={
+            "issues": [
+                {
+                    "code": "stale_state_mismatch",
+                    "rebaseline_recovery": {"action": "rebaseline", "endpoint": "/vibecomfy/agent-edit/rebaseline"},
+                }
+            ]
+        },
+    )
+
+    assert public_outcome_from_turn_outcome(TurnOutcome.from_failure(failure), response=failure.to_dict()) == {
+        "kind": "error",
+        "failure_kind": FailureKind.STALE_STATE_MISMATCH.value,
+        "stage": "ingest",
+        "retryable": False,
+        "next_action": "resubmit from the current canvas",
+        "graph_unchanged": True,
+        "agent_failure_context": {
+            "issues": [
+                {
+                    "code": "stale_state_mismatch",
+                    "rebaseline_recovery": {"action": "rebaseline", "endpoint": "/vibecomfy/agent-edit/rebaseline"},
+                }
+            ]
+        },
+        "rebaseline_recovery": {"action": "rebaseline", "endpoint": "/vibecomfy/agent-edit/rebaseline"},
+    }
+
+
+def test_product_failure_outcome_payload_keeps_contract_version_and_context() -> None:
+    failure = failure_envelope(
+        FailureKind.MISSING_REQUIRED_FIELD,
+        "agent_response",
+        TurnContext(session_id="s1"),
+        agent_failure_context={"explanation": "missing python"},
+    )
+    payload = failure.to_dict()
+    payload.update(product_failure_envelope_fields(failure))
+
+    assert payload["contract_version"] == AGENT_EDIT_TURN_CONTRACT_VERSION
+    assert payload["outcome"]["kind"] == "error"
+    assert payload["outcome"]["failure_kind"] == FailureKind.MISSING_REQUIRED_FIELD.value
+    assert payload["candidate"] is None
+    assert payload["eligibility"]["reason"] == "server_blocked"
+    assert payload["audit_ref"] is None
+    assert payload["debug"]["failure"]["kind"] == FailureKind.MISSING_REQUIRED_FIELD.value
+
+
+def test_failure_envelope_to_dict_stamps_public_error_outcome() -> None:
+    failure = failure_envelope(
+        FailureKind.MISSING_REQUIRED_FIELD,
+        "agent_response",
+        TurnContext(session_id="s1"),
+        agent_failure_context={"explanation": "missing python"},
+    )
+
+    assert failure.to_dict()["outcome"] == {
+        "kind": "error",
+        "failure_kind": FailureKind.MISSING_REQUIRED_FIELD.value,
+        "stage": "agent_response",
+        "retryable": True,
+        "next_action": "wait and retry; model response is incomplete",
+        "graph_unchanged": True,
+        "agent_failure_context": {"explanation": "missing python"},
+    }
+
+
+def test_failure_envelope_to_dict_promotes_nested_recovery_without_dropping_context() -> None:
+    recovery = {
+        "action": "rebaseline",
+        "endpoint": "/vibecomfy/agent-edit/rebaseline",
+    }
+    failure = failure_envelope(
+        FailureKind.STALE_STATE_MISMATCH,
+        "ingest",
+        TurnContext(session_id="s1", turn_id="0002"),
+        agent_failure_context={
+            "issues": [
+                {
+                    "code": "stale_state_mismatch",
+                    "rebaseline_recovery": recovery,
+                    "detail": "client baseline is stale",
+                }
+            ]
+        },
+    )
+
+    payload = failure.to_dict()
+
+    assert payload["outcome"]["kind"] == "error"
+    assert payload["outcome"]["rebaseline_recovery"] == recovery
+    assert payload["rebaseline_recovery"] == recovery
+    assert payload["agent_failure_context"] == {
+        "issues": [
+            {
+                "code": "stale_state_mismatch",
+                "rebaseline_recovery": recovery,
+                "detail": "client baseline is stale",
+            }
+        ]
+    }
+
+
+def test_ensure_agent_edit_response_contract_accepts_scoped_conflict_recovery_issue() -> None:
+    recovery = {
+        "action": "rebaseline",
+        "endpoint": "/vibecomfy/agent-edit/rebaseline",
+        "reason": "scoped_accept_conflict",
+        "turn_id": "turn-7",
+        "submit_graph_hash": "submit-hash",
+        "candidate_graph_hash": "candidate-hash",
+    }
+
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": False,
+            "kind": FailureKind.STALE_STATE_MISMATCH.value,
+            "stage": "accept",
+            "retryable": False,
+            "next_action": "resubmit from the current canvas",
+            "graph_unchanged": True,
+            "agent_failure_context": {
+                "explanation": "Scoped accept verification failed.",
+                "issues": [
+                    {
+                        "code": "scoped_conflict",
+                        "detail": "Node 2 prompt drifted after submit.",
+                        "rebaseline_recovery": recovery,
+                    }
+                ],
+            },
+        },
+        stage="accept",
+    )
+
+    assert payload["rebaseline_recovery"] == recovery
+    assert payload["outcome"]["rebaseline_recovery"] == recovery
+    assert payload["agent_failure_context"]["issues"][0]["rebaseline_recovery"] == recovery
+    assert tuple(payload["rebaseline_recovery"]) == EXPECTED_SCOPED_ACCEPT_RECOVERY_FIELDS
+    assert set(payload["rebaseline_recovery"]) == set(EXPECTED_SCOPED_ACCEPT_RECOVERY_FIELDS)
+    assert "candidate_graph_hash" not in REBASELINE_RECOVERY_FIELDS
+
+
+def test_rebaseline_recovery_fields_are_exact_canonical_tuple() -> None:
+    assert REBASELINE_RECOVERY_FIELDS == EXPECTED_REBASELINE_RECOVERY_FIELDS
+    assert len(REBASELINE_RECOVERY_FIELDS) == 8
+
+
+def test_stale_rebaseline_recovery_issue_uses_only_canonical_recovery_fields(
+    tmp_path,
+) -> None:
+    from vibecomfy.comfy_nodes.agent.edit import (
+        AgentEditState,
+        _stale_rebaseline_recovery_issue,
+    )
+
+    graph = {"nodes": [], "links": []}
+    state = AgentEditState(
+        task="Update the workflow.",
+        graph=graph,
+        request_payload={"graph": graph},
+        schema_provider=None,
+        baseline_graph_hash="baseline-hash",
+        submit_graph_hash="submit-hash",
+        submit_structural_graph_hash="submit-structural-hash",
+        submitted_client_graph_hash="client-hash",
+        submitted_client_structural_graph_hash="client-structural-hash",
+        session_dir=tmp_path / "session",
+        turn_dir=tmp_path / "session" / "turns" / "0001",
+        request_path=tmp_path / "session" / "turns" / "0001" / "request.json",
+        original_ui_path=tmp_path / "session" / "turns" / "0001" / "original.ui.json",
+        before_py_path=tmp_path / "session" / "turns" / "0001" / "before.py",
+        after_py_path=tmp_path / "session" / "turns" / "0001" / "after.py",
+        projection_path=tmp_path / "session" / "turns" / "0001" / "projection.txt",
+        model_request_path=tmp_path / "session" / "turns" / "0001" / "model_request.json",
+        model_response_path=tmp_path / "session" / "turns" / "0001" / "model_response.json",
+        candidate_ui_path=tmp_path / "session" / "turns" / "0001" / "candidate.ui.json",
+        messages_path=tmp_path / "session" / "turns" / "0001" / "messages.jsonl",
+    )
+
+    issue = _stale_rebaseline_recovery_issue(
+        state,
+        {
+            "reason": "hash_mismatch",
+            "baseline_graph_hash": "baseline-hash",
+        },
+    )
+    recovery = issue["rebaseline_recovery"]
+
+    assert tuple(recovery) == REBASELINE_RECOVERY_FIELDS
+    assert set(recovery) == set(REBASELINE_RECOVERY_FIELDS)
+    assert recovery == {
+        "action": "rebaseline",
+        "endpoint": "/vibecomfy/agent-edit/rebaseline",
+        "reason": "stale_state_recovery",
+        "last_known_baseline_graph_hash": "baseline-hash",
+        "submit_graph_hash": "submit-hash",
+        "submit_structural_graph_hash": "submit-structural-hash",
+        "client_graph_hash": "client-hash",
+        "client_structural_graph_hash": "client-structural-hash",
+    }
+
+
+def test_route_stale_recovery_repair_emits_only_available_recovery_fields() -> None:
+    # Private route-boundary helper coverage is intentional: _ensure_stale_recovery
+    # repairs older flat failures into a public recovery payload at the route edge.
+    from vibecomfy.comfy_nodes.agent.routes import _ensure_stale_recovery
+
+    payload = _ensure_stale_recovery(
+        {
+            "kind": FailureKind.STALE_STATE_MISMATCH.value,
+            "message": "Submitted graph no longer matches the current baseline.",
+            "expected_baseline_graph_hash": "baseline-hash",
+            "submit_structural_graph_hash": "submit-structural-hash",
+            "outcome": {"kind": "error"},
+            "agent_failure_context": {"reason": "stale_state_recovery"},
+        }
+    )
+    recovery = payload["rebaseline_recovery"]
+
+    route_repair_fields = {
+        "action",
+        "endpoint",
+        "reason",
+        "last_known_baseline_graph_hash",
+        "submit_structural_graph_hash",
+    }
+    unavailable_hash_fields = {
+        "submit_graph_hash",
+        "client_graph_hash",
+        "client_structural_graph_hash",
+    }
+
+    assert set(recovery) == route_repair_fields
+    assert recovery == {
+        "action": "rebaseline",
+        "endpoint": "/vibecomfy/agent-edit/rebaseline",
+        "reason": "stale_state_recovery",
+        "last_known_baseline_graph_hash": "baseline-hash",
+        "submit_structural_graph_hash": "submit-structural-hash",
+    }
+    assert unavailable_hash_fields.isdisjoint(recovery)
+    assert payload["agent_failure_context"]["issues"][0]["rebaseline_recovery"] == recovery
+    assert payload["outcome"]["rebaseline_recovery"] == recovery
+    assert (
+        set(payload["agent_failure_context"]["issues"][0]["rebaseline_recovery"])
+        == route_repair_fields
+    )
+    assert set(payload["outcome"]["rebaseline_recovery"]) == route_repair_fields
+
+
+def test_rebaseline_recovery_js_codegen_is_limited_to_canonical_tuple() -> None:
+    from tools import generate_agent_contract_js
+
+    fields = generate_agent_contract_js._load_fields()
+    js_source = generate_agent_contract_js.generate_js(fields)
+    normalizer_body = js_source.split("export function normalizeRebaselineRecovery", 1)[1]
+    normalizer_body = normalizer_body.split("};", 1)[0]
+    generated_fields = tuple(
+        line.strip().split(":", 1)[0]
+        for line in normalizer_body.splitlines()
+        if "asString(recovery." in line
+    )
+
+    assert fields == REBASELINE_RECOVERY_FIELDS
+    assert generated_fields == REBASELINE_RECOVERY_FIELDS
+    assert set(generated_fields) == set(REBASELINE_RECOVERY_FIELDS)
+    assert "candidate_graph_hash: asString(recovery.candidate_graph_hash)" not in js_source
+    assert "submit_graph_hash: asString(recovery.submit_graph_hash)" in js_source
+
+
+def test_turn_envelope_serializes_versioned_product_contract() -> None:
+    context = TurnContext(session_id="s1", turn_id="0001")
+    context.set_gate("python_load_ok", True)
+    eligibility = context.apply_eligibility
+
+    payload = turn_envelope(
+        message="  Updated the save prefix.  ",
+        outcome=TurnOutcome.edit(),
+        candidate={"state": "candidate", "graph_hash": "abc123"},
+        eligibility=eligibility,
+        debug={"gates": context.gate_snapshot()},
+    )
+
+    assert payload == {
+        "contract_version": AGENT_EDIT_TURN_CONTRACT_VERSION,
+        "message": "Updated the save prefix.",
+        "outcome": {"kind": "edit", "changes": []},
+        "candidate": {"state": "candidate", "graph_hash": "abc123"},
+        "eligibility": eligibility.to_dict(),
+        "audit_ref": None,
+        "debug": {"gates": context.gate_snapshot()},
+    }
+
+
+def test_ensure_agent_edit_response_contract_maps_internal_outcomes_and_flat_failures() -> None:
+    success_payload = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "message": "Updated the save prefix.",
+            "candidate": {"graph_hash": "abc123"},
+            "outcome": {"kind": "edit", "changes": []},
+        },
+        stage="submit",
+    )
+    failure_payload = ensure_agent_edit_response_contract(
+        failure_envelope(
+            FailureKind.TIMEOUT_ERROR,
+            "agent_response",
+            TurnContext(session_id="s1"),
+            agent_failure_context={"explanation": "provider timed out"},
+        ).to_dict(),
+        stage="submit",
+    )
+
+    assert success_payload["outcome"] == {"kind": "candidate", "changes": []}
+    assert failure_payload["outcome"]["kind"] == "error"
+    assert failure_payload["outcome"]["failure_kind"] == FailureKind.TIMEOUT_ERROR.value
+
+
+def test_success_envelope_keeps_canonical_eligibility_field() -> None:
+    context = TurnContext(session_id="s1", turn_id="0001")
+    context.set_gate("python_load_ok", True)
+
+    payload = success_envelope(
+        context,
+        message="Applied the requested edit.",
+        graph={"nodes": [], "links": []},
+    )
+
+    assert payload["eligibility"] == context.apply_eligibility.to_dict()
+    assert "apply_eligibility" not in payload
+    assert "apply_allowed" not in payload
+    assert "canvas_apply_allowed" not in payload
+    assert "queue_allowed" not in payload
+
+
+def test_build_legacy_agent_edit_v1_adds_aliases_after_canonical_payload() -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    canonical = {
+        "message": "Updated the workflow.",
+        "outcome": {"kind": "candidate", "changes": []},
+        "candidate": {
+            "state": "candidate",
+            "graph": {"nodes": [{"id": 1}], "links": []},
+            "graph_hash": "candidate-hash",
+            "structural_graph_hash": "candidate-structural-hash",
+        },
+        "eligibility": {
+            "applyable": True,
+            "reason": "applyable",
+            "message": "Ready to apply.",
+            "warnings": [],
+        },
+    }
+
+    payload = build_legacy_agent_edit_v1(
+        {
+            **canonical,
+            "canvas_apply_allowed": True,
+            "queue_allowed": False,
+        }
+    )
+
+    assert canonical.keys() <= payload.keys()
+    assert payload["apply_eligibility"] == canonical["eligibility"]
+    assert payload["apply_allowed"] is True
+    assert payload["canvas_apply_allowed"] is True
+    assert payload["queue_allowed"] is False
+    assert payload["candidate_graph"] == canonical["candidate"]["graph"]
+    assert payload["graph"] == canonical["candidate"]["graph"]
+
+
+def test_build_legacy_agent_edit_v1_accepts_apply_eligibility_dataclass() -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    candidate_graph = {"nodes": [{"id": 1}], "links": []}
+    eligibility = ApplyEligibility(
+        applyable=True,
+        reason="applyable",
+        message="Ready to apply.",
+    )
+
+    # Defensive compatibility coverage: older internal callers may pass the
+    # dataclass directly instead of the public mapping shape.
+    payload = build_legacy_agent_edit_v1(
+        {
+            "message": "Updated the workflow.",
+            "outcome": {"kind": "candidate", "changes": []},
+            "candidate": {
+                "state": "candidate",
+                "graph": candidate_graph,
+                "graph_hash": "candidate-hash",
+                "structural_graph_hash": "candidate-structural-hash",
+            },
+            "eligibility": eligibility,
+            "canvas_apply_allowed": True,
+            "queue_allowed": False,
+        }
+    )
+
+    assert payload["eligibility"] == eligibility.to_dict()
+    assert payload["apply_eligibility"] == eligibility.to_dict()
+    assert payload["apply_allowed"] is True
+    assert payload["canvas_apply_allowed"] is True
+    assert payload["queue_allowed"] is False
+    assert payload["candidate_graph"] == candidate_graph
+    assert payload["graph"] == candidate_graph
+
+
+def test_build_legacy_agent_edit_v1_uses_apply_eligibility_mapping_fallback() -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    candidate_graph = {"nodes": [{"id": 1}], "links": []}
+    eligibility = {
+        "applyable": True,
+        "reason": "applyable",
+        "message": "Ready to apply.",
+        "warnings": [],
+    }
+
+    payload = build_legacy_agent_edit_v1(
+        {
+            "message": "Updated the workflow.",
+            "outcome": {"kind": "candidate", "changes": []},
+            "candidate": {
+                "state": "candidate",
+                "graph": candidate_graph,
+                "graph_hash": "candidate-hash",
+                "structural_graph_hash": "candidate-structural-hash",
+            },
+            "apply_eligibility": eligibility,
+            "canvas_apply_allowed": True,
+            "queue_allowed": False,
+        }
+    )
+
+    assert payload["eligibility"] == eligibility
+    assert payload["apply_eligibility"] == eligibility
+    assert payload["apply_allowed"] is True
+    assert payload["canvas_apply_allowed"] is True
+    assert payload["queue_allowed"] is False
+    assert payload["candidate_graph"] == candidate_graph
+    assert payload["graph"] == candidate_graph
+
+
+def test_build_legacy_agent_edit_v1_preserves_plan_fields_and_non_plan_candidate_aliases() -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    candidate_graph = {
+        "nodes": [
+            {"id": 10, "type": "ADE_AnimateDiffLoaderWithContext"},
+            {"id": 11, "type": "VHS_VideoCombine"},
+        ],
+        "links": [[1, 10, 0, 11, 0, "IMAGE"]],
+    }
+    queue_warning = {
+        "applyable": True,
+        "reason": "queue_blocked_warning",
+        "message": "Apply is allowed, but Queue remains blocked for this candidate.",
+        "warnings": ["queue_blocked"],
+    }
+    plan_payload = build_legacy_agent_edit_v1(
+        {
+            "message": "HotShotXL candidate ready.",
+            "outcome": {"kind": "candidate", "changes": []},
+            "candidate": {
+                "state": "candidate",
+                "graph": candidate_graph,
+                "graph_hash": "candidate-hash",
+                "structural_graph_hash": "candidate-structural-hash",
+            },
+            "eligibility": queue_warning,
+            "canvas_apply_allowed": True,
+            "queue_allowed": False,
+            "gates": {
+                "plan_validate_ok": True,
+                "queue_validate_ok": False,
+            },
+            "execution_plan_status": {
+                "plan_id": "hotshotxl-active-video-path",
+                "ok": True,
+                "blocking": False,
+                "failed_condition_ids": [],
+            },
+            "execution_plan_feedback": "plan evaluation passed.",
+            "artifacts": {
+                "execution_plan": "turns/0001/execution_plan.json",
+                "plan_evaluation": "turns/0001/plan_evaluation.json",
+            },
+            "debug": {
+                "gates": {
+                    "plan_validate_ok": True,
+                    "queue_validate_ok": False,
+                },
+                "execution_plan_artifacts": {
+                    "execution_plan": {
+                        "path": "turns/0001/execution_plan.json",
+                        "sha256": "plan-sha",
+                        "byte_count": 42,
+                        "preview": None,
+                    },
+                    "plan_evaluation": {
+                        "path": "turns/0001/plan_evaluation.json",
+                        "sha256": "eval-sha",
+                        "byte_count": 84,
+                        "preview": None,
+                    },
+                },
+            },
+        }
+    )
+    non_plan_payload = build_legacy_agent_edit_v1(
+        {
+            "message": "Regular candidate ready.",
+            "outcome": {"kind": "candidate", "changes": []},
+            "candidate": {
+                "state": "candidate",
+                "graph": candidate_graph,
+                "graph_hash": "candidate-hash",
+                "structural_graph_hash": "candidate-structural-hash",
+            },
+            "eligibility": queue_warning,
+            "canvas_apply_allowed": True,
+            "queue_allowed": False,
+        }
+    )
+
+    assert plan_payload["apply_allowed"] is True
+    assert plan_payload["canvas_apply_allowed"] is True
+    assert plan_payload["queue_allowed"] is False
+    assert plan_payload["apply_eligibility"]["reason"] == "queue_blocked_warning"
+    assert plan_payload["gates"]["plan_validate_ok"] is True
+    assert plan_payload["execution_plan_status"]["ok"] is True
+    assert plan_payload["execution_plan_feedback"] == "plan evaluation passed."
+    assert plan_payload["artifacts"]["execution_plan"].endswith("execution_plan.json")
+    assert plan_payload["artifacts"]["plan_evaluation"].endswith("plan_evaluation.json")
+    assert (
+        plan_payload["debug"]["execution_plan_artifacts"]["plan_evaluation"]["path"]
+        == "turns/0001/plan_evaluation.json"
+    )
+    assert non_plan_payload["apply_allowed"] is True
+    assert non_plan_payload["canvas_apply_allowed"] is True
+    assert non_plan_payload["queue_allowed"] is False
+    assert non_plan_payload["apply_eligibility"] == queue_warning
+    assert non_plan_payload["candidate_graph"] == candidate_graph
+    assert "execution_plan_status" not in non_plan_payload
+    assert "execution_plan_feedback" not in non_plan_payload
+
+
+@pytest.mark.parametrize(
+    ("apply_eligible", "expected_reason", "expected_message"),
+    [
+        (True, "applyable", "Ready to apply."),
+        (False, "no_candidate", "No candidate is available to apply."),
+    ],
+)
+def test_build_legacy_agent_edit_v1_uses_apply_eligible_boolean_fallback(
+    apply_eligible: bool,
+    expected_reason: str,
+    expected_message: str,
+) -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    payload = build_legacy_agent_edit_v1(
+        {
+            "message": "Updated the workflow.",
+            "outcome": {"kind": "noop"},
+            "apply_eligible": apply_eligible,
+        }
+    )
+
+    assert payload["eligibility"] == {
+        "applyable": apply_eligible,
+        "reason": expected_reason,
+        "message": expected_message,
+        "warnings": [],
+    }
+    assert payload["apply_eligibility"] == payload["eligibility"]
+    assert payload["apply_allowed"] is apply_eligible
+    assert payload["canvas_apply_allowed"] is apply_eligible
+    assert payload["queue_allowed"] is apply_eligible
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        None,
+        "not-a-candidate",
+        {"state": "candidate"},
+        {"state": "candidate", "graph": None},
+        {"state": "candidate", "graph": []},
+    ],
+)
+def test_build_legacy_agent_edit_v1_does_not_stamp_graph_aliases_without_candidate_graph(
+    candidate: object,
+) -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    canonical: dict[str, object] = {
+        "message": "No graph candidate.",
+        "outcome": {"kind": "noop"},
+        "eligibility": {
+            "applyable": False,
+            "reason": "no_candidate",
+            "message": "No candidate is available to apply.",
+            "warnings": [],
+        },
+    }
+    if candidate is not None:
+        canonical["candidate"] = candidate
+
+    payload = build_legacy_agent_edit_v1(canonical)
+
+    assert "candidate_graph" not in payload
+    assert "graph" not in payload
+    assert payload["graph_unchanged"] is True
+
+
+def test_build_legacy_agent_edit_v1_stamps_graph_aliases_and_defaults_changed() -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    candidate_graph = {"nodes": [{"id": 1}], "links": []}
+
+    payload = build_legacy_agent_edit_v1(
+        {
+            "message": "Updated the workflow.",
+            "outcome": {"kind": "candidate", "changes": []},
+            "candidate": {
+                "state": "candidate",
+                "graph": candidate_graph,
+            },
+            "eligibility": {
+                "applyable": True,
+                "reason": "applyable",
+                "message": "Ready to apply.",
+                "warnings": [],
+            },
+        }
+    )
+
+    assert payload["candidate_graph"] == candidate_graph
+    assert payload["graph"] == candidate_graph
+    assert payload["graph_unchanged"] is False
+
+
+@pytest.mark.parametrize("graph_unchanged", [True, False])
+def test_build_legacy_agent_edit_v1_preserves_existing_graph_unchanged(
+    graph_unchanged: bool,
+) -> None:
+    from vibecomfy.comfy_nodes.agent.contracts import build_legacy_agent_edit_v1
+
+    candidate_graph = {"nodes": [{"id": 1}], "links": []}
+
+    payload = build_legacy_agent_edit_v1(
+        {
+            "message": "Updated the workflow.",
+            "outcome": {"kind": "candidate", "changes": []},
+            "candidate": {
+                "state": "candidate",
+                "graph": candidate_graph,
+            },
+            "eligibility": {
+                "applyable": True,
+                "reason": "applyable",
+                "message": "Ready to apply.",
+                "warnings": [],
+            },
+            "graph_unchanged": graph_unchanged,
+        }
+    )
+
+    assert payload["candidate_graph"] == candidate_graph
+    assert payload["graph"] == candidate_graph
+    assert payload["graph_unchanged"] is graph_unchanged
+
+
+# ---------------------------------------------------------------------------
+# T2: Focused contract tests — classifier stability, scan-code mappings,
+# failure envelope shape, gate defaults, apply_allowed == canvas_apply_allowed
+# ---------------------------------------------------------------------------
+
+
+# --- Gate default stability ---
+
+
+def test_all_design_gates_present_and_distinct() -> None:
+    """Every design-level named gate exists and is distinct."""
+    assert len(DEFAULT_GATE_NAMES) == 9
+    assert len(set(DEFAULT_GATE_NAMES)) == 9
+    assert set(DEFAULT_GATE_NAMES) == {
+        "python_load_ok",
+        "lower_ok",
+        "ir_validate_ok",
+        "ui_emit_ok",
+        "ui_fidelity_ok",
+        "ui_load_safe_ok",
+        PLAN_VALIDATE_GATE_NAME,
+        "queue_validate_ok",
+        "state_match_ok",
+    }
+
+
+def test_canvas_apply_subset_is_proper_subset_of_all_gates() -> None:
+    """canvas_apply_allowed checks every gate except queue_validate_ok."""
+    assert set(CANVAS_APPLY_GATE_NAMES) == set(DEFAULT_GATE_NAMES) - {"queue_validate_ok", "lower_ok"}
+    assert PLAN_VALIDATE_GATE_NAME in CANVAS_APPLY_GATE_NAMES
+    assert "queue_validate_ok" not in CANVAS_APPLY_GATE_NAMES
+    assert "lower_ok" not in CANVAS_APPLY_GATE_NAMES
+
+
+def test_turn_context_set_gate_accepts_lower_ok() -> None:
+    context = TurnContext(session_id="s1")
+    context.set_gate("lower_ok", True, evidence={"stage": "lower"})
+    assert context.gate_results["lower_ok"].ok is True
+    assert dict(context.gate_results["lower_ok"].evidence) == {"stage": "lower"}
+
+
+def test_turn_context_set_gate_rejects_unknown_name() -> None:
+    context = TurnContext(session_id="s1")
+    with pytest.raises(KeyError, match="Unknown gate"):
+        context.set_gate("nonexistent_gate", True)
+
+
+def test_turn_context_apply_allowed_equals_canvas_apply_allowed() -> None:
+    """Explicit check: apply_allowed IS canvas_apply_allowed for TurnContext."""
+    context = TurnContext(session_id="s1")
+    assert context.apply_allowed is context.canvas_apply_allowed
+    assert context.apply_allowed is False
+
+    # After setting all canvas-apply gates true, both should flip
+    for name in CANVAS_APPLY_GATE_NAMES:
+        context.set_gate(name, True, evidence={"test": True})
+    assert context.canvas_apply_allowed is True
+    assert context.apply_allowed is True
+    assert context.apply_allowed is context.canvas_apply_allowed
+
+
+def test_queue_allowed_requires_queue_validate_ok() -> None:
+    """queue_allowed = canvas_apply_allowed AND queue_validate_ok."""
+    context = TurnContext(session_id="s1")
+    for name in CANVAS_APPLY_GATE_NAMES:
+        context.set_gate(name, True)
+    # canvas_apply_allowed is now true, but queue_validate_ok still false
+    assert context.canvas_apply_allowed is True
+    assert context.queue_allowed is False
+
+    context.set_gate("queue_validate_ok", True)
+    assert context.queue_allowed is True
+
+
+# --- Failure envelope shape invariants ---
+
+
+def test_failure_envelope_apply_allowed_equals_canvas_apply_allowed() -> None:
+    """apply_allowed alias on FailureEnvelope mirrors canvas_apply_allowed."""
+    fe = failure_envelope(FailureKind.VALIDATION_ERROR, "validate", None)
+    assert fe.apply_allowed is fe.canvas_apply_allowed
+    assert fe.apply_allowed is False
+
+
+def test_failure_envelope_to_dict_excludes_null_turn_id() -> None:
+    """When turn_id is None it is not serialized into the dict payload."""
+    fe = failure_envelope(FailureKind.VALIDATION_ERROR, "load_python", None)
+    payload = fe.to_dict()
+    assert "turn_id" not in payload
+    assert payload["baseline_turn_id"] is None
+
+
+def test_failure_envelope_to_dict_includes_turn_id_when_present() -> None:
+    ctx = TurnContext(session_id="s1", turn_id="0007", baseline_turn_id="0006")
+    fe = failure_envelope(FailureKind.VALIDATION_ERROR, "load_python", ctx)
+    payload = fe.to_dict()
+    assert payload["turn_id"] == "0007"
+    assert payload["baseline_turn_id"] == "0006"
+
+
+def test_failure_envelope_always_has_ok_false() -> None:
+    """Every FailureEnvelope reports ok=False."""
+    for kind in FailureKind:
+        fe = failure_envelope(kind, "any_stage", None)
+        assert fe.ok is False
+        assert fe.to_dict()["ok"] is False
+
+
+def test_failure_envelope_to_dict_has_all_required_keys() -> None:
+    """The serialized dict contains every consumer-facing key."""
+    fe = failure_envelope(FailureKind.SYNTAX_ERROR, "load_python")
+    payload = fe.to_dict()
+    required_keys = {
+        "ok", "kind", "stage", "session_id", "baseline_turn_id",
+        "canvas_apply_allowed", "apply_allowed", "queue_allowed",
+        "graph_unchanged", "retryable", "next_action",
+        "message", "user_facing_message", "agent_failure_context",
+        "audit_ref", "audit_error",
+    }
+    present = set(payload.keys())
+    assert required_keys.issubset(present)
+
+
+def test_failure_envelope_message_equals_user_facing_message_for_all_kinds() -> None:
+    """message is an alias for user_facing_message on every FailureKind."""
+    for kind in FailureKind:
+        fe = failure_envelope(kind, "any_stage", None)
+        assert fe.message == fe.user_facing_message
+        assert fe.to_dict()["message"] == fe.to_dict()["user_facing_message"]
+
+
+def test_failure_envelope_is_fully_frozen() -> None:
+    """Cannot mutate any field after construction."""
+    fe = failure_envelope(FailureKind.VALIDATION_ERROR, "validate")
+    with pytest.raises((TypeError, AttributeError)):
+        fe.kind = FailureKind.SYNTAX_ERROR  # type: ignore[misc]
+    with pytest.raises((TypeError, AttributeError)):
+        fe.stage = "other"  # type: ignore[misc]
+    with pytest.raises((TypeError, AttributeError)):
+        fe.canvas_apply_allowed = True  # type: ignore[misc]
+
+
+def test_failure_specs_cover_all_kinds() -> None:
+    """Every FailureKind has an entry in FAILURE_SPECS."""
+    for kind in FailureKind:
+        assert kind in FAILURE_SPECS, f"{kind} missing from FAILURE_SPECS"
+
+
+def test_failure_specs_retryable_and_graph_unchanged_are_booleans() -> None:
+    """retryable and graph_unchanged are bools for every spec."""
+    for kind, spec in FAILURE_SPECS.items():
+        assert isinstance(spec.retryable, bool), f"{kind}: retryable not bool"
+        assert isinstance(spec.graph_unchanged, bool), f"{kind}: graph_unchanged not bool"
+        assert len(spec.next_action) > 0, f"{kind}: next_action empty"
+        assert len(spec.user_facing_message) > 0, f"{kind}: user_facing_message empty"
+
+
+# --- Scan-code mapping stability ---
+
+
+def test_scan_code_mapping_keys_are_lower_snake_case() -> None:
+    """All scan-code mapping keys are lower_snake_case strings."""
+    for code in SCAN_CODE_FAILURE_KIND:
+        assert code == code.lower()
+        assert " " not in code
+        assert code.isascii()
+
+
+def test_scan_code_mapping_all_targets_are_valid_enum_members() -> None:
+    """Every value in SCAN_CODE_FAILURE_KIND is a genuine FailureKind member."""
+    for code, kind in SCAN_CODE_FAILURE_KIND.items():
+        assert isinstance(kind, FailureKind), f"{code} -> {kind!r}"
+        assert kind in FailureKind, f"{code} -> {kind} not in FailureKind"
+
+
+def test_scan_code_mapping_is_immutable() -> None:
+    """SCAN_CODE_FAILURE_KIND cannot be mutated."""
+    with pytest.raises(TypeError):
+        SCAN_CODE_FAILURE_KIND["new_code"] = FailureKind.SYNTAX_ERROR  # type: ignore[index]
+
+
+# --- Classifier stability ---
+
+
+def test_classify_auth_401_returns_auth_error() -> None:
+    """HTTP 401 response classifies as AUTH_ERROR."""
+
+    class MockResponse:
+        status_code = 401
+
+    class MockAuthError(Exception):
+        def __init__(self) -> None:
+            self.response = MockResponse()
+
+    ctx = TurnContext(session_id="s1", turn_id="t1")
+    fe = classify_failure("agent_response", MockAuthError(), ctx)
+    assert fe.kind is FailureKind.AUTH_ERROR
+    assert fe.stage == "agent_response"
+    assert fe.agent_failure_context["http_status"] == 401
+
+
+def test_classify_auth_403_returns_auth_error() -> None:
+    """HTTP 403 response classifies as AUTH_ERROR."""
+
+    class MockResponse:
+        status_code = 403
+
+    class MockAuthError(Exception):
+        def __init__(self) -> None:
+            self.response = MockResponse()
+
+    ctx = TurnContext(session_id="s1", turn_id="t1")
+    fe = classify_failure("agent_response", MockAuthError(), ctx)
+    assert fe.kind is FailureKind.AUTH_ERROR
+    assert fe.agent_failure_context["http_status"] == 403
+
+
+def test_classify_auth_from_mapping_http_status() -> None:
+    """Mapping with http_status=401 also classifies as AUTH_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", {"http_status": 401, "message": "unauthorized"}, ctx)
+    assert fe.kind is FailureKind.AUTH_ERROR
+    assert fe.agent_failure_context["http_status"] == 401
+
+
+def test_classify_auth_from_mapping_status_code() -> None:
+    """Mapping with status_code=403 also classifies as AUTH_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", {"status_code": 403, "message": "forbidden"}, ctx)
+    assert fe.kind is FailureKind.AUTH_ERROR
+    assert fe.agent_failure_context["http_status"] == 403
+
+
+def test_classify_refused_emit_by_exception_name() -> None:
+    """An exception named RefusedEmit classifies as REFUSED_EMIT."""
+
+    class RefusedEmit(Exception):
+        pass
+
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("emit_ui", RefusedEmit("protected state"), ctx)
+    assert fe.kind is FailureKind.REFUSED_EMIT
+    assert fe.stage == "emit_ui"
+
+
+def test_classify_editor_ahead_error_by_exception_name() -> None:
+    """An exception named EditorAheadError classifies as EDITOR_AHEAD_CONFLICT."""
+
+    class EditorAheadError(Exception):
+        pass
+
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("ingest", EditorAheadError("conflict"), ctx)
+    assert fe.kind is FailureKind.EDITOR_AHEAD_CONFLICT
+    assert fe.stage == "ingest"
+
+
+def test_classify_timeout_by_exception_type() -> None:
+    """A built-in TimeoutError classifies as TIMEOUT_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", TimeoutError("timed out"), ctx)
+    assert fe.kind is FailureKind.TIMEOUT_ERROR
+
+
+def test_classify_timeout_by_name_containing_timeout() -> None:
+    """An exception with 'timeout' in its name classifies as TIMEOUT_ERROR."""
+
+    class RequestTimeout(Exception):
+        pass
+
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", RequestTimeout("slow"), ctx)
+    assert fe.kind is FailureKind.TIMEOUT_ERROR
+
+
+def test_classify_agent_response_missing_python() -> None:
+    """agent_response stage with 'missing' + 'python' -> MISSING_REQUIRED_FIELD."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", ValueError("missing python field"), ctx)
+    assert fe.kind is FailureKind.MISSING_REQUIRED_FIELD
+
+
+def test_classify_agent_response_json_decode_error() -> None:
+    """JSONDecodeError in agent_response -> MALFORMED_MODEL_JSON."""
+    ctx = TurnContext(session_id="s1")
+    exc: json.JSONDecodeError
+    try:
+        json.loads("{bad")
+    except json.JSONDecodeError as e:
+        exc = e
+    fe = classify_failure("agent_response", exc, ctx)
+    assert fe.kind is FailureKind.MALFORMED_MODEL_JSON
+
+
+def test_classify_agent_response_json_error_with_noisy_import_tail_stays_malformed() -> None:
+    ctx = TurnContext(session_id="s1")
+    exc = RuntimeError(
+        "JSONDecodeError: Expecting ',' delimiter: line 2 column 1463 (char 1464)\n\n"
+        "Worker output tail:\n"
+        "Could not register VibeComfy agent routes (No module named 'server'); "
+        "the ComfyUI server may not be available."
+    )
+
+    fe = classify_failure("agent_response", exc, ctx)
+
+    assert fe.kind is FailureKind.MALFORMED_MODEL_JSON
+
+
+def test_classify_agent_response_value_error_malformed() -> None:
+    """Generic ValueError in agent_response -> MALFORMED_MODEL_JSON."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", ValueError("bad value"), ctx)
+    assert fe.kind is FailureKind.MALFORMED_MODEL_JSON
+
+
+def test_classify_agent_response_type_error_malformed() -> None:
+    """TypeError in agent_response -> MALFORMED_MODEL_JSON."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", TypeError("bad type"), ctx)
+    assert fe.kind is FailureKind.MALFORMED_MODEL_JSON
+
+
+def test_classify_agent_response_provider_error_fallback() -> None:
+    """Unrecognized error in agent_response stage falls back to PROVIDER_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("agent_response", RuntimeError("something unexpected"), ctx)
+    assert fe.kind is FailureKind.PROVIDER_ERROR
+
+
+def test_classify_stage_json_parse_error_is_malformed_model_json() -> None:
+    """A ValueError from the classify phase's JSON parser must classify as
+    MALFORMED_MODEL_JSON, never as VALIDATION_ERROR.  The executor routes
+    classify parse failures through classify_failure("classify", exc); before
+    the classify-stage branch existed they fell through to VALIDATION_ERROR and
+    the user saw "The edited workflow has validation errors and was not
+    applied" for a failure that never touched the graph (observed: greedy JSON
+    extraction failing on valid leading JSON + trailing prose)."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure(
+        "classify",
+        ValueError("Could not extract a JSON object from: '{...}'"),
+        ctx,
+    )
+    assert fe.kind is FailureKind.MALFORMED_MODEL_JSON
+    assert "could not be parsed" in fe.user_facing_message
+    assert "validation errors" not in fe.user_facing_message
+
+
+def test_classify_stage_json_decode_error_is_malformed_model_json() -> None:
+    ctx = TurnContext(session_id="s1")
+    try:
+        json.loads("{bad")
+    except json.JSONDecodeError as exc:
+        fe = classify_failure("classify", exc, ctx)
+    assert fe.kind is FailureKind.MALFORMED_MODEL_JSON
+
+
+def test_classify_failure_preserves_malformed_model_json_parse_evidence() -> None:
+    """DEEP-AUDIT-FIX-3-REVISION-2 (ADJUDICATION-3): the MALFORMED_MODEL_JSON
+    envelope carries the provider signature gate's typed parse evidence —
+    ``parse_reason`` plus the already bounded/redacted ``raw_response_preview``
+    — under BOTH the "agent_response" and "classify" stages, preserving the
+    existing explanation. The unbounded ``raw_response`` is never persisted."""
+    from vibecomfy.comfy_nodes.agent.provider import MalformedModelJSON
+
+    ctx = TurnContext(session_id="s1")
+    exc = MalformedModelJSON(
+        "Agent classify response does not contain a classify-contract decision "
+        "object (needs one of route/intent/implement/reply).",
+        raw_response='{"latency_ms": 42}',
+        parse_reason="missing_classify_json",
+    )
+
+    for stage in ("agent_response", "classify"):
+        envelope = classify_failure(stage, exc, ctx)
+
+        assert envelope.kind is FailureKind.MALFORMED_MODEL_JSON
+        assert (
+            envelope.agent_failure_context["parse_reason"]
+            == "missing_classify_json"
+        )
+        assert envelope.agent_failure_context["raw_response_preview"]
+        assert envelope.agent_failure_context["explanation"] == str(exc)
+        assert "raw_response" not in envelope.agent_failure_context
+
+
+def test_classify_stage_unknown_error_is_provider_error() -> None:
+    """Unrecognized classify-stage failures stay PROVIDER_ERROR, not a graph
+    validation lie."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("classify", RuntimeError("worker subprocess vanished"), ctx)
+    assert fe.kind is FailureKind.PROVIDER_ERROR
+
+
+def test_classify_openrouter_credit_error_is_specific_and_non_retryable() -> None:
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure(
+        "agent_response",
+        RuntimeError(
+            "ValueError: Agent returned an empty batch_repl response.\n\n"
+            "Worker output tail:\n"
+            "Error code: 402 - This request requires more credits, or fewer max_tokens. "
+            "You requested up to 8192 tokens, but can only afford 3590. "
+            "To increase, visit https://openrouter.ai/settings/credits"
+        ),
+        ctx,
+    )
+
+    assert fe.kind is FailureKind.PROVIDER_CREDIT_ERROR
+    assert fe.retryable is False
+    assert "OpenRouter" in fe.user_facing_message
+    assert "temporarily unavailable" not in fe.user_facing_message
+
+
+def test_classify_ingest_stale_state() -> None:
+    """Ingest stage with 'stale' in message -> STALE_STATE_MISMATCH."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("ingest", RuntimeError("stale state detected"), ctx)
+    assert fe.kind is FailureKind.STALE_STATE_MISMATCH
+
+
+def test_classify_ingest_non_dag() -> None:
+    """Ingest stage with 'non-dag' in message -> UNSUPPORTED_NON_DAG."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("ingest", RuntimeError("non-dag graph unsupported"), ctx)
+    assert fe.kind is FailureKind.UNSUPPORTED_NON_DAG
+
+
+def test_classify_ingest_unsupported() -> None:
+    """Ingest stage with 'unsupported' in message -> UNSUPPORTED_NON_DAG."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("ingest", RuntimeError("unsupported graph structure"), ctx)
+    assert fe.kind is FailureKind.UNSUPPORTED_NON_DAG
+
+
+def test_classify_lower_stage_uses_lowering_failure() -> None:
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("lower", RuntimeError("unsupported loop body"), ctx)
+    assert fe.kind is FailureKind.LOWERING_FAILURE
+    assert fe.stage == "lower"
+
+
+def test_classify_ingest_fallback_missing_required_field() -> None:
+    """Generic ingest error falls back to MISSING_REQUIRED_FIELD."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("ingest", RuntimeError("something went wrong"), ctx)
+    assert fe.kind is FailureKind.MISSING_REQUIRED_FIELD
+
+
+def test_classify_validate_unsatisfied_input() -> None:
+    """Validate stage with 'missing input' -> UNSATISFIED_INPUT_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("validate", RuntimeError("missing input 'image'"), ctx)
+    assert fe.kind is FailureKind.UNSATISFIED_INPUT_ERROR
+
+
+def test_classify_validate_required_input() -> None:
+    """Validate stage with 'required input' -> UNSATISFIED_INPUT_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("validate", RuntimeError("required input absent"), ctx)
+    assert fe.kind is FailureKind.UNSATISFIED_INPUT_ERROR
+
+
+def test_classify_validate_generic() -> None:
+    """Generic validate error -> VALIDATION_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("validate", RuntimeError("bad graph"), ctx)
+    assert fe.kind is FailureKind.VALIDATION_ERROR
+
+
+def test_classify_queue_validate_schema_less() -> None:
+    """Queue validate with 'schema' -> SCHEMA_LESS_QUEUE_BLOCKER."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("queue_validate", RuntimeError("schema missing"), ctx)
+    assert fe.kind is FailureKind.SCHEMA_LESS_QUEUE_BLOCKER
+
+
+def test_classify_queue_validate_editor_only() -> None:
+    """Queue validate with 'editor-only' -> EDITOR_ONLY_NODE_QUEUE_BLOCKER."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("queue_validate", RuntimeError("editor-only node present"), ctx)
+    assert fe.kind is FailureKind.EDITOR_ONLY_NODE_QUEUE_BLOCKER
+
+
+def test_classify_queue_validate_editor_only_space() -> None:
+    """Queue validate with 'editor only' (space) -> EDITOR_ONLY_NODE_QUEUE_BLOCKER."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("queue_validate", RuntimeError("editor only node blocks queue"), ctx)
+    assert fe.kind is FailureKind.EDITOR_ONLY_NODE_QUEUE_BLOCKER
+
+
+def test_classify_queue_validate_low_confidence() -> None:
+    """Generic queue_validate error -> LOW_CONFIDENCE_QUEUE_BLOCKER."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("queue_validate", RuntimeError("confidence too low"), ctx)
+    assert fe.kind is FailureKind.LOW_CONFIDENCE_QUEUE_BLOCKER
+
+
+def test_classify_audit_warning() -> None:
+    """Audit stage with 'warning' -> AUDIT_WRITE_WARNING."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("audit", RuntimeError("audit write warning: disk near full"), ctx)
+    assert fe.kind is FailureKind.AUDIT_WRITE_WARNING
+
+
+def test_classify_audit_failure() -> None:
+    """Audit stage without 'warning' -> AUDIT_WRITE_FAILURE."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("audit", RuntimeError("audit disk full"), ctx)
+    assert fe.kind is FailureKind.AUDIT_WRITE_FAILURE
+
+
+def test_classify_fallback_unknown_stage() -> None:
+    """Completely unknown stage falls back to VALIDATION_ERROR."""
+    ctx = TurnContext(session_id="s1")
+    fe = classify_failure("unknown_stage", RuntimeError("something"), ctx)
+    assert fe.kind is FailureKind.VALIDATION_ERROR
+
+
+# --- Failure envelope from TurnContext-derived context ---
+
+
+def test_failure_envelope_from_turn_context_uses_explicit_params_not_context() -> None:
+    """failure_envelope canvas_apply_allowed/queue_allowed come from explicit
+    parameters, NOT auto-derived from the TurnContext gate state.  The context
+    only provides session/turn/baseline IDs."""
+    ctx = TurnContext(session_id="s1", turn_id="t1")
+    for name in CANVAS_APPLY_GATE_NAMES:
+        ctx.set_gate(name, True)
+    ctx.set_gate("queue_validate_ok", True)
+
+    # Without explicit params, defaults to False (does NOT read context gates)
+    fe = failure_envelope(FailureKind.AUDIT_WRITE_WARNING, "audit", ctx)
+    assert fe.canvas_apply_allowed is False
+    assert fe.apply_allowed is False
+    assert fe.queue_allowed is False
+
+    # With explicit params, those are used
+    fe2 = failure_envelope(
+        FailureKind.AUDIT_WRITE_WARNING, "audit", ctx,
+        canvas_apply_allowed=True, queue_allowed=True,
+    )
+    assert fe2.canvas_apply_allowed is True
+    assert fe2.apply_allowed is True
+    assert fe2.queue_allowed is True
+
+
+def test_failure_envelope_explicit_flags_override_context() -> None:
+    """Explicit canvas_apply_allowed/queue_allowed params override the context."""
+    ctx = TurnContext(session_id="s1")
+    fe = failure_envelope(
+        FailureKind.VALIDATION_ERROR,
+        "validate",
+        ctx,
+        canvas_apply_allowed=True,
+        queue_allowed=True,
+    )
+    assert fe.canvas_apply_allowed is True
+    assert fe.queue_allowed is True
+
+
+# --- failure_envelope with string-kind coercion ---
+
+
+def test_failure_envelope_accepts_string_kind() -> None:
+    """failure_envelope coerces a string to FailureKind."""
+    fe = failure_envelope("SyntaxError", "load_python", None)
+    assert fe.kind is FailureKind.SYNTAX_ERROR
+    assert fe.to_dict()["kind"] == "SyntaxError"
+
+
+def test_failure_envelope_serializes_lowering_failure_kind() -> None:
+    fe = failure_envelope(FailureKind.LOWERING_FAILURE, "lower", None)
+    payload = fe.to_dict()
+    assert payload["kind"] == FailureKind.LOWERING_FAILURE.value
+    assert payload["stage"] == "lower"
+
+
+def test_failure_envelope_invalid_string_kind_raises() -> None:
+    """An unrecognised string raises ValueError from the Enum constructor."""
+    with pytest.raises(ValueError):
+        failure_envelope("NotAKind", "load_python", None)
+
+
+# ---------------------------------------------------------------------------
+# T1: Focused contract tests — closed public outcome kinds, legacy/internal
+# kind mapping, endpoint payload outcome stamping
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_agent_edit_response_contract_rejects_unrecognized_outcome_kind() -> None:
+    """ensure_agent_edit_response_contract must raise when the resolved public
+    outcome kind is not in PUBLIC_OUTCOME_KINDS."""
+    with pytest.raises(ValueError, match="invalid public outcome kind|Unknown TurnOutcome kind"):
+        ensure_agent_edit_response_contract(
+            {"ok": True, "outcome": {"kind": "bogus"}},
+            stage="submit",
+        )
+
+
+def test_ensure_agent_edit_response_contract_normalizes_edit_to_candidate() -> None:
+    """Internal 'edit' outcome kind is normalized to public 'candidate'."""
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "message": "Applied rename.",
+            "outcome": {"kind": "edit", "changes": [{"uid": "n1", "field_path": "widgets.prefix", "old": "a", "new": "b"}]},
+        },
+        stage="submit",
+    )
+    assert payload["outcome"]["kind"] == "candidate"
+    assert len(payload["outcome"]["changes"]) == 1
+    assert payload["outcome"]["changes"][0]["uid"] == "n1"
+
+
+def test_ensure_agent_edit_response_contract_normalizes_edit_plus_clarify_to_candidate() -> None:
+    """Internal 'edit+clarify' is normalized to public 'candidate' with
+    clarification payload attached."""
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "message": "Renamed and asked.",
+            "outcome": {"kind": "edit+clarify", "question": "Keep this prefix?"},
+        },
+        stage="submit",
+    )
+    assert payload["outcome"]["kind"] == "candidate"
+    assert payload["outcome"]["question"] == "Keep this prefix?"
+    assert payload["outcome"]["clarification"] == {"message": "Keep this prefix?"}
+
+
+def test_ensure_agent_edit_response_contract_preserves_public_noop() -> None:
+    """Public 'noop' outcome kind passes through unchanged."""
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "message": "Nothing to do.",
+            "outcome": {"kind": "noop", "reason": "no changes detected"},
+        },
+        stage="submit",
+    )
+    assert payload["outcome"]["kind"] == "noop"
+    assert payload["outcome"]["reason"] == "no changes detected"
+
+
+def test_ensure_agent_edit_response_contract_preserves_public_clarify() -> None:
+    """Public 'clarify' outcome kind passes through unchanged."""
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "message": "Question for you.",
+            "outcome": {"kind": "clarify", "question": "Which model?"},
+        },
+        stage="submit",
+    )
+    assert payload["outcome"]["kind"] == "clarify"
+    assert payload["outcome"]["question"] == "Which model?"
+
+
+def test_ensure_agent_edit_response_contract_preserves_public_error() -> None:
+    """Public 'error' outcome kind passes through unchanged."""
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": False,
+            "kind": "TimeoutError",
+            "stage": "agent_response",
+            "retryable": True,
+            "next_action": "retry",
+            "graph_unchanged": True,
+            "agent_failure_context": {"explanation": "timed out"},
+        },
+        stage="submit",
+    )
+    assert payload["outcome"]["kind"] == "error"
+    assert payload["outcome"]["failure_kind"] == "TimeoutError"
+
+
+def test_ensure_agent_edit_response_contract_maps_flat_failure_to_error() -> None:
+    """A flat failure response without explicit outcome is mapped to public 'error'."""
+    failure = failure_envelope(
+        FailureKind.MISSING_REQUIRED_FIELD,
+        "ingest",
+        None,
+        agent_failure_context={"explanation": "no graph"},
+    )
+    payload = ensure_agent_edit_response_contract(
+        failure.to_dict(),
+        stage="submit",
+    )
+    assert payload["outcome"]["kind"] == "error"
+    assert payload["outcome"]["failure_kind"] == "MissingRequiredField"
+    assert payload["outcome"]["stage"] == "ingest"
+
+
+def test_all_public_outcome_kinds_tested_by_ensure_contract() -> None:
+    """Smoke-test: every member of PUBLIC_OUTCOME_KINDS can round-trip through
+    ensure_agent_edit_response_contract."""
+    # candidate (via internal edit)
+    candidate = ensure_agent_edit_response_contract(
+        {"ok": True, "outcome": {"kind": "edit"}},
+        stage="submit",
+    )
+    assert candidate["outcome"]["kind"] == "candidate"
+
+    # noop (already public)
+    noop = ensure_agent_edit_response_contract(
+        {"ok": True, "outcome": {"kind": "noop"}},
+        stage="accept",
+    )
+    assert noop["outcome"]["kind"] == "noop"
+
+    # clarify (already public)
+    clarify = ensure_agent_edit_response_contract(
+        {"ok": True, "outcome": {"kind": "clarify", "question": "q?"}},
+        stage="submit",
+    )
+    assert clarify["outcome"]["kind"] == "clarify"
+
+    # error (via flat failure)
+    error = ensure_agent_edit_response_contract(
+        failure_envelope(FailureKind.TIMEOUT_ERROR, "agent_response", None).to_dict(),
+        stage="submit",
+    )
+    assert error["outcome"]["kind"] == "error"
+
+    # requires_custom_nodes (already public, non-applyable)
+    requires_custom_nodes = ensure_agent_edit_response_contract(
+        {"ok": True, "outcome": {"kind": "requires_custom_nodes", "reason": "missing pack"}},
+        stage="submit",
+    )
+    assert requires_custom_nodes["outcome"]["kind"] == "requires_custom_nodes"
+
+
+def test_public_outcome_kinds_are_the_closed_contract_set() -> None:
+    """The public outcome kinds are exactly the contractual values."""
+    assert PUBLIC_OUTCOME_KINDS == (
+        "candidate",
+        "candidate_transaction",
+        "noop",
+        "clarify",
+        "error",
+        "requires_custom_nodes",
+    )
+    assert len(PUBLIC_OUTCOME_KINDS) == 6
+    assert len(set(PUBLIC_OUTCOME_KINDS)) == 6
+
+
+def test_public_candidate_envelope_carries_bundle_revision_lineage() -> None:
+    revision_id = "a" * 64
+    parent_revision = "b" * 64
+    projected = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "session_id": "sess-1",
+            "turn_id": "0001",
+            "revision_id": revision_id,
+            "parent_revision": parent_revision,
+            "outcome": {"kind": "candidate_transaction"},
+            "candidate": {
+                "revision_id": revision_id,
+                "parent_revision": parent_revision,
+            },
+        },
+        stage="submit",
+    )
+    assert projected["revision_id"] == revision_id
+    assert projected["parent_revision"] == parent_revision
+    assert projected["candidate"]["revision_id"] == revision_id
+    assert projected["candidate"]["parent_revision"] == parent_revision
+
+
+def test_real_public_submit_prepare_finalize_rollback_chat_envelopes_carry_revision(
+    tmp_path, monkeypatch
+) -> None:
+    from tests.test_comfy_nodes_agent_backend_spine import (
+        _setup_v2_session_with_candidate,
+    )
+    from vibecomfy.comfy_nodes.agent import edit as edit_module
+    from vibecomfy.comfy_nodes.agent import routes as routes_module
+    from vibecomfy.workflow_bundle import ApprovedProjectionRecord, WorkflowBundle
+    from vibecomfy.testing.canonical import canonical_digest
+
+    compile_calls: list[str] = []
+
+    def compile_once(self, *, schema_provider=None):
+        assert schema_provider is not None
+        compile_calls.append(self.revision_id)
+        api_projection = {"workflow_revision": self.revision_id}
+        return ApprovedProjectionRecord(
+            revision_id=self.revision_id,
+            selected_variant=self.workflow.default_variant,
+            input_binding={},
+            api_projection=api_projection,
+            ui_projection={},
+            api_digest=canonical_digest(api_projection),
+        )
+
+    monkeypatch.setattr(WorkflowBundle, "compile", compile_once)
+    root, session_id, turn_id, candidate_hash, structural_hash, plan_hash = (
+        _setup_v2_session_with_candidate(tmp_path)
+    )
+    rollback_root, rollback_session, rollback_turn, rollback_hash, _rollback_structural, rollback_plan = (
+        _setup_v2_session_with_candidate(tmp_path / "rollback")
+    )
+    persisted_submits = {
+        session_id: json.loads(
+            (root / session_id / "turns" / turn_id / "response.json").read_text(
+                encoding="utf-8"
+            )
+        ),
+        rollback_session: json.loads(
+            (
+                rollback_root
+                / rollback_session
+                / "turns"
+                / rollback_turn
+                / "response.json"
+            ).read_text(encoding="utf-8")
+        ),
+    }
+
+    registered: dict[tuple[str, str], object] = {}
+
+    class _Routes:
+        def post(self, path):
+            def _decorator(fn):
+                registered[("POST", path)] = fn
+                return fn
+
+            return _decorator
+
+        def get(self, path):
+            def _decorator(fn):
+                registered[("GET", path)] = fn
+                return fn
+
+            return _decorator
+
+    aiohttp_module = types.ModuleType("aiohttp")
+    aiohttp_module.web = types.SimpleNamespace(
+        json_response=lambda body, status=200, **kwargs: {
+            "status": status,
+            "body": body,
+            "headers": kwargs.get("headers", {}),
+        },
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", aiohttp_module)
+
+    def _registered_submit(payload, *, client_id=None):
+        del client_id
+        return persisted_submits[payload["session_id"]], 201
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(routes_module, "_handle_agent_executor_submit", _registered_submit)
+    monkeypatch.setattr(routes_module.asyncio, "to_thread", _inline_to_thread)
+
+    class _Request:
+        def __init__(self, payload=None, *, query=None):
+            self._payload = payload
+            self.query = query or {}
+
+        async def json(self):
+            return self._payload
+
+    def _register_for_root(session_root):
+        monkeypatch.setattr(edit_module, "_SESSION_ROOT", session_root)
+        routes_module.register_agent_edit_routes(types.SimpleNamespace(routes=_Routes()))
+
+    def _body(method, path, request):
+        handler = registered[(method, path)]
+        response = asyncio.run(handler(request))
+        assert response["status"] == 200 or response["status"] == 201
+        return response["body"]
+
+    _register_for_root(root)
+    submit = _body(
+        "POST",
+        "/vibecomfy/agent-edit",
+        _Request({"session_id": session_id, "turn_id": turn_id}),
+    )
+    revision_id = submit["revision_id"]
+    parent_revision = submit["parent_revision"]
+    assert submit["candidate"]["revision_id"] == revision_id
+    assert submit["candidate"]["parent_revision"] == parent_revision
+    assert submit["candidate_transaction"]["revision_id"] == revision_id
+    assert submit["candidate_transaction"]["parent_revision"] == parent_revision
+
+    transaction = submit["candidate_transaction"]
+    prepared = _body(
+        "POST",
+        "/vibecomfy/agent-edit/prepare",
+        _Request(
+            {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "plan_hash": plan_hash,
+                "candidate_graph_hash": candidate_hash,
+                "revision_id": revision_id,
+                "parent_revision": parent_revision,
+                "precondition_projection": transaction["candidate_authority"]["precondition"],
+            }
+        ),
+    )
+    assert prepared["revision_id"] == revision_id
+    assert prepared["parent_revision"] == parent_revision
+
+    chat = _body(
+        "GET",
+        "/vibecomfy/agent-edit/chat",
+        _Request(query={"session_id": session_id}),
+    )
+    lifecycle = chat["latest_turn_lifecycle"]
+    assert lifecycle["candidate_transaction"]["revision_id"] == revision_id
+    assert lifecycle["candidate_transaction"]["parent_revision"] == parent_revision
+
+    finalized = _body(
+        "POST",
+        "/vibecomfy/agent-edit/finalize",
+        _Request(
+            {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "plan_hash": plan_hash,
+                "generation": prepared["generation"],
+                "lease_nonce": prepared["lease_nonce"],
+                "revision_id": revision_id,
+                "parent_revision": parent_revision,
+                "post_apply_hash": structural_hash,
+                "post_apply_graph": submit["candidate"]["graph"],
+                "applied_delta_hash": transaction["plan"]["delta_hash"],
+                "post_apply_hash_verified": True,
+                "browser_verified": True,
+                "postcondition_projection": transaction["candidate_authority"]["postcondition"],
+            }
+        ),
+    )
+    assert finalized["revision_id"] == revision_id
+    assert finalized["parent_revision"] == parent_revision
+    expected_approval = ApprovedProjectionRecord(
+        revision_id=revision_id,
+        selected_variant=None,
+        input_binding={},
+        api_projection={"workflow_revision": revision_id},
+        ui_projection={},
+        api_digest=canonical_digest({"workflow_revision": revision_id}),
+    )
+    expected_canonical = expected_approval.to_canonical_bytes().decode("utf-8")
+    assert finalized["approved_record_canonical"] == expected_canonical
+    durable_approval = finalized["receipt"]["receipt"]["approval"]
+    assert durable_approval["api_digest"] == expected_approval.api_digest
+    assert durable_approval["record_digest"] == hashlib.sha256(
+        expected_canonical.encode("utf-8")
+    ).hexdigest()
+
+    _register_for_root(rollback_root)
+    rollback_submit = _body(
+        "POST",
+        "/vibecomfy/agent-edit",
+        _Request({"session_id": rollback_session, "turn_id": rollback_turn}),
+    )
+    rollback_revision = rollback_submit["revision_id"]
+    rollback_parent = rollback_submit["parent_revision"]
+    rollback_transaction = rollback_submit["candidate_transaction"]
+    rollback_prepared = _body(
+        "POST",
+        "/vibecomfy/agent-edit/prepare",
+        _Request(
+            {
+                "session_id": rollback_session,
+                "turn_id": rollback_turn,
+                "plan_hash": rollback_plan,
+                "candidate_graph_hash": rollback_hash,
+                "revision_id": rollback_revision,
+                "parent_revision": rollback_parent,
+                "precondition_projection": rollback_transaction["candidate_authority"]["precondition"],
+            }
+        ),
+    )
+    assert rollback_prepared["revision_id"] == rollback_revision
+    assert rollback_prepared["parent_revision"] == rollback_parent
+    rolled = _body(
+        "POST",
+        "/vibecomfy/agent-edit/rollback",
+        _Request(
+            {
+                "session_id": rollback_session,
+                "turn_id": rollback_turn,
+                "plan_hash": rollback_plan,
+                "generation": rollback_prepared["generation"],
+                "lease_nonce": rollback_prepared["lease_nonce"],
+                "revision_id": rollback_revision,
+                "parent_revision": rollback_parent,
+            }
+        ),
+    )
+    assert rolled["revision_id"] == rollback_revision
+    assert rolled["parent_revision"] == rollback_parent
+
+
+def test_internal_to_public_outcome_is_closed_authoritative_mapping() -> None:
+    """Every internal kind has one declared public default; budget defaults to
+    noop and is promoted only when a candidate payload exists."""
+    assert dict(INTERNAL_TO_PUBLIC_OUTCOME) == {
+        "edit": "candidate",
+        "edit+clarify": "candidate",
+        "clarify": "clarify",
+        "failure": "error",
+        "noop": "noop",
+        "budget": "noop",
+    }
+    assert set(INTERNAL_TO_PUBLIC_OUTCOME) == set(TURN_OUTCOME_KINDS)
+    assert set(INTERNAL_TO_PUBLIC_OUTCOME.values()) <= set(PUBLIC_OUTCOME_KINDS)
+
+
+def test_budget_public_outcome_uses_mapping_default_and_candidate_override() -> None:
+    assert INTERNAL_TO_PUBLIC_OUTCOME["budget"] == "noop"
+
+    default_public = public_outcome_from_turn_outcome(
+        {"kind": "budget", "reason": "turn budget exhausted"},
+        response={},
+    )
+    candidate_public = public_outcome_from_turn_outcome(
+        {"kind": "budget", "reason": "turn budget exhausted"},
+        response={"candidate": {"graph_hash": "candidate-hash"}},
+    )
+
+    assert default_public == {
+        "kind": "noop",
+        "budget_exhausted": True,
+        "reason": "turn budget exhausted",
+    }
+    assert candidate_public == {
+        "kind": "candidate",
+        "budget_exhausted": True,
+        "reason": "turn budget exhausted",
+        "changes": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"kind": "error"},
+        {
+            "kind": "error",
+            "failure_kind": FailureKind.TIMEOUT_ERROR.value,
+            "stage": "agent_response",
+            "retryable": "true",
+            "next_action": "retry",
+            "graph_unchanged": True,
+        },
+        {
+            "kind": "error",
+            "failure_kind": FailureKind.TIMEOUT_ERROR.value,
+            "stage": "agent_response",
+            "retryable": True,
+            "next_action": "retry",
+        },
+    ],
+)
+def test_public_outcome_from_turn_outcome_rejects_malformed_public_error(outcome: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="public error outcome"):
+        public_outcome_from_turn_outcome(outcome)
+
+
+def test_ensure_agent_edit_response_contract_maps_all_failure_hint_keys_to_error() -> None:
+    assert set(FAILURE_HINT_KEYS) == {
+        "agent_failure_context",
+        "failureKind",
+        "failure_kind",
+        "nextAction",
+        "next_action",
+        "retryable",
+    }
+
+    payload = ensure_agent_edit_response_contract(
+        {
+            "ok": True,
+            "failureKind": FailureKind.AUTH_ERROR.value,
+            "stage": "agent_response",
+            "retryable": False,
+            "nextAction": "check credentials in Agent Settings",
+            "graph_unchanged": True,
+            "agent_failure_context": {"explanation": "HTTP 401"},
+        },
+        stage="agent_response",
+    )
+
+    assert payload["outcome"] == {
+        "kind": "error",
+        "failure_kind": FailureKind.AUTH_ERROR.value,
+        "stage": "agent_response",
+        "retryable": False,
+        "next_action": "check credentials in Agent Settings",
+        "graph_unchanged": True,
+        "agent_failure_context": {"explanation": "HTTP 401"},
+    }
+
+
+def test_all_internal_turn_outcome_kinds_map_to_public_union() -> None:
+    """Every internal TurnOutcome kind maps to a valid public kind via
+    public_outcome_from_turn_outcome."""
+    internal_to_public = {
+        "edit": "candidate",
+        "edit+clarify": "candidate",
+        "clarify": "clarify",
+        "noop": "noop",
+        "failure": "error",
+        # budget depends on response context — but the kind itself maps
+    }
+    for internal_kind in TURN_OUTCOME_KINDS:
+        if internal_kind == "budget":
+            # budget requires response context
+            result = public_outcome_from_turn_outcome(
+                {"kind": "budget", "reason": "exhausted"},
+                response={"candidate": None},
+            )
+            assert result["kind"] in ("candidate", "noop")
+        elif internal_kind == "failure":
+            failure = failure_envelope(
+                FailureKind.VALIDATION_ERROR, "validate", None
+            )
+            result = public_outcome_from_turn_outcome(
+                TurnOutcome.from_failure(failure),
+                response=failure.to_dict(),
+            )
+            assert result["kind"] == internal_to_public[internal_kind]
+        else:
+            # Non-failure, non-budget: construct a minimal outcome
+            changes = (
+                (FieldChange(uid="n1", field_path="x", old=1, new=2),)
+                if internal_kind in ("edit", "edit+clarify")
+                else ()
+            )
+            question = "q?" if internal_kind in ("clarify", "edit+clarify") else None
+            result = public_outcome_from_turn_outcome(
+                {
+                    "kind": internal_kind,
+                    "changes": [c.to_dict() for c in changes],
+                    "question": question,
+                }
+            )
+            assert result["kind"] == internal_to_public[internal_kind], (
+                f"{internal_kind!r} should map to {internal_to_public[internal_kind]!r}, "
+                f"got {result['kind']!r}"
+            )
+
+
+def test_public_projection_helpers_do_not_leak_raw_rehydrate_fields() -> None:
+    sentinel = "SECRET_PUBLIC_PROJECTION_SENTINEL"
+    raw_change_details = {
+        "code": "queue_blocked",
+        "severity": "warning",
+        "message": "Queue remains blocked.",
+        "lifecycle": "candidate",
+        "stage": "queue_validate",
+        "ok": False,
+        "path": f"/private/{sentinel}/audit.json",
+        "audit_path": f"/private/{sentinel}/audit.json",
+        "request_path": f"/private/{sentinel}/request.json",
+        "response_path": f"/private/{sentinel}/response.json",
+        "raw_prompt": f"raw prompt {sentinel}",
+        "prompt": f"expanded prompt {sentinel}",
+        "budget": {"remaining": sentinel},
+        "budget_trace": [{"remaining": sentinel}],
+        "debug_payload": {"stack": sentinel},
+        "raw_session_state": {"canvas": sentinel},
+        "provider_diagnostics": {"trace": sentinel},
+        "batch_turns": [
+            {
+                "stage": "agent_response",
+                "ok": True,
+                "code": "batch_step_complete",
+                "message": "First batch turn completed.",
+                "raw_prompt": f"batch prompt {sentinel}",
+                "budget": {"remaining": sentinel},
+                "debug_payload": {"trace": sentinel},
+            }
+        ],
+    }
+    raw_audit_ref = {
+        "path": f"/private/{sentinel}/turns/0002/audit.json",
+        "sha256": "abc123",
+        "byte_count": 42,
+        "preview": "audit ok",
+    }
+    raw_response = {
+        "ok": True,
+        "session_id": "sess-1",
+        "turn_id": "0002",
+        "message": "Candidate ready.",
+        "outcome": {"kind": "edit", "changes": []},
+        "candidate_graph_hash": "graph-hash",
+        "change_details": raw_change_details,
+        "audit_ref": raw_audit_ref,
+        "debug_payload": {"response": sentinel},
+        "raw_session_state": {"state": sentinel},
+        "provider_diagnostics": {"tokens": sentinel},
+        "budget": {"remaining": sentinel},
+    }
+    raw_latest_candidate = {
+        **raw_response,
+        "graph": {"nodes": [{"id": 1}], "links": []},
+        "runtime_dependencies": [
+            {
+                "class_type": "IPAdapterModelLoader",
+                "availability": "registry_resolvable",
+                "resolver_candidates": [
+                    {
+                        "pack": {
+                            "source": "comfy-registry",
+                            "registry_id": "comfyui_ipadapter_plus",
+                        },
+                        "stable_install_hash": "registry-receipt-hash",
+                    }
+                ],
+            }
+        ],
+        "candidate_transaction": {
+            "contract_version": "candidate_transaction_v1",
+            "state": "candidate_ready",
+        },
+        "report": {
+            "revision_evidence": {
+                "scoped_diff": {
+                    "summary": "1 changed node(s)",
+                    "changed_nodes": ["1"],
+                },
+            },
+        },
+        "candidate": {"state": "candidate", "graph_hash": "graph-hash"},
+    }
+
+    public_values = [
+        public_response_details(raw_response),
+        public_latest_candidate(raw_latest_candidate),
+        public_chat_rehydrate_payload(
+            {
+                "ok": True,
+                "exists": True,
+                "session_id": "sess-1",
+                "latest_turn_id": "0002",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "text": "Candidate ready.",
+                        "turn_id": "0002",
+                        "timestamp": "2026-06-24T12:00:00Z",
+                        "outcome": {"kind": "edit", "changes": []},
+                        "change_details": raw_change_details,
+                        "audit_ref": raw_audit_ref,
+                        "debug_payload": {"message": sentinel},
+                        "raw_prompt": f"message prompt {sentinel}",
+                    }
+                ],
+                "latest_candidate": raw_latest_candidate,
+                "diagnostics": [
+                    {
+                        "code": "reload_warning",
+                        "message": "Reload warning.",
+                        "path": f"/private/{sentinel}/diagnostic.json",
+                        "debug_payload": {"diagnostic": sentinel},
+                    }
+                ],
+                "audit_artifacts": [raw_audit_ref],
+                "debug_payload": {"rehydrate": sentinel},
+                "raw_session_state": {"state": sentinel},
+                "provider_diagnostics": {"provider": sentinel},
+            }
+        ),
+        public_session_json_payload(
+            {
+                "ok": True,
+                "session_id": "sess-1",
+                "latest_turn_id": "0002",
+                "turn_count": 1,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "text": "Candidate ready.",
+                        "turn_id": "0002",
+                        "change_details": raw_change_details,
+                        "audit_ref": raw_audit_ref,
+                    }
+                ],
+                "turns": [
+                    {
+                        "turn_id": "0002",
+                        "message_count": 2,
+                        "error": None,
+                        "audit_path": f"/private/{sentinel}/audit.json",
+                        "detail_json_path": f"/private/{sentinel}/detail.json",
+                        "request.json": {"path": f"/private/{sentinel}/request.json"},
+                        "response.json": {"path": f"/private/{sentinel}/response.json"},
+                        "chat.json": {"path": f"/private/{sentinel}/chat.json"},
+                        "audit_ref": raw_audit_ref,
+                        "raw_session_state": {"turn": sentinel},
+                        "provider_diagnostics": {"turn": sentinel},
+                    }
+                ],
+                "debug_payload": {"session": sentinel},
+                "raw_session_state": {"session": sentinel},
+                "provider_diagnostics": {"session": sentinel},
+            }
+        ),
+    ]
+    assert public_latest_candidate(raw_latest_candidate)["report"] == raw_latest_candidate["report"]
+    assert (
+        public_latest_candidate(raw_latest_candidate)["candidate_transaction"]
+        == raw_latest_candidate["candidate_transaction"]
+    )
+    assert (
+        public_latest_candidate(raw_latest_candidate)["runtime_dependencies"]
+        == raw_latest_candidate["runtime_dependencies"]
+    )
+    assert (
+        public_chat_rehydrate_payload(
+            {
+                "ok": True,
+                "exists": True,
+                "session_id": "sess-1",
+                "latest_candidate": raw_latest_candidate,
+            }
+        )["latest_candidate"]["report"]
+        == raw_latest_candidate["report"]
+    )
+    assert (
+        public_chat_rehydrate_payload(
+            {
+                "ok": True,
+                "exists": True,
+                "session_id": "sess-1",
+                "latest_candidate": raw_latest_candidate,
+            }
+        )["latest_candidate"]["candidate_transaction"]
+        == raw_latest_candidate["candidate_transaction"]
+    )
+
+    for value in public_values:
+        assert value is not None
+        _assert_public_projection_has_no_forbidden_sentinels(value)
+
+
+def test_public_chat_rehydrate_projection_keeps_compact_reload_diagnostics() -> None:
+    projected = public_chat_rehydrate_payload(
+        {
+            "ok": True,
+            "exists": True,
+            "session_id": "sess-1",
+            "latest_turn_id": "0002",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "text": "Candidate ready.",
+                    "turn_id": "0002",
+                    "change_details": {
+                        "code": "queue_blocked",
+                        "severity": "warning",
+                        "message": "Queue remains blocked.",
+                        "lifecycle": "candidate",
+                        "stage": "queue_validate",
+                        "ok": False,
+                        "queue_allowed": False,
+                        "candidate_nodes": 3,
+                        "batch_turns": [
+                            {
+                                "code": "batch_step_complete",
+                                "message": "Validated step one.",
+                                "stage": "agent_response",
+                                "ok": True,
+                                "landed_operation_count": 2,
+                            }
+                        ],
+                    },
+                    "audit_ref": {
+                        "path": "/private/session/turns/0002/audit.json",
+                        "sha256": "abc123",
+                        "byte_count": 42,
+                        "preview": "audit ok",
+                    },
+                }
+            ],
+            "diagnostics": [
+                {
+                    "turn_id": "0001",
+                    "source": "persisted",
+                    "code": "prior_warning",
+                    "message": "Prior warning.",
+                    "severity": "info",
+                    "stage": "ui_emit",
+                    "ok": True,
+                }
+            ],
+            "audit_artifacts": [
+                {
+                    "turn_id": "0001",
+                    "source": "persisted",
+                    "path": "/private/session/turns/0001/audit.json",
+                    "sha256": "def456",
+                    "byte_count": 24,
+                    "preview": "prior audit ok",
+                }
+            ],
+        }
+    )
+
+    assert projected["diagnostics"] == [
+        {
+            "turn_id": "0002",
+            "source": "messages.change_details",
+            "code": "queue_blocked",
+            "severity": "warning",
+            "message": "Queue remains blocked.",
+            "lifecycle": "candidate",
+            "stage": "queue_validate",
+            "ok": False,
+            "queue_allowed": False,
+            "candidate_nodes": 3,
+        },
+        {
+            "turn_id": "0002",
+            "source": "messages.change_details.batch_turns[0]",
+            "code": "batch_step_complete",
+            "message": "Validated step one.",
+            "stage": "agent_response",
+            "ok": True,
+            "landed_operation_count": 2,
+        },
+        {
+            "turn_id": "0001",
+            "source": "persisted",
+            "code": "prior_warning",
+            "message": "Prior warning.",
+            "severity": "info",
+            "stage": "ui_emit",
+            "ok": True,
+        },
+    ]
+    assert projected["audit_artifacts"] == [
+        {
+            "turn_id": "0002",
+            "source": "messages",
+            "sha256": "abc123",
+            "byte_count": 42,
+            "preview": "audit ok",
+        },
+        {
+            "turn_id": "0001",
+            "source": "persisted",
+            "sha256": "def456",
+            "byte_count": 24,
+            "preview": "prior audit ok",
+        },
+    ]
+    _assert_public_projection_has_no_forbidden_sentinels(projected)
+
+
+def test_public_chat_rehydrate_projection_keeps_baseline_authority() -> None:
+    projected = public_chat_rehydrate_payload(
+        {
+            "ok": True,
+            "exists": True,
+            "session_id": "sess-1",
+            "baseline_turn_id": "0007",
+            "baseline_graph_hash": "structural-baseline-hash",
+            "baseline_graph_hash_kind": "structural",
+            "baseline_graph_hash_version": 3,
+            "baseline_source": "turn",
+            "baseline_rebaseline_id": None,
+            "baseline_graph_source_path": "turns/0007/applied.ui.json",
+            "messages": [],
+        }
+    )
+
+    assert projected["baseline_turn_id"] == "0007"
+    assert projected["baseline_graph_hash"] == "structural-baseline-hash"
+    assert projected["baseline_graph_hash_kind"] == "structural"
+    assert projected["baseline_graph_hash_version"] == 3
+    assert projected["baseline_source"] == "turn"
+    assert projected["baseline_rebaseline_id"] is None
+    assert projected["baseline_graph_source_path"] == "turns/0007/applied.ui.json"
+
+
+def test_diagnostic_record_round_trips_through_dict() -> None:
+    record = DiagnosticRecord(
+        session_id="sess-1",
+        turn_id="0003",
+        path="/tmp/sess-1/turns/0003/response.json",
+        mtime=1234567890.0,
+        baseline_turn_id="0001",
+        ok=True,
+        kind="edit",
+        outcome="candidate",
+        lifecycle="candidate",
+        fidelity_ok=True,
+        state_match_ok=True,
+        queue_validate_ok=True,
+        canvas_apply_allowed=True,
+        queue_allowed=True,
+        candidate_nodes=7,
+        task="make it pop",
+        route="edit",
+        protocol="v2",
+        summary="changed saturation",
+        is_baseline=False,
+        accepted_at=None,
+        live_token="token-abc",
+    )
+    payload = record.to_dict()
+    restored = DiagnosticRecord.from_dict(payload)
+    assert restored == record
+    # Extra fields in older on-disk records are ignored.
+    payload["future_field"] = "ignored"
+    assert DiagnosticRecord.from_dict(payload) == record
+
+
+def test_diagnostic_record_requires_string_identity_fields() -> None:
+    base_payload = {
+        "session_id": "sess-1",
+        "turn_id": "0003",
+    }
+    invalid_values = (
+        ("session_id", "<missing>"),
+        ("session_id", None),
+        ("session_id", 123),
+        ("turn_id", "<missing>"),
+        ("turn_id", None),
+        ("turn_id", 123),
+    )
+
+    for field, value in invalid_values:
+        payload = dict(base_payload)
+        if value == "<missing>":
+            del payload[field]
+        else:
+            payload[field] = value
+
+        with pytest.raises(ValueError, match=rf"DiagnosticRecord\.{field} must be a string"):
+            DiagnosticRecord.from_dict(payload)
+
+
+def test_diagnostic_record_rejects_malformed_known_fields() -> None:
+    base_payload = {"session_id": "sess-1", "turn_id": "0003"}
+    invalid_values = (
+        ("path", 123),
+        ("mtime", "not-a-float"),
+        ("mtime", True),
+        ("baseline_turn_id", 456),
+        ("ok", "yes"),
+        ("kind", 789),
+        ("outcome", {"kind": "candidate"}),
+        ("lifecycle", ["candidate"]),
+        ("fidelity_ok", "true"),
+        ("state_match_ok", 1),
+        ("queue_validate_ok", []),
+        ("canvas_apply_allowed", "allowed"),
+        ("queue_allowed", 0),
+        ("candidate_nodes", "seven"),
+        ("candidate_nodes", True),
+        ("task", {"prompt": "make it pop"}),
+        ("route", 42),
+        ("protocol", False),
+        ("summary", ["changed saturation"]),
+        ("is_baseline", "no"),
+        ("accepted_at", 123.45),
+        ("live_token", {"token": "abc"}),
+    )
+
+    for field, value in invalid_values:
+        with pytest.raises(ValueError, match=rf"DiagnosticRecord\.{field}"):
+            DiagnosticRecord.from_dict({**base_payload, field: value})
+
+
+def test_diagnostic_record_defaults_missing_optional_fields() -> None:
+    record = DiagnosticRecord.from_dict({"session_id": "sess-1", "turn_id": "0003"})
+
+    assert record.is_baseline is False
+    assert record.path is None
+    assert record.ok is None
+
+
+def test_diagnostic_record_rejects_non_mapping_and_explicit_baseline_null() -> None:
+    with pytest.raises(ValueError, match="payload must be a mapping"):
+        DiagnosticRecord.from_dict([])  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="is_baseline must be a boolean"):
+        DiagnosticRecord.from_dict(
+            {"session_id": "sess-1", "turn_id": "0003", "is_baseline": None}
+        )
+
+
+def test_diagnostic_record_accepts_nullable_known_fields() -> None:
+    payload = {
+        "session_id": "sess-1",
+        "turn_id": "0003",
+        "path": None,
+        "mtime": None,
+        "baseline_turn_id": None,
+        "ok": None,
+        "kind": None,
+        "outcome": None,
+        "lifecycle": None,
+        "fidelity_ok": None,
+        "state_match_ok": None,
+        "queue_validate_ok": None,
+        "canvas_apply_allowed": None,
+        "queue_allowed": None,
+        "candidate_nodes": None,
+        "task": None,
+        "route": None,
+        "protocol": None,
+        "summary": None,
+        "accepted_at": None,
+        "live_token": None,
+    }
+
+    assert DiagnosticRecord.from_dict(payload).to_dict() == {
+        **payload,
+        "is_baseline": False,
+    }
+
+
+def test_repair_field_changes_fills_missing_old_value_from_ui_graph() -> None:
+    graph = {
+        "nodes": [
+            {
+                "id": 1,
+                "type": "KSampler",
+                "widgets_values": [20, "euler", 1.0],
+            }
+        ]
+    }
+    changes = (FieldChange(uid="1", field_path="widgets_values[0]", old=None, new=25),)
+    repaired = repair_field_changes(graph, changes)
+    assert len(repaired) == 1
+    assert repaired[0].old == 20
+    assert repaired[0].new == 25
+
+
+def test_repair_field_changes_keeps_tuple_when_nothing_changes() -> None:
+    graph = {
+        "nodes": [
+            {
+                "id": "n1",
+                "properties": {"vibecomfy_uid": "n1"},
+                "widgets_values": {"seed": 42},
+            }
+        ]
+    }
+    changes = (FieldChange(uid="n1", field_path="seed", old=42, new=43),)
+    assert repair_field_changes(graph, changes) is changes
+
+
+# ── Batch 10: every consumer uses the canonical Δ (the accepted batch) ──────
+
+
+def _delta_state(**overrides: object) -> "object":
+    from pathlib import Path
+
+    from vibecomfy.comfy_nodes.agent.edit import AgentEditState
+
+    defaults: dict[str, object] = {
+        "task": "delta consumers",
+        "graph": {},
+        "request_payload": {},
+        "schema_provider": None,
+        "baseline_graph_hash": None,
+        "submit_graph_hash": None,
+        "submit_structural_graph_hash": None,
+        "submitted_client_graph_hash": None,
+        "submitted_client_structural_graph_hash": None,
+        "session_dir": Path("/tmp/delta_consumers_session"),
+        "turn_dir": Path("/tmp/delta_consumers_session/turn_001"),
+        "request_path": Path("/tmp/delta_consumers_session/request.json"),
+        "original_ui_path": Path("/tmp/delta_consumers_session/original.json"),
+        "before_py_path": Path("/tmp/delta_consumers_session/before.py"),
+        "after_py_path": Path("/tmp/delta_consumers_session/after.py"),
+        "projection_path": Path("/tmp/delta_consumers_session/projection.json"),
+        "model_request_path": Path("/tmp/delta_consumers_session/model_request.json"),
+        "model_response_path": Path("/tmp/delta_consumers_session/model_response.json"),
+        "candidate_ui_path": Path("/tmp/delta_consumers_session/candidate.json"),
+        "messages_path": Path("/tmp/delta_consumers_session/messages.json"),
+        "batch_turns": [],
+        "batch_field_changes": (),
+    }
+    defaults.update(overrides)
+    return AgentEditState(**defaults)
+
+
+def test_accepted_batch_statements_exclude_rejected_statements() -> None:
+    """The accepted Δ is the batch statements that succeeded; rejected
+    statements are never part of Δ."""
+    from vibecomfy.comfy_nodes.agent.edit import _accepted_batch_statements
+
+    state = _delta_state(
+        batch_turns=[
+            {
+                "statements": [
+                    {
+                        "statement_index": 1,
+                        "source": 'set_field(uid="sampler", field="steps", value=30)',
+                        "ok": True,
+                        "landed": True,
+                        "op_kind": "edit",
+                        "touched_uids": ["sampler"],
+                    },
+                    {
+                        "statement_index": 2,
+                        "source": 'set_field(uid="sampler", field="seed", value=99)',
+                        "ok": False,
+                        "landed": False,
+                        "op_kind": "edit",
+                        "touched_uids": ["sampler"],
+                    },
+                ]
+            }
+        ]
+    )
+
+    accepted = _accepted_batch_statements(state)
+
+    assert [item["statement_index"] for item in accepted] == [1]
+    assert accepted[0]["op_kind"] == "edit"
+
+
+def test_humanized_edit_message_derived_from_accepted_delta() -> None:
+    """A batch with a rejected statement does not claim it: the summary is
+    derived from the accepted Δ only."""
+    from vibecomfy.comfy_nodes.agent.edit import _humanized_edit_message
+
+    state = _delta_state(
+        graph={
+            "nodes": [
+                {
+                    "id": "sampler",
+                    "type": "KSampler",
+                    "properties": {"vibecomfy_uid": "sampler"},
+                }
+            ]
+        },
+        ui_payload={
+            "nodes": [
+                {
+                    "id": "sampler",
+                    "type": "KSampler",
+                    "properties": {"vibecomfy_uid": "sampler"},
+                }
+            ]
+        },
+        batch_turns=[
+            {
+                "statements": [
+                    {
+                        "statement_index": 1,
+                        "source": 'set_field(uid="sampler", field="steps", value=30)',
+                        "ok": True,
+                        "landed": True,
+                        "op_kind": "edit",
+                        "touched_uids": ["sampler"],
+                    },
+                    {
+                        "statement_index": 2,
+                        "source": 'set_field(uid="sampler", field="seed", value=99)',
+                        "ok": False,
+                        "landed": False,
+                        "op_kind": "edit",
+                        "touched_uids": ["sampler"],
+                    },
+                ],
+                "field_changes": [
+                    {"uid": "sampler", "field_path": "steps", "old": 20, "new": 30},
+                ],
+                "delta_ops_envelope": {
+                    "schema_version": "2.0.0",
+                    "ops": [
+                        {
+                            "op": "set_node_field",
+                            "target": ["", "sampler", "steps"],
+                            "value": 30,
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+
+    message = _humanized_edit_message(state)
+
+    assert "steps" in message
+    assert "seed" not in message
+
+
+def test_change_details_operations_derive_from_accepted_delta() -> None:
+    """Response change claims are the Δ's field changes; a rejected
+    statement's field never appears in change_details.operations."""
+    from vibecomfy.comfy_nodes.agent.edit import (
+        TurnContext,
+        _change_details_payload,
+    )
+
+    state = _delta_state(
+        batch_turns=[
+            {
+                "statements": [
+                    {
+                        "statement_index": 1,
+                        "source": 'set_field(uid="a", field="x", value=1)',
+                        "ok": True,
+                        "landed": True,
+                        "op_kind": "edit",
+                        "touched_uids": ["a"],
+                    },
+                    {
+                        "statement_index": 2,
+                        "source": 'set_field(uid="b", field="y", value=2)',
+                        "ok": False,
+                        "landed": False,
+                        "op_kind": "edit",
+                        "touched_uids": ["b"],
+                    },
+                ],
+                "field_changes": [
+                    {"uid": "a", "field_path": "x", "old": None, "new": 1},
+                ],
+            }
+        ]
+    )
+    context = TurnContext()
+
+    payload = _change_details_payload(state, context)
+
+    operations = payload["operations"]
+    assert [op["uid"] for op in operations] == ["a"]
+    assert all(op["field_path"] == "x" for op in operations)
+
+
+# ── T3.1: harness sole-timeout-retry-owner freeze ────────────────────────────
+
+
+def test_t31_harness_is_sole_timeout_retry_owner_with_fresh_identity() -> None:
+    """D5+D6 freeze: cap = 1 infra retry, 1200s per attempt; every live attempt
+    record carries the fixture vocabulary (owner/deadline/remote_uncertainty/
+    retry_disposition) and never retries under the same identity."""
+    from tests.live_agentic_harness import runner as harness_runner
+
+    assert harness_runner.DEFAULT_INFRA_RETRIES == 1
+    assert harness_runner.DEFAULT_PER_SCENARIO_TIMEOUT == 1200
+    assert harness_runner.HARNESS_RETRY_OWNER == "harness_infrastructure"
+    assert harness_runner._RETRYABLE_INFRA_CLASSES == frozenset(
+        {"infra_empty_response", "infra_timeout"}
+    )
+
+    summary = {
+        "failure_class": "infra_timeout",
+        "killed_before_first_attempt": True,
+        "model_attempts": [],
+        "guard": {},
+    }
+    assert harness_runner._is_retryable_infra_summary(summary) is True
+    record = harness_runner._attempt_record(
+        summary,
+        attempt=2,
+        attempt_identity="tag/attempts/sid/attempt_2",
+        attempt_deadline_seconds=1200.0,
+    )
+    ownership = record["retry_ownership"]
+    assert ownership["owner"] == "harness_infrastructure"
+    assert ownership["attempt_identity"] == "tag/attempts/sid/attempt_2"
+    assert ownership["attempt_deadline_seconds"] == 1200.0
+    assert ownership["same_identity_retry"] is False
+    assert ownership["retry_disposition"] == "not_safe_to_retry_same_identity"
+    assert ownership["remote_uncertainty"] == "timeout_before_response"
+    assert ownership["request_idempotency_key"] is None

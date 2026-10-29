@@ -1,0 +1,1 @@
+cliptextencode.text = "hello world"

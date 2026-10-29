@@ -1,0 +1,1195 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from tests.live_agentic_harness.runner import (
+    _is_retryable_infra_summary,
+    _persist_run_summary,
+    _persist_scenario_summary,
+    _provider_infra_failure_class,
+    run_tag,
+)
+from tests.live_agentic_harness.scenario_manifest import write_manifest
+from vibecomfy.executor.contracts import coerce_model_attempts
+
+
+def _summary(tmp_path: Path, scenario_id: str, *, ok: bool) -> dict:
+    output_dir = tmp_path / "tag" / scenario_id
+    return {
+        "scenario_id": scenario_id,
+        "status": "success" if ok else "error",
+        "output_dir": str(output_dir),
+        "guard": {"live_agentic_success": ok},
+        "deepseek_usage": {},
+        "deepseek_est_cost_usd": 0.0,
+        "deepseek_cost_basis": "not_available",
+        "model_attempts": [],
+    }
+
+
+def _failed_attempt(failure_type: str, *, completion_tokens: int = 0) -> dict:
+    return {
+        "phase": "classify",
+        "attempt": 1,
+        "outcome": "failure",
+        "failure_type": failure_type,
+        "requested_model": "requested",
+        "resolved_model": "resolved",
+        "adapter": "hermes",
+        "provider": "openrouter",
+        "transport": "openrouter",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "finish_reason": "unknown",
+        "token_usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 10 + completion_tokens,
+        },
+    }
+
+
+def test_r5_480_second_attempt_ledger_is_identity_bound_and_truthful() -> None:
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "workflow_execution_spine_r5"
+            / "attempt_ledger_480s.json"
+        ).read_text(encoding="utf-8")
+    )
+    attempt = fixture["attempts"][0]
+
+    assert attempt["attempt_id"] == "turn-0007/attempt-1"
+    assert attempt["turn_id"] == "turn-0007"
+    assert attempt["deadline_seconds"] == 480
+    assert attempt["owner"] == "harness_infrastructure"
+    assert attempt["status"] == "exhausted"
+    assert attempt["retry_disposition"] == "not_safe_to_retry_same_identity"
+    assert attempt["remote_uncertainty"] == "timeout_before_response"
+    assert attempt["model_calls"] == 1
+    assert fixture["expected"] == {
+        "identity_recorded": True,
+        "deadline_recorded": True,
+        "ownership_recorded": True,
+        "truthful_exhaustion": True,
+        "retry_does_not_claim_success": True,
+    }
+
+
+def test_persists_per_scenario_and_incremental_run_summary(tmp_path: Path) -> None:
+    passing = _summary(tmp_path, "passing", ok=True)
+    failing = _summary(tmp_path, "failing", ok=False)
+
+    _persist_scenario_summary(passing, tmp_path, "tag")
+    _persist_scenario_summary(failing, tmp_path, "tag")
+    partial = _persist_run_summary(
+        "tag",
+        [passing, failing, None],
+        tmp_path,
+        total_scenarios=3,
+        complete=False,
+    )
+
+    assert partial["passed"] == 1
+    assert partial["failed"] == 1
+    assert partial["pending"] == 1
+    assert partial["complete"] is False
+    assert (tmp_path / "tag" / "passing" / "agentic_summary.json").exists()
+    assert (tmp_path / "tag" / "failing" / "agentic_summary.json").exists()
+    assert (tmp_path / "tag" / "run_summary.partial.json").exists()
+
+    persisted = json.loads((tmp_path / "tag" / "run_summary.partial.json").read_text())
+    assert persisted["passed"] == 1
+    assert persisted["failed"] == 1
+
+
+def test_final_summary_replaces_partial_summary(tmp_path: Path) -> None:
+    passing = _summary(tmp_path, "passing", ok=True)
+
+    _persist_run_summary("tag", [passing], tmp_path, total_scenarios=1, complete=False)
+    final = _persist_run_summary("tag", [passing], tmp_path, total_scenarios=1, complete=True)
+
+    assert final["complete"] is True
+    assert final["overall_success"] is True
+    assert (tmp_path / "tag" / "run_summary.json").exists()
+    assert not (tmp_path / "tag" / "run_summary.partial.json").exists()
+
+
+def test_runner_persists_dispatch_liveness_before_child_returns(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """A dispatched child is visible before its potentially long work ends."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "slow-start.json"
+    scenario_path.write_text(
+        json.dumps({"id": "slow-start", "query": "do it"}),
+        encoding="utf-8",
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        attempt_dir = (
+            tmp_path
+            / "out"
+            / "tag"
+            / "attempts"
+            / "slow-start"
+            / "attempt_1"
+            / "slow-start"
+        )
+        assert attempt_dir.is_dir()
+        partial_path = tmp_path / "out" / "tag" / "run_summary.partial.json"
+        partial = json.loads(partial_path.read_text(encoding="utf-8"))
+        assert partial["completed"] == 0
+        assert partial["pending"] == 1
+
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        attempt_tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / attempt_tag, "slow-start", ok=True)
+        payload["output_dir"] = str(attempt_dir)
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr(
+        "tests.live_agentic_harness.runner._run_scenario_subprocess",
+        fake_run,
+    )
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        infra_retries=0,
+        progress_every=0,
+    )
+
+    assert summary["passed"] == 1
+    assert (tmp_path / "out" / "tag" / "run_summary.json").is_file()
+    assert not (tmp_path / "out" / "tag" / "run_summary.partial.json").exists()
+
+
+def test_runner_retries_outer_timeout_with_empty_attempts_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "retry-me.json"
+    scenario_path.write_text(json.dumps({"id": "retry-me", "query": "do it"}), encoding="utf-8")
+
+    calls = 0
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            kwargs["before_terminate"]()
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        output_dir = tmp_path / "out" / tag / "retry-me"
+        payload = _summary(tmp_path / "out" / tag, "retry-me", ok=True)
+        payload["output_dir"] = str(output_dir)
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert calls == 2
+    assert summary["passed"] == 1
+    assert summary["raw_first_attempt_passed"] == 0
+    assert scenario["attempt_count"] == 2
+    assert scenario["attempts"][0]["failure_class"] == "infra_timeout"
+    assert scenario["attempts"][0]["score_class"] == "infra_blocked"
+    assert scenario["attempts"][0]["retryable_infra"] is True
+    assert scenario["attempts"][0]["agent_exercised"] is False
+    assert scenario["attempts"][0]["model_attempts"] == []
+    assert scenario["attempts"][0]["killed_before_first_attempt"] is True
+    assert scenario["attempts"][0]["elapsed_s"] is not None
+    assert scenario["final_attempt"] == 2
+    assert (
+        tmp_path / "out" / "tag" / "retry-me" / "agentic_summary.json"
+    ).exists()
+    partial = json.loads(
+        (
+            tmp_path
+            / "out"
+            / "tag"
+            / "attempts"
+            / "retry-me"
+            / "attempt_1"
+            / "retry-me"
+            / "agentic_summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert partial["killed_before_first_attempt"] is True
+    assert partial["model_attempts"] == []
+
+
+def test_runner_types_provider_capacity_without_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "provider-capacity.json"
+    scenario_path.write_text(
+        json.dumps({"id": "provider-capacity", "query": "do it"}),
+        encoding="utf-8",
+    )
+
+    calls = 0
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        nonlocal calls
+        calls += 1
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        output_dir = tmp_path / "out" / tag / "provider-capacity"
+        if calls == 1:
+            payload = _summary(tmp_path / "out" / tag, "provider-capacity", ok=False)
+            payload.update(
+                {
+                    "status": "executor_failure",
+                    "error": (
+                        "OpenRouter rejected the request because the account does "
+                        "not have enough credits for the requested token budget."
+                    ),
+                    "output_dir": str(output_dir),
+                    "model_attempts": [_failed_attempt("provider_failure")],
+                    "guard": {
+                        "live_agentic_success": False,
+                        "score_class": "product_fail",
+                        "assessment": {
+                            "passed": False,
+                            "issues": [
+                                {
+                                    "check": "response_ok",
+                                    "severity": "error",
+                                    "detail": (
+                                        "response.ok is False: OpenRouter rejected "
+                                        "the request because the account does not "
+                                        "have enough credits for the requested token budget."
+                                    ),
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
+        else:
+            payload = _summary(tmp_path / "out" / tag, "provider-capacity", ok=True)
+            payload["output_dir"] = str(output_dir)
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert calls == 1
+    assert summary["passed"] == 0
+    assert summary["raw_first_attempt_passed"] == 0
+    assert scenario["attempt_count"] == 1
+    assert scenario["attempts"][0]["failure_class"] == "infra_provider_capacity"
+    assert scenario["attempts"][0]["score_class"] == "infra_blocked"
+    assert scenario["attempts"][0]["retryable_infra"] is False
+
+
+def test_runner_retries_only_typed_empty_zero_token_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "typed-empty.json"
+    scenario_path.write_text(json.dumps({"id": "typed-empty", "query": "do it"}), encoding="utf-8")
+    calls = 0
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        nonlocal calls
+        calls += 1
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "typed-empty", ok=calls > 1)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "typed-empty")
+        if calls == 1:
+            payload["error"] = "arbitrary wording that must not drive classification"
+            payload["model_attempts"] = [_failed_attempt("empty_response", completion_tokens=0)]
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert calls == 2
+    assert scenario["attempts"][0]["failure_class"] == "infra_empty_response"
+    assert scenario["attempts"][0]["model_attempts"][0]["failure_type"] == "empty_response"
+    assert scenario["attempts"][1]["live_agentic_success"] is True
+
+
+def test_runner_keeps_malformed_nonempty_as_product_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "malformed.json"
+    scenario_path.write_text(json.dumps({"id": "malformed", "query": "do it"}), encoding="utf-8")
+    calls = 0
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        nonlocal calls
+        calls += 1
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "malformed", ok=False)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "malformed")
+        payload["error"] = "OpenRouter rejected / HTTP 429 wording is irrelevant"
+        payload["model_attempts"] = [_failed_attempt("malformed_json", completion_tokens=5)]
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (1, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert calls == 1
+    assert scenario["score_class"] == "product_fail"
+    assert scenario.get("retryable_infra") is not True
+
+
+def test_runner_counts_persistent_provider_capacity_as_infra_blocked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "provider-down.json"
+    scenario_path.write_text(json.dumps({"id": "provider-down", "query": "do it"}), encoding="utf-8")
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        output_dir = tmp_path / "out" / tag / "provider-down"
+        payload = _summary(tmp_path / "out" / tag, "provider-down", ok=False)
+        payload.update(
+            {
+                "status": "executor_failure",
+                "error": "HTTP Error 429: Too Many Requests",
+                "output_dir": str(output_dir),
+                "model_attempts": [_failed_attempt("provider_failure")],
+                "guard": {
+                    "live_agentic_success": False,
+                    "score_class": "product_fail",
+                    "assessment": {"passed": False, "issues": []},
+                },
+            }
+        )
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (1, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert scenario["attempt_count"] == 1
+    assert scenario["failure_class"] == "infra_provider_capacity"
+    assert scenario["score_class"] == "infra_blocked"
+    assert summary["passed"] == 0
+    assert summary["infra_failures"] == 1
+    assert summary["product_or_assessment_failures"] == 0
+    assert summary["score_classes"] == {"infra_blocked": 1}
+
+
+def test_runner_does_not_classify_soft_search_429_as_infra(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "soft-search-warning.json"
+    scenario_path.write_text(
+        json.dumps({"id": "soft-search-warning", "query": "do it"}),
+        encoding="utf-8",
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        output_dir = tmp_path / "out" / tag / "soft-search-warning"
+        payload = _summary(tmp_path / "out" / tag, "soft-search-warning", ok=False)
+        payload.update(
+            {
+                "status": "success",
+                "error": None,
+                "output_dir": str(output_dir),
+                "guard": {
+                    "live_agentic_success": False,
+                    "score_class": "product_fail",
+                    "assessment": {
+                        "passed": False,
+                        "issues": [
+                            {
+                                "check": "graph_changed",
+                                "severity": "error",
+                                "detail": "Expected graph change but response.graph_unchanged is True.",
+                            },
+                            {
+                                "check": "soft_warning",
+                                "severity": "warning",
+                                "detail": "web search: brave search HTTP error: HTTP Error 429: Too Many Requests",
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (1, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert scenario["attempt_count"] == 1
+    assert scenario["failure_class"] == "product_or_assessment_failure"
+    assert scenario["score_class"] == "product_fail"
+    assert scenario.get("retryable_infra") is not True
+    assert summary["infra_failures"] == 0
+    assert summary["product_or_assessment_failures"] == 1
+
+
+def test_runner_timeout_preserves_scenario_graph_change_expectation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "diagnose.json"
+    scenario_path.write_text(
+        json.dumps(
+            {
+                "id": "diagnose",
+                "query": "explain the graph",
+                "assessment": {"expect_graph_changed": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=0,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert scenario["guard"]["assessment"]["expect_graph_changed"] is False
+    assert scenario["failure_class"] == "infra_timeout"
+    assert summary["infra_failures"] == 1
+
+
+def test_retryability_ignores_stale_infra_flags_when_evidence_is_malformed() -> None:
+    """Oracle finding 4: persisted failure_class/retryable_infra must never drive retry.
+
+    Canonical ``malformed_json`` evidence with zero tokens is NOT retryable even
+    when the summary inherited ``failure_class=infra_empty_response`` and
+    ``retryable_infra=True`` from an earlier attempt.
+    """
+    summary = _summary(Path("/tmp"), "conflicting-flags", ok=False)
+    summary["model_attempts"] = [_failed_attempt("malformed_json", completion_tokens=0)]
+    summary["failure_class"] = "infra_empty_response"
+    summary["retryable_infra"] = True
+    summary["score_class"] = "infra_blocked"
+    summary["guard"]["failure_class"] = "infra_empty_response"
+    summary["guard"]["score_class"] = "infra_blocked"
+
+    assert _provider_infra_failure_class(summary) is None
+    assert _is_retryable_infra_summary(summary) is False
+    # The inherited markers were cleared, never trusted.
+    assert summary.get("failure_class") is None
+    assert summary.get("retryable_infra") is False
+    assert summary.get("score_class") is None
+    assert summary["guard"].get("failure_class") is None
+    assert summary["guard"].get("score_class") is None
+
+
+def test_retryability_is_derived_from_canonical_typed_evidence() -> None:
+    """Canonical empty_response + observed zero tokens is retryable regardless of flags."""
+    summary = _summary(Path("/tmp"), "canonical-empty", ok=False)
+    summary["model_attempts"] = [_failed_attempt("empty_response", completion_tokens=0)]
+    summary["failure_class"] = "product_or_assessment_failure"  # stale conflicting flag
+    summary["retryable_infra"] = False  # stale conflicting flag
+
+    assert _provider_infra_failure_class(summary) == "infra_empty_response"
+    assert _is_retryable_infra_summary(summary) is True
+    assert summary["failure_class"] == "infra_empty_response"
+    assert summary["retryable_infra"] is True
+
+
+def test_outer_timeout_marker_requires_empty_model_attempts() -> None:
+    summary = _summary(Path("/tmp"), "outer-timeout", ok=False)
+    summary["failure_class"] = "infra_timeout"
+    summary["killed_before_first_attempt"] = True
+    summary["model_attempts"] = [_failed_attempt("malformed_json")]
+
+    assert _is_retryable_infra_summary(summary) is False
+
+
+@pytest.fixture
+def leaky_canonical_attempt() -> dict:
+    """Canonical failed attempt whose preview embeds oracle finding 5 JSON secrets.
+
+    The canonical shape is exactly what the executor emits (``coerce_model_attempts``
+    applies ``ModelAttemptEvidence`` redaction), so a persisted agentic summary must
+    never reintroduce the raw secrets.
+    """
+    attempts = coerce_model_attempts(
+        (
+            {
+                **_failed_attempt("provider_failure"),
+                "raw_response_preview": (
+                    '{"api_key":"sk-secret",'
+                    '"authorization":"Basic dXNlcjpwYXNz",'
+                    '"token":"tok-secret"}'
+                ),
+            },
+        )
+    )
+    return attempts[0]
+
+
+def test_persisted_agentic_summary_redacts_json_quoted_secrets(
+    tmp_path: Path,
+    monkeypatch,
+    leaky_canonical_attempt: dict,
+) -> None:  # noqa: ANN001
+    """Oracle finding 5 durable: agentic_summary.json keeps JSON-quoted secrets out."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "json-quoted-secrets.json"
+    scenario_path.write_text(
+        json.dumps({"id": "json-quoted-secrets", "query": "do it"}),
+        encoding="utf-8",
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "json-quoted-secrets", ok=False)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "json-quoted-secrets")
+        payload["error"] = "provider rejected"
+        payload["model_attempts"] = [leaky_canonical_attempt]
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (1, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=0,
+        progress_every=0,
+    )
+
+    persisted_path = (
+        tmp_path / "out" / "tag" / "json-quoted-secrets" / "agentic_summary.json"
+    )
+    assert persisted_path.exists()
+    persisted = persisted_path.read_text(encoding="utf-8")
+    assert "sk-secret" not in persisted
+    assert "Basic dXNlcjpwYXNz" not in persisted
+    assert "tok-secret" not in persisted
+    summary = json.loads(persisted)
+    # model_attempts is persisted both top-level and inside the attempt record;
+    # every occurrence must carry the fully redacted preview.
+    for attempt in [summary["model_attempts"][0], summary["attempts"][0]["model_attempts"][0]]:
+        preview = attempt["raw_response_preview"]
+        assert preview.count("<redacted>") == 3
+        assert "sk-secret" not in preview
+        assert "Basic dXNlcjpwYXNz" not in preview
+        assert "tok-secret" not in preview
+
+
+# ── B07-lite: explicit transport selector plumbing ──────────────────────────
+
+
+def test_transport_flag_and_pinned_child_env_survive_subprocess_isolation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """Sense-check 1+2: the explicit selector reaches the child command line and
+    the child environment is pinned so ambient credentials cannot win."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "transport.json"
+    scenario_path.write_text(
+        json.dumps({"id": "transport", "query": "do it"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIBECOMFY_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("VIBECOMFY_FORCE_MODEL", "openrouter:deepseek/deepseek-v4-pro")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-ambient")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-native-ambient")
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "transport", ok=True)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "transport")
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=0,
+        progress_every=0,
+        transport="native",
+    )
+
+    # CLI -> child: the selector is on the child command line.
+    assert captured["cmd"][captured["cmd"].index("--transport") + 1] == "native"
+    # Child environment: ambient transport-selecting keys are pinned away...
+    assert "VIBECOMFY_OPENROUTER_BASE_URL" not in captured["env"]
+    assert "VIBECOMFY_TRANSPORT" not in captured["env"]
+    assert "VIBECOMFY_FORCE_MODEL" not in captured["env"]
+    # ...but credential keys are preserved (they supply keys, not transport).
+    assert captured["env"]["OPENROUTER_API_KEY"] == "sk-or-ambient"
+    assert captured["env"]["DEEPSEEK_API_KEY"] == "sk-native-ambient"
+    # The run configuration records the selection.
+    assert summary["transport"] == "native"
+    assert summary["scenarios"][0]["transport"] == "native"
+    persisted = json.loads(
+        (tmp_path / "out" / "tag" / "run_summary.json").read_text(encoding="utf-8")
+    )
+    assert persisted["transport"] == "native"
+
+
+def test_transport_omitted_resolves_to_openrouter_default_not_ambient_native(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """Rework 2 (oracle issue 1d): the no-flag default is pinned to the
+    canonical OpenRouter product route.  An ambient ``VIBECOMFY_TRANSPORT=native``
+    must never leak into the child or displace the default, and the run records
+    the resolved default (openrouter), not None."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "no-transport.json"
+    scenario_path.write_text(
+        json.dumps({"id": "no-transport", "query": "do it"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIBECOMFY_TRANSPORT", "native")
+    monkeypatch.setenv("VIBECOMFY_OPENROUTER_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "***")
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "no-transport", ok=True)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "no-transport")
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=0,
+        progress_every=0,
+    )
+
+    # No flag -> the canonical default is forwarded explicitly to the child.
+    assert captured["cmd"][captured["cmd"].index("--transport") + 1] == "openrouter"
+    # The ambient native pin/base URL is stripped from the child environment.
+    assert "VIBECOMFY_TRANSPORT" not in captured["env"]
+    assert "VIBECOMFY_OPENROUTER_BASE_URL" not in captured["env"]
+    # Credential keys are preserved (they supply keys, not transport).
+    assert captured["env"]["OPENROUTER_API_KEY"] == "***"
+    # The run configuration records the resolved default.
+    assert summary["transport"] == "openrouter"
+    assert summary["scenarios"][0]["transport"] == "openrouter"
+    persisted = json.loads(
+        (tmp_path / "out" / "tag" / "run_summary.json").read_text(encoding="utf-8")
+    )
+    assert persisted["transport"] == "openrouter"
+
+
+def test_observed_transport_provenance_passthrough_matches_selection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """B01 provenance is consumed verbatim: the runner never rewrites the
+    observed transport and never introduces a second metadata format."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "observed-transport.json"
+    scenario_path.write_text(
+        json.dumps({"id": "observed-transport", "query": "do it"}),
+        encoding="utf-8",
+    )
+
+    native_attempt = _failed_attempt("empty_response", completion_tokens=0)
+    native_attempt.update(
+        {
+            "provider": "deepseek",
+            "transport": "native",
+            "endpoint": "https://api.deepseek.com/v1",
+            "resolved_model": "deepseek-v4-pro",
+        }
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "observed-transport", ok=False)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "observed-transport")
+        payload["error"] = "empty response"
+        payload["model_attempts"] = [native_attempt]
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (1, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+        transport="native",
+    )
+
+    scenario = summary["scenarios"][0]
+    # Observed B01 attempt provenance: transport/endpoint exactly as the child
+    # observed them — no rewriting, no parallel format.
+    observed = scenario["attempts"][0]["model_attempts"][0]
+    assert observed["transport"] == "native"
+    assert observed["endpoint"] == "https://api.deepseek.com/v1"
+    assert observed["failure_type"] == "empty_response"
+    assert scenario["failure_class"] == "infra_empty_response"
+    # Selection and observation agree.
+    assert scenario["transport"] == "native"
+    assert observed["transport"] == scenario["transport"]
+
+
+def test_run_single_forwards_transport_selector_to_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    from tests.live_agentic_harness.runner import run_single
+
+    scenario_path = tmp_path / "single.json"
+    scenario_path.write_text(
+        json.dumps({"id": "single", "query": "do it"}),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_headless(scenario, *, output_base, tag, transport=None):  # noqa: ANN001, ANN202, ARG001
+        calls["transport"] = transport
+        return {
+            "scenario_id": "single",
+            "status": "success",
+            "ok": True,
+            "output_dir": str(tmp_path / "out" / tag / "single"),
+            "deepseek_usage": {},
+            "model_attempts": [],
+        }
+
+    def fake_guard(output_dir, *, scenario=None):  # noqa: ANN001, ANN202, ARG001
+        return {
+            "live_agentic_success": True,
+            "score_class": "pass",
+            "assessment": {"passed": True, "issues": []},
+        }
+
+    monkeypatch.setattr(
+        "tests.live_agentic_harness.adapter.run_headless_scenario", fake_headless
+    )
+    monkeypatch.setattr(
+        "tests.live_agentic_harness.runner._guard_scenario_output",
+        fake_guard,
+    )
+
+    summary = run_single(
+        str(scenario_path), "tag", tmp_path / "out", None, transport="openrouter"
+    )
+
+    assert calls["transport"] == "openrouter"
+    assert summary["transport"] == "openrouter"
+
+
+# ── I-B: pre-first-attempt research-hang kills ──────────────────────────────
+
+
+def test_failure_summary_persists_pre_attempt_reason(tmp_path: Path) -> None:
+    from tests.live_agentic_harness.runner import _failure_summary
+
+    summary = _failure_summary(
+        "research-hang",
+        tmp_path / "out",
+        "tag",
+        "scenario exceeded 1200s and was killed",
+        failure_class="infra_timeout",
+        killed_before_first_attempt=True,
+        pre_attempt_reason="research_hang",
+    )
+
+    assert summary["killed_before_first_attempt"] is True
+    assert summary["pre_attempt_reason"] == "research_hang"
+    assert summary["model_attempts"] == []
+    assert summary["failure_class"] == "infra_timeout"
+
+
+def test_infer_pre_attempt_reason_classifies_research_hang_only() -> None:
+    from tests.live_agentic_harness.runner import _infer_pre_attempt_reason
+
+    assert (
+        _infer_pre_attempt_reason(
+            "[INFO] HTTP Request: GET https://api.github.com/search/code"
+            "?q=GroundingDinoModelLoader ComfyUI ... 422 Unprocessable Entity"
+        )
+        == "research_hang"
+    )
+    assert (
+        _infer_pre_attempt_reason(
+            "registry sub-budget exceeded during GitHub lookup; partial evidence."
+        )
+        == "research_hang"
+    )
+    assert _infer_pre_attempt_reason("hivemind_query_degraded_after_57014") == "research_hang"
+    # Implement-stage silence (v5-batch-3 #2/#6) is NOT a research hang: the
+    # retry keeps its plain full-budget shape.
+    assert _infer_pre_attempt_reason("profiler worker_profile backend_phase=batch") is None
+    assert (
+        _infer_pre_attempt_reason(
+            "old: GET https://api.github.com/search/code?q=StaleNode ComfyUI\n"
+            "current: profiler worker_profile backend_phase=batch"
+        )
+        is None
+    )
+    assert _infer_pre_attempt_reason(None) is None
+    assert _infer_pre_attempt_reason("") is None
+
+
+def test_runner_marks_research_hang_kill_and_bounds_retry_research(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """A zero-attempt outer kill whose stderr shows the GitHub code-search path
+    is typed ``pre_attempt_reason=research_hang`` AND the retry child gets a
+    hard-bounded research env (GitHub tier skipped, tiny registry sub-budget)
+    so the retry is not a second 1200s black hole."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "research-hang.json"
+    scenario_path.write_text(
+        json.dumps({"id": "research-hang", "query": "do it"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("VIBECOMFY_REGISTRY_SKIP_GITHUB", raising=False)
+    monkeypatch.delenv("VIBECOMFY_REGISTRY_SUB_BUDGET", raising=False)
+    monkeypatch.delenv("VIBECOMFY_RESEARCH_HANG_RETRY_SKIP", raising=False)
+
+    calls = 0
+    child_envs: list[dict] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal calls
+        calls += 1
+        child_envs.append(dict(kwargs.get("env") or {}))
+        if calls == 1:
+            kwargs["before_terminate"]()
+            raise subprocess.TimeoutExpired(
+                cmd=cmd,
+                timeout=kwargs.get("timeout"),
+                output=b"",
+                stderr=(
+                    b"[INFO] HTTP Request: GET https://api.github.com/search/code"
+                    b"?q=GroundingDinoModelLoader ComfyUI ... 422 Unprocessable Entity\n"
+                ),
+            )
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "research-hang", ok=True)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "research-hang")
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert calls == 2  # retry-once preserved
+    assert summary["passed"] == 1
+    first = scenario["attempts"][0]
+    assert first["killed_before_first_attempt"] is True
+    assert first["model_attempts"] == []
+    assert first["pre_attempt_reason"] == "research_hang"
+    # The retry child's research path is hard-bounded; the first attempt is not.
+    assert "VIBECOMFY_REGISTRY_SKIP_GITHUB" not in child_envs[0]
+    assert "VIBECOMFY_REGISTRY_SUB_BUDGET" not in child_envs[0]
+    assert child_envs[1]["VIBECOMFY_REGISTRY_SKIP_GITHUB"] == "1"
+    assert child_envs[1]["VIBECOMFY_REGISTRY_SUB_BUDGET"] == "8"
+    assert child_envs[1]["VIBECOMFY_RESEARCH_HANG_RETRY_SKIP"] == "1"
+
+
+def test_runner_retry_without_research_hang_reason_keeps_full_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """A zero-attempt outer kill WITHOUT research markers (implement-stage
+    silence) still retries once, but the retry child keeps the plain full
+    research budget — only a research-hang reason bounds the retry."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "implement-kill.json"
+    scenario_path.write_text(
+        json.dumps({"id": "implement-kill", "query": "do it"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("VIBECOMFY_REGISTRY_SKIP_GITHUB", raising=False)
+    monkeypatch.delenv("VIBECOMFY_REGISTRY_SUB_BUDGET", raising=False)
+    monkeypatch.delenv("VIBECOMFY_RESEARCH_HANG_RETRY_SKIP", raising=False)
+
+    calls = 0
+    child_envs: list[dict] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal calls
+        calls += 1
+        child_envs.append(dict(kwargs.get("env") or {}))
+        if calls == 1:
+            kwargs["before_terminate"]()
+            raise subprocess.TimeoutExpired(
+                cmd=cmd,
+                timeout=kwargs.get("timeout"),
+                output=b"",
+                stderr=(
+                    b"old: GET https://api.github.com/search/code?q=StaleNode ComfyUI\n"
+                    b"current: profiler worker_profile backend_phase=batch"
+                ),
+            )
+        out_file = Path(cmd[cmd.index("--single-out") + 1])
+        tag = cmd[cmd.index("--tag") + 1]
+        payload = _summary(tmp_path / "out" / tag, "implement-kill", ok=True)
+        payload["output_dir"] = str(tmp_path / "out" / tag / "implement-kill")
+        out_file.write_text(json.dumps(payload), encoding="utf-8")
+        return (0, "", "")
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert calls == 2
+    first = scenario["attempts"][0]
+    assert first["killed_before_first_attempt"] is True
+    assert first["pre_attempt_reason"] is None
+    assert "VIBECOMFY_REGISTRY_SKIP_GITHUB" not in child_envs[1]
+    assert "VIBECOMFY_REGISTRY_SUB_BUDGET" not in child_envs[1]
+    assert "VIBECOMFY_RESEARCH_HANG_RETRY_SKIP" not in child_envs[1]
+
+
+def test_outer_timeout_marker_persists_pre_attempt_reason_when_stderr_available(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    """The persisted outer-timeout marker (written before the group is killed)
+    carries a pre_attempt_reason inferred from whatever stderr was flushed."""
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_path = scenarios_dir / "marker-reason.json"
+    scenario_path.write_text(
+        json.dumps({"id": "marker-reason", "query": "do it"}),
+        encoding="utf-8",
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        # No stderr file exists (the fake never wrote one): the marker's
+        # best-effort read degrades to an empty tail and reason stays None.
+        kwargs["before_terminate"]()
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=kwargs.get("timeout"),
+            output=b"",
+            stderr=b"",
+        )
+
+    write_manifest(scenarios_dir)
+    monkeypatch.setattr("tests.live_agentic_harness.runner._run_scenario_subprocess", fake_run)
+
+    summary = run_tag(
+        "tag",
+        scenarios_dir=scenarios_dir,
+        output_base=tmp_path / "out",
+        max_workers=1,
+        per_scenario_timeout=1,
+        infra_retries=1,
+        progress_every=0,
+    )
+
+    scenario = summary["scenarios"][0]
+    assert scenario["attempts"][0]["killed_before_first_attempt"] is True
+    # No stderr content reached the marker: reason stays None (never invented).
+    assert scenario["attempts"][0]["pre_attempt_reason"] is None
+def test_live_scenario_assessment_wires_expect_graph_changed_into_request(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Harness assessment metadata must reach the real headless contract."""
+    from types import SimpleNamespace
+
+    from tests.live_agentic_harness.adapter import run_headless_scenario
+
+    seen: dict[str, object] = {}
+
+    def fake_run_headless(request, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        seen["headless"] = request.expect_graph_changed
+        seen["executor"] = request.to_executor_request().expect_graph_changed
+        return SimpleNamespace(
+            status="ok",
+            ok=True,
+            output_dir=tmp_path,
+            readiness={"ready": True},
+            error=None,
+            response={},
+        )
+
+    monkeypatch.setenv("VIBECOMFY_HEADLESS", "1")
+    monkeypatch.setattr("vibecomfy.agent.service.run_headless", fake_run_headless)
+    summary = run_headless_scenario(
+        {
+            "id": "expected-edit",
+            "query": "change the sampler",
+            "assessment": {"expect_graph_changed": True},
+        },
+        output_base=tmp_path,
+    )
+
+    assert summary["ok"] is True
+    assert seen == {"headless": True, "executor": True}

@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from vibecomfy.commands._workflow_path import resolve_workflow_path
+from vibecomfy.ingest.loader import load_workflow_json
+from vibecomfy.ingest.normalize import _named_import
+from vibecomfy.registry.ready import (
+    ReadyTemplateDiscovery,
+    ready_template_discovery,
+    resolve_ready_template,
+    workflow_from_ready,
+)
+from vibecomfy.scratchpad_loader import load_scratchpad
+from vibecomfy.security.provenance import Provenance
+from vibecomfy.workflow import VibeWorkflow
+
+# `get_schema_provider` lives behind `vibecomfy.schema.provider`, which
+# top-imports the runtime client. Importing it eagerly defeats the
+# cheap-import promise for `vibecomfy.testing`. Resolve lazily on first call.
+
+
+def load_workflow_any(path_or_id: str) -> VibeWorkflow:
+    value = str(path_or_id)
+    direct_path = Path(value)
+    if direct_path.is_file() and direct_path.suffix.lower() in {".py", ".json"}:
+        return _load_workflow_path(direct_path)
+    if direct_path.is_dir():
+        return _load_workflow_path(Path(resolve_workflow_path(value)))
+
+    discovery = ready_template_discovery()
+    ready_id = _ready_id_for(value, discovery)
+    if ready_id is not None:
+        return workflow_from_ready(value, _discovery=discovery)
+
+    try:
+        path = resolve_workflow_path(value)
+    except FileNotFoundError as exc:
+        if _looks_like_path(value):
+            raise
+        raise KeyError(f"Workflow id not found: {value}") from exc
+
+    return _load_workflow_path(Path(path))
+
+
+def _load_workflow_path(
+    path: Path,
+    *,
+    workflow_id: str | None = None,
+    schema_provider: Any = None,
+) -> VibeWorkflow:
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        return load_scratchpad(path, provenance_override="user_confirmed")
+    if suffix == ".json":
+        if schema_provider is None:
+            from vibecomfy.schema import get_schema_provider  # noqa: PLC0415
+
+            schema_provider = get_schema_provider("auto")
+        raw = load_workflow_json(path)
+        return _named_import(
+            raw,
+            source_path=path,
+            workflow_id=workflow_id,
+            schema_provider=schema_provider,
+        )
+    raise FileNotFoundError(path)
+
+
+def _ready_id_for(
+    value: str, discovery: ReadyTemplateDiscovery | None = None
+) -> str | None:
+    try:
+        return resolve_ready_template(value, discovery).template_id
+    except KeyError:
+        return None
+
+
+def _looks_like_path(value: str) -> bool:
+    path = Path(value)
+    return bool(path.suffix) or path.is_absolute() or any(part in value for part in ("/", "\\"))
+
+
+def load_bundle(
+    reference: str | Path | VibeWorkflow,
+    trust: Provenance | None = None,
+    *,
+    schema_provider: Any = None,
+    allow_unresolved: bool = False,
+):
+    """Load a candidate canonical bundle through the dedicated bundle binding."""
+    from vibecomfy.workflow_bundle import load_bundle as _load_bundle
+
+    return _load_bundle(
+        reference,
+        trust=trust,
+        schema_provider=schema_provider,
+        allow_unresolved=allow_unresolved,
+    )
+
+
+__all__ = ["load_workflow_any", "load_bundle"]

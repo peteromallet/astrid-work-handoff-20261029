@@ -1,0 +1,592 @@
+// canonical_delta.js — Browser-side canonical delta normalization
+//
+// The sole durable Δ is ``accepted_batch``. Apply derives ops from
+// ``accepted_batch[*].op``. Envelope and flat shapes are not durable.
+
+// ── Constants (aligned with Python backend) ─────────────────────────────────
+
+export const DELTA_SCHEMA_VERSION = "2.0.0";
+// M1 authority name. The older schema_version remains wire-only; callers
+// preparing authority must name both values and may not use legacy bridges.
+export const DELTA_CONTRACT_V1 = "delta_v1";
+
+export const DELTA_DIAGNOSTIC_MALFORMED = "malformed_delta";
+export const DELTA_DIAGNOSTIC_LEGACY_SHAPE = "legacy_delta_shape";
+export const DELTA_DIAGNOSTIC_UNSUPPORTED_SCOPED_APPLY = "unsupported_scoped_apply";
+
+export const CANONICAL_DELTA_OP_NAMES = Object.freeze([
+  "set_node_field",
+  "set_mode",
+  "add_node",
+  "upsert_link",
+  "remove_node",
+  "remove_link",
+  "subgraph_interface",
+]);
+
+const _CANONICAL_ENVELOPE_KEYS = Object.freeze(
+  new Set(["schema_version", "ops"]),
+);
+
+const _LEGACY_WRAPPER_KEYS = Object.freeze(
+  new Set([
+    "automatic_link_removals",
+    "delta",
+    "delta_ops",
+    "diagnostics",
+    "guard_result",
+    "normalize",
+    "ops",
+    "re_stitches",
+  ]),
+);
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function _isObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function _isNonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Stable shallow clone with sorted keys for deterministic shape.
+ * @param {object} obj
+ * @returns {object}
+ */
+function _stableClone(obj) {
+  const keys = Object.keys(obj).sort();
+  const clone = /** @type {object} */ ({});
+  for (const key of keys) {
+    clone[key] = obj[key];
+  }
+  return clone;
+}
+
+/**
+ * Freeze plain JSON-compatible data deeply.
+ * @param {*} value
+ * @returns {*}
+ */
+function _freezePlainData(value) {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      _freezePlainData(entry);
+    }
+    return Object.freeze(value);
+  }
+  if (_isObject(value)) {
+    for (const entry of Object.values(value)) {
+      _freezePlainData(entry);
+    }
+    return Object.freeze(value);
+  }
+  return value;
+}
+
+// ── Validation ──────────────────────────────────────────────────────────────
+
+/**
+ * Lenient validation for legacy flat V2 op arrays.  Only checks that the
+ * entry has a non-empty string ``op`` and that the op kind is one of the
+ * seven canonical names.  All other fields are passed through as-is with
+ * sorted keys for deterministic shape.
+ *
+ * @param {object} entry
+ * @param {number} index
+ * @returns {object}
+ */
+function _validateLegacyFlatOp(entry, index) {
+  if (!_isObject(entry)) {
+    throw new DeltaDiagnosticError(
+      `delta op at index ${index} must be an object.`,
+      DELTA_DIAGNOSTIC_MALFORMED,
+      { index },
+    );
+  }
+
+  const opName = entry.op;
+  if (!_isNonEmptyString(opName)) {
+    throw new DeltaDiagnosticError(
+      `delta op at index ${index} must have a non-empty string "op" field.`,
+      DELTA_DIAGNOSTIC_MALFORMED,
+      { index, op: opName },
+    );
+  }
+
+  if (!CANONICAL_DELTA_OP_NAMES.includes(opName)) {
+    throw new DeltaDiagnosticError(
+      `Unsupported edit op "${opName}" at index ${index}. Expected one of: ${CANONICAL_DELTA_OP_NAMES.join(", ")}.`,
+      DELTA_DIAGNOSTIC_MALFORMED,
+      { index, op: opName },
+    );
+  }
+
+  return _stableClone(entry);
+}
+
+/**
+ * Strict validation for canonical envelope ops (backend-aligned).
+ * Validates structural constraints for each op type.
+ *
+ * @param {object} entry
+ * @param {number} index
+ * @returns {object}
+ */
+function _validateCanonicalOpStrict(entry, index) {
+  if (!_isObject(entry)) {
+    throw new DeltaDiagnosticError(
+      `delta op at index ${index} must be an object.`,
+      DELTA_DIAGNOSTIC_MALFORMED,
+      { index },
+    );
+  }
+
+  const opName = entry.op;
+  if (!_isNonEmptyString(opName)) {
+    throw new DeltaDiagnosticError(
+      `delta op at index ${index} must have a non-empty string "op" field.`,
+      DELTA_DIAGNOSTIC_MALFORMED,
+      { index, op: opName },
+    );
+  }
+
+  if (!CANONICAL_DELTA_OP_NAMES.includes(opName)) {
+    throw new DeltaDiagnosticError(
+      `Unsupported edit op "${opName}" at index ${index}. Expected one of: ${CANONICAL_DELTA_OP_NAMES.join(", ")}.`,
+      DELTA_DIAGNOSTIC_MALFORMED,
+      { index, op: opName },
+    );
+  }
+
+  // Per-op structural validations (aligned with Python backend)
+  switch (opName) {
+    case "set_node_field": {
+      if (!Array.isArray(entry.target) || entry.target.length !== 3) {
+        throw new DeltaDiagnosticError(
+          `set_node_field at index ${index} must have a "target" array of length 3.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      if (!("value" in entry)) {
+        throw new DeltaDiagnosticError(
+          `set_node_field at index ${index} must have a "value" field.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      break;
+    }
+
+    case "set_mode": {
+      if (!Array.isArray(entry.target) || entry.target.length !== 2) {
+        throw new DeltaDiagnosticError(
+          `set_mode at index ${index} must have a "target" array of length 2.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      if (![0, 2, 4].includes(entry.mode)) {
+        throw new DeltaDiagnosticError(
+          `set_mode at index ${index} must have "mode" one of: 0, 2, 4.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      break;
+    }
+
+    case "add_node": {
+      if (!_isNonEmptyString(entry.uid)) {
+        throw new DeltaDiagnosticError(
+          `add_node at index ${index} must have a non-empty string "uid".`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName, field: "uid" },
+        );
+      }
+      if (!_isNonEmptyString(entry.node_id)) {
+        throw new DeltaDiagnosticError(
+          `add_node at index ${index} must have a non-empty string "node_id".`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName, field: "node_id" },
+        );
+      }
+      if (!_isNonEmptyString(entry.class_type)) {
+        throw new DeltaDiagnosticError(
+          `add_node at index ${index} must have a non-empty string "class_type".`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName, field: "class_type" },
+        );
+      }
+      break;
+    }
+
+    case "upsert_link": {
+      if (!Array.isArray(entry.from) || entry.from.length !== 3) {
+        throw new DeltaDiagnosticError(
+          `upsert_link at index ${index} must have a "from" array of length 3.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      if (!Array.isArray(entry.to) || entry.to.length !== 3) {
+        throw new DeltaDiagnosticError(
+          `upsert_link at index ${index} must have a "to" array of length 3.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      break;
+    }
+
+    case "remove_node": {
+      if (!Array.isArray(entry.target) || entry.target.length !== 2) {
+        throw new DeltaDiagnosticError(
+          `remove_node at index ${index} must have a "target" array of length 2.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      break;
+    }
+
+    case "remove_link": {
+      const hasId = "id" in entry && entry.id != null;
+      const hasTo = "to" in entry && entry.to != null;
+      if (!hasId && !hasTo) {
+        throw new DeltaDiagnosticError(
+          `remove_link at index ${index} requires either "id" or "to".`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      if (hasId && hasTo) {
+        throw new DeltaDiagnosticError(
+          `remove_link at index ${index} accepts only one of "id" or "to".`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      if (hasTo && (!Array.isArray(entry.to) || entry.to.length !== 3)) {
+        throw new DeltaDiagnosticError(
+          `remove_link at index ${index} must have a "to" array of length 3.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName },
+        );
+      }
+      break;
+    }
+
+    case "subgraph_interface": {
+      if (!["add", "remove", "change"].includes(entry.action)) {
+        throw new DeltaDiagnosticError(
+          `subgraph_interface at index ${index} must have "action" one of: add, remove, change.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName, field: "action" },
+        );
+      }
+      if (!_isNonEmptyString(entry.name)) {
+        throw new DeltaDiagnosticError(
+          `subgraph_interface at index ${index} must have a non-empty string "name".`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName, field: "name" },
+        );
+      }
+      if (entry.id != null && !_isNonEmptyString(entry.id)) {
+        throw new DeltaDiagnosticError(
+          `subgraph_interface at index ${index} must have a non-empty string "id" when provided.`,
+          DELTA_DIAGNOSTIC_MALFORMED,
+          { index, op: opName, field: "id" },
+        );
+      }
+      for (const field of ["inputs", "outputs"]) {
+        if (!(field in entry)) continue;
+        if (!Array.isArray(entry[field])) {
+          throw new DeltaDiagnosticError(
+            `subgraph_interface.${field} at index ${index} must be a list of [name, type] pairs.`,
+            DELTA_DIAGNOSTIC_MALFORMED,
+            { index, op: opName, field },
+          );
+        }
+        for (let portIndex = 0; portIndex < entry[field].length; portIndex += 1) {
+          const port = entry[field][portIndex];
+          if (!Array.isArray(port) || port.length === 0 || !_isNonEmptyString(port[0])) {
+            throw new DeltaDiagnosticError(
+              `subgraph_interface.${field}[${portIndex}] at index ${index} must be a [name, type] pair.`,
+              DELTA_DIAGNOSTIC_MALFORMED,
+              { index, op: opName, field, port_index: portIndex },
+            );
+          }
+        }
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  return _stableClone(entry);
+}
+
+// ── DeltaDiagnosticError ────────────────────────────────────────────────────
+
+export class DeltaDiagnosticError extends Error {
+  constructor(message, code, detail = {}) {
+    super(message);
+    this.name = "DeltaDiagnosticError";
+    this.code = code || DELTA_DIAGNOSTIC_MALFORMED;
+    this.detail = detail || {};
+  }
+}
+
+// ── Shape classification ────────────────────────────────────────────────────
+
+export function classifyDeltaShape(payload) {
+  if (!_isObject(payload)) {
+    return {
+      shape: "missing",
+      code: "missing_turn_response",
+      detail: {},
+    };
+  }
+
+  const accepted = payload.accepted_batch;
+  if (Array.isArray(accepted)) {
+    return {
+      shape: "accepted_batch",
+      code: "accepted_batch",
+      detail: { count: accepted.length },
+    };
+  }
+
+  return {
+    shape: "missing",
+    code: "missing_delta_ops",
+    detail: {},
+  };
+}
+
+// ── Normalisation ───────────────────────────────────────────────────────────
+
+export function normalizeDeltaEnvelope(payload, options = {}) {
+  const { allowLegacyList = false, strict = false } = options;
+
+  if (_isObject(payload)) {
+    const data = /** @type {object} */ (payload);
+
+    // Detect and reject legacy wrapped shapes.
+    if ("delta_ops" in data) {
+      const legacyKeys = Object.keys(data)
+        .filter((k) => _LEGACY_WRAPPER_KEYS.has(k))
+        .sort();
+      throw new DeltaDiagnosticError(
+        "Legacy wrapped delta shapes under `delta_ops` are not canonical V2 envelopes.",
+        DELTA_DIAGNOSTIC_LEGACY_SHAPE,
+        { keys: legacyKeys },
+      );
+    }
+
+    const hasSchemaVersion = "schema_version" in data;
+    const hasOps = "ops" in data;
+
+    if (hasOps && !hasSchemaVersion) {
+      const legacyKeys = Object.keys(data)
+        .filter((k) => _LEGACY_WRAPPER_KEYS.has(k))
+        .sort();
+      throw new DeltaDiagnosticError(
+        "Legacy wrapped delta shapes must be migrated to `{schema_version, ops}`.",
+        DELTA_DIAGNOSTIC_LEGACY_SHAPE,
+        { keys: legacyKeys },
+      );
+    }
+
+    if (!hasSchemaVersion && !hasOps) {
+      const extras = Object.keys(data).sort();
+      throw new DeltaDiagnosticError(
+        "Canonical delta envelopes must be objects with `schema_version` and `ops`.",
+        DELTA_DIAGNOSTIC_MALFORMED,
+        { keys: extras },
+      );
+    }
+
+    // Reject extra keys beyond the canonical two.
+    const extras = Object.keys(data).filter(
+      (key) => !_CANONICAL_ENVELOPE_KEYS.has(key),
+    );
+    if (extras.length > 0) {
+      if (extras.some((key) => _LEGACY_WRAPPER_KEYS.has(key))) {
+        throw new DeltaDiagnosticError(
+          "Legacy wrapped delta metadata is not part of the canonical V2 envelope.",
+          DELTA_DIAGNOSTIC_LEGACY_SHAPE,
+          { keys: extras.sort() },
+        );
+      }
+      throw new DeltaDiagnosticError(
+        "Canonical delta envelopes only accept `schema_version` and `ops`.",
+        DELTA_DIAGNOSTIC_MALFORMED,
+        { keys: extras.sort() },
+      );
+    }
+
+    const schemaVersion = data.schema_version;
+    if (schemaVersion !== DELTA_SCHEMA_VERSION) {
+      throw new DeltaDiagnosticError(
+        `Unsupported delta schema_version "${schemaVersion}".`,
+        DELTA_DIAGNOSTIC_MALFORMED,
+        { schema_version: schemaVersion },
+      );
+    }
+
+    const ops = data.ops;
+    if (!Array.isArray(ops)) {
+      throw new DeltaDiagnosticError(
+        "Canonical delta envelope `ops` must be an array.",
+        DELTA_DIAGNOSTIC_MALFORMED,
+        {},
+      );
+    }
+
+    // Canonical envelopes use strict validation.
+    const validateFn = strict ? _validateCanonicalOpStrict : _validateLegacyFlatOp;
+    const normalizedOps = [];
+    for (let i = 0; i < ops.length; i++) {
+      normalizedOps.push(validateFn(ops[i], i));
+    }
+
+    return {
+      schema_version: DELTA_SCHEMA_VERSION,
+      ops: _freezePlainData(normalizedOps),
+    };
+  }
+
+  // Legacy flat V2 op array bridge
+  if (Array.isArray(payload)) {
+    if (!allowLegacyList) {
+      throw new DeltaDiagnosticError(
+        "Flat V2 delta op arrays are a legacy bridge; wrap them in `{schema_version, ops}`.",
+        DELTA_DIAGNOSTIC_LEGACY_SHAPE,
+        {},
+      );
+    }
+    // Legacy flat arrays use lenient validation with skip-on-invalid.
+    const normalizedOps = [];
+    for (let i = 0; i < payload.length; i++) {
+      try {
+        normalizedOps.push(_validateLegacyFlatOp(payload[i], i));
+      } catch (_err) {
+        // Skip invalid entries in legacy flat arrays — backward compat.
+        continue;
+      }
+    }
+    return {
+      schema_version: DELTA_SCHEMA_VERSION,
+      ops: _freezePlainData(normalizedOps),
+    };
+  }
+
+  throw new DeltaDiagnosticError(
+    "Canonical delta envelopes must be an object or op list.",
+    DELTA_DIAGNOSTIC_MALFORMED,
+    {},
+  );
+}
+
+export function normalizeDeltaV1(payload) {
+  if (!payload || payload.delta_contract !== DELTA_CONTRACT_V1 || payload.wire_version !== DELTA_SCHEMA_VERSION || !Array.isArray(payload.ops)) {
+    throw new DeltaDiagnosticError("delta_v1 requires explicit wire_version 2.0.0 and ops.", DELTA_DIAGNOSTIC_MALFORMED);
+  }
+  const envelope = normalizeDeltaEnvelope({ schema_version: payload.wire_version, ops: payload.ops }, { strict: true });
+  ensureRootScopedOps(envelope.ops);
+  return Object.freeze({ delta_contract: DELTA_CONTRACT_V1, wire_version: DELTA_SCHEMA_VERSION, ops: envelope.ops });
+}
+
+export function normalizeDeltaOpsFromSubmitPayload(payload) {
+  const shape = classifyDeltaShape(payload);
+
+  if (shape.shape === "accepted_batch") {
+    const ops = [];
+    for (const statement of payload.accepted_batch) {
+      if (_isObject(statement) && _isObject(statement.op)) {
+        ops.push(statement.op);
+      }
+    }
+    return ops;
+  }
+
+  throw new DeltaDiagnosticError(
+    "No accepted_batch found in submit response.",
+    shape.code || "missing_delta_ops",
+    shape.detail,
+  );
+}
+
+export function ensureRootScopedOps(ops) {
+  for (const op of ops) {
+    const scopedPaths = [];
+
+    if (
+      op.op === "set_node_field" ||
+      op.op === "set_mode" ||
+      op.op === "remove_node"
+    ) {
+      if (Array.isArray(op.target) && op.target.length >= 2) {
+        scopedPaths.push(op.target[0] || "");
+      }
+    } else if (op.op === "add_node") {
+      scopedPaths.push(op.scope_path || "");
+    } else if (op.op === "upsert_link") {
+      if (Array.isArray(op.from) && op.from.length >= 1) {
+        scopedPaths.push(op.from[0] || "");
+      }
+      if (Array.isArray(op.to) && op.to.length >= 1) {
+        scopedPaths.push(op.to[0] || "");
+      }
+    } else if (
+      op.op === "remove_link" &&
+      Array.isArray(op.to) &&
+      op.to.length >= 1
+    ) {
+      scopedPaths.push(op.to[0] || "");
+    }
+
+    const bad = [
+      ...new Set(scopedPaths.filter((p) => p && p.length > 0)),
+    ].sort();
+    if (bad.length > 0) {
+      throw new DeltaDiagnosticError(
+        "Non-root scoped apply is unsupported for canonical delta consumers.",
+        DELTA_DIAGNOSTIC_UNSUPPORTED_SCOPED_APPLY,
+        { scope_paths: bad, op: op.op },
+      );
+    }
+  }
+}
+
+export function decodeNodeFieldPathV1(path) {
+  if (!Array.isArray(path) || path.length !== 1 || typeof path[0] !== "string") {
+    return Array.isArray(path) ? [...path] : [];
+  }
+  return path[0].split(".").map((segment) => (
+    /^(?:0|[1-9][0-9]*)$/.test(segment) ? Number(segment) : segment
+  ));
+}
+
+export default {
+  DELTA_SCHEMA_VERSION,
+  DELTA_CONTRACT_V1,
+  DELTA_DIAGNOSTIC_MALFORMED,
+  DELTA_DIAGNOSTIC_LEGACY_SHAPE,
+  DELTA_DIAGNOSTIC_UNSUPPORTED_SCOPED_APPLY,
+  CANONICAL_DELTA_OP_NAMES,
+  DeltaDiagnosticError,
+  classifyDeltaShape,
+  normalizeDeltaEnvelope,
+  normalizeDeltaV1,
+  normalizeDeltaOpsFromSubmitPayload,
+  ensureRootScopedOps,
+  decodeNodeFieldPathV1,
+};

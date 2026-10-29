@@ -1,0 +1,39 @@
+{
+  "id": "multi-wan2-2-animate-video-with-pose-and-segmentatio-1cc457",
+  "query": "Swap the Wan2.2 model for a Stable Video Diffusion (SVD) based animation model. Also, remove the SAM2 segmentation branch and replace it with a simple foreground mask derived from the pose keypoints, keeping the relighting LoRA stage.",
+  "workflow_path": "tests/fixtures/live_agentic_corpus/corpus/1cc45704dcffe34a.json",
+  "network": true,
+  "timeout": 420,
+  "apply": false,
+  "assessment": {
+    "expect_graph_changed": false,
+    "allow_safe_refusal_outcome_kinds": ["clarify", "requires_custom_nodes"],
+    "expected_no_candidate_reason": "SVD-based animation classes are absent from the authoritative object_info index and no SVD node exists in the workflow; the requested Wan2.2→SVD swap and pose-derived foreground mask cannot be authored without custom nodes. Honest requires_custom_nodes refusal is the grounded terminal.",
+    "expected_no_candidate_absent_classes": ["SVD_img2vid_Conditioning", "ImageOnlyCheckpointLoader"]
+  },
+  "_tags": {
+    "modality": "multi",
+    "query_type": "big_adjustment",
+    "abstraction": "high",
+    "complexity": "high",
+    "manifest_complexity": 5,
+    "task_type": "image_to_video",
+    "requires_custom_nodes": true,
+    "techniques": [
+      "video-to-video",
+      "wan2.2",
+      "animation",
+      "pose-detection",
+      "face-detection",
+      "sam2",
+      "segmentation",
+      "lora",
+      "relighting"
+    ],
+    "source_workflow_id": "1cc45704dcffe34a",
+    "source": "external_workflows/corpus",
+    "staged": true,
+    "authored_by": "deepseek-v4-pro",
+    "author_rationale": "It tests the agent's ability to restructure the animation pipeline by replacing the core video model and simplifying segmentation, requiring precise rerouting of data flow."
+  }
+}

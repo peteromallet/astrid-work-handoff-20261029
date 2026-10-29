@@ -1,0 +1,243 @@
+# vibecomfy: generated
+# For hand-editing, run: python -m vibecomfy.cli copy-to-recipe <id>
+# vibecomfy: surface=canonical
+"""Auto-generated ready_template — use python -m vibecomfy.cli copy-to-recipe <id> for hand-editing."""
+from __future__ import annotations
+
+from vibecomfy.templates import InputSpec, OutputSpec, ReadyMetadata, new_workflow, ref
+from vibecomfy.workflow import VibeWorkflow
+from vibecomfy.nodes.core import CFGGuider, CLIPLoader, CLIPTextEncode, ConditioningZeroOut, EmptyFlux2LatentImage, Flux2Scheduler, GetImageSize, ImageScaleToTotalPixels, KSamplerSelect, LoadImage, RandomNoise, ReferenceLatent, SamplerCustomAdvanced, SaveImage, UNETLoader, VAEDecode, VAEEncode, VAELoader
+
+
+CLIP_NAME = 'qwen_3_4b.safetensors'
+DEFAULT_PROMPT = 'stylize the handbag in image1 with the colours and logo from image 2'
+DEFAULT_SEED = 43301611940728
+DEFAULT_SEED_2 = 786795143695419
+EULER = 'euler'
+FLUX2 = 'flux2'
+GUIDE_STRENGTH = 1
+NEAREST_EXACT = 'nearest-exact'
+RANDOMIZE = 'randomize'
+UNET_NAME = 'flux-2-klein-4b-fp8.safetensors'
+VAE_NAME = 'flux2-vae.safetensors'
+
+
+PUBLIC_INPUT_METADATA = {
+    'model': InputSpec(node=ref('unetloader_2'), field='unet_name', default=None, infer_type=False),
+    'seed': InputSpec(node=ref('randomnoise_2'), field='noise_seed', default=None, infer_type=False),
+    'prompt': InputSpec(node=ref('cliptextencode_2'), field='text', default=None, infer_type=False),
+    'image': InputSpec(node=ref('loadimage'), field='image', default='', type='IMAGE', required=True, aliases=('input_image',), media_semantics='image', infer_type=False),
+}
+
+
+READY_METADATA = ReadyMetadata.build(
+    capability='image',
+    template_id='edit/flux2_klein_4b_image_edit_distilled',
+    inputs=PUBLIC_INPUT_METADATA,
+    requirements={'models': ['flux-2-klein-4b-fp8.safetensors', 'flux2-vae.safetensors', 'qwen_3_4b.safetensors']},
+    source_path='ready_templates/sources/official/edit/flux2_klein_4b_image_edit_distilled.json',
+    source_id='edit/flux2_klein_4b_image_edit_distilled',
+    upstream_source_id='flux2_klein_4b_image_edit_distilled',
+    source_type='api',
+    source_workflow_path='ready_templates/sources/official/edit/flux2_klein_4b_image_edit_distilled.json',
+    output_mode='ready_template',
+    ready_id='edit/flux2_klein_4b_image_edit_distilled',
+    provenance={'source_path': 'ready_templates/sources/official/edit/flux2_klein_4b_image_edit_distilled.json', 'source_id': 'edit/flux2_klein_4b_image_edit_distilled', 'upstream_source_id': 'flux2_klein_4b_image_edit_distilled', 'source_type': 'api', 'source_workflow_path': 'ready_templates/sources/official/edit/flux2_klein_4b_image_edit_distilled.json', 'output_mode': 'ready_template', 'ready_id': 'edit/flux2_klein_4b_image_edit_distilled', 'source_workflow': 'ready_templates/sources/official/edit/flux2_klein_4b_image_edit_distilled.json'},
+)
+
+def build() -> VibeWorkflow:
+    """Build the workflow (auto-generated)."""
+    with new_workflow(READY_METADATA, source_path=__file__) as wf:
+
+        # Sampling
+        ksamplerselect_2 = KSamplerSelect(sampler_name=EULER)
+
+        # Loaders
+        unetloader_2 = UNETLoader(unet_name=UNET_NAME)
+        cliploader_2 = CLIPLoader(clip_name=CLIP_NAME, type=FLUX2)
+        vaeloader_2 = VAELoader(vae_name=VAE_NAME)
+
+        randomnoise_2 = RandomNoise(
+            noise_seed=DEFAULT_SEED,
+            control_after_generate=RANDOMIZE,
+        )
+
+        ksamplerselect = KSamplerSelect(sampler_name=EULER)
+
+        randomnoise = RandomNoise(
+            noise_seed=DEFAULT_SEED_2,
+            control_after_generate=RANDOMIZE,
+        )
+
+        unetloader = UNETLoader(unet_name=UNET_NAME)
+        cliploader = CLIPLoader(clip_name=CLIP_NAME, type=FLUX2)
+        vaeloader = VAELoader(vae_name=VAE_NAME)
+
+        # Inputs
+        loadimage = LoadImage(image='handbag_white.png')
+        loadimage_2 = LoadImage(image='comfy_logo_blue.png')
+
+        imagescaletototalpixels_3 = ImageScaleToTotalPixels(
+            upscale_method=NEAREST_EXACT,
+            image=loadimage.out('IMAGE'),
+        )
+
+        # Conditioning
+        cliptextencode_2 = CLIPTextEncode(
+            text='Change the bag color to blue.',
+            clip=cliploader_2.out('CLIP'),
+        )
+
+        imagescaletototalpixels = ImageScaleToTotalPixels(
+            upscale_method=NEAREST_EXACT,
+            image=loadimage_2.out('IMAGE'),
+        )
+
+        imagescaletototalpixels_2 = ImageScaleToTotalPixels(
+            upscale_method=NEAREST_EXACT,
+            image=loadimage.out('IMAGE'),
+        )
+
+        cliptextencode = CLIPTextEncode(
+            text=DEFAULT_PROMPT,
+            clip=cliploader.out('CLIP'),
+        )
+
+        getimagesize = GetImageSize(image=imagescaletototalpixels_3.out('IMAGE'))
+
+        conditioningzeroout = ConditioningZeroOut(
+            conditioning=cliptextencode_2.out('CONDITIONING'),
+        )
+
+        getimagesize_2 = GetImageSize(image=imagescaletototalpixels_2.out('IMAGE'))
+
+        conditioningzeroout_2 = ConditioningZeroOut(
+            conditioning=cliptextencode.out('CONDITIONING'),
+        )
+
+        vaeencode_2 = VAEEncode(
+            pixels=imagescaletototalpixels_2.out('IMAGE'),
+            vae=vaeloader.out('VAE'),
+        )
+
+        vaeencode_3 = VAEEncode(
+            pixels=imagescaletototalpixels.out('IMAGE'),
+            vae=vaeloader.out('VAE'),
+        )
+
+        vaeencode = VAEEncode(
+            pixels=imagescaletototalpixels_3.out('IMAGE'),
+            vae=vaeloader_2.out('VAE'),
+        )
+
+        flux2scheduler = Flux2Scheduler(
+            steps=4,
+            width=getimagesize.out('WIDTH'),
+            height=getimagesize.out('HEIGHT'),
+        )
+
+        emptyflux2latentimage = EmptyFlux2LatentImage(
+            width=getimagesize.out('WIDTH'),
+            height=getimagesize.out('HEIGHT'),
+        )
+
+        referencelatent = ReferenceLatent(
+            conditioning=cliptextencode_2.out('CONDITIONING'),
+            latent=vaeencode.out('LATENT'),
+        )
+
+        referencelatent_2 = ReferenceLatent(
+            conditioning=conditioningzeroout.out('CONDITIONING'),
+            latent=vaeencode.out('LATENT'),
+        )
+
+        flux2scheduler_2 = Flux2Scheduler(
+            steps=4,
+            width=getimagesize_2.out('WIDTH'),
+            height=getimagesize_2.out('HEIGHT'),
+        )
+
+        emptyflux2latentimage_2 = EmptyFlux2LatentImage(
+            width=getimagesize_2.out('WIDTH'),
+            height=getimagesize_2.out('HEIGHT'),
+        )
+
+        referencelatent_3 = ReferenceLatent(
+            conditioning=conditioningzeroout_2.out('CONDITIONING'),
+            latent=vaeencode_2.out('LATENT'),
+        )
+
+        referencelatent_4 = ReferenceLatent(
+            conditioning=cliptextencode.out('CONDITIONING'),
+            latent=vaeencode_2.out('LATENT'),
+        )
+
+        cfgguider = CFGGuider(
+            cfg=GUIDE_STRENGTH,
+            model=unetloader_2.out('MODEL'),
+            negative=referencelatent_2.out('CONDITIONING'),
+            positive=referencelatent.out('CONDITIONING'),
+        )
+
+        referencelatent_5 = ReferenceLatent(
+            conditioning=referencelatent_3.out('CONDITIONING'),
+            latent=vaeencode_3.out('LATENT'),
+        )
+
+        referencelatent_6 = ReferenceLatent(
+            conditioning=referencelatent_4.out('CONDITIONING'),
+            latent=vaeencode_3.out('LATENT'),
+        )
+
+        samplercustomadvanced = SamplerCustomAdvanced(
+            guider=cfgguider.out('GUIDER'),
+            latent_image=emptyflux2latentimage.out('LATENT'),
+            noise=randomnoise_2.out('NOISE'),
+            sampler=ksamplerselect_2.out('SAMPLER'),
+            sigmas=flux2scheduler.out('SIGMAS'),
+        )
+
+        cfgguider_2 = CFGGuider(
+            cfg=GUIDE_STRENGTH,
+            model=unetloader.out('MODEL'),
+            negative=referencelatent_5.out('CONDITIONING'),
+            positive=referencelatent_6.out('CONDITIONING'),
+        )
+
+        # Decode
+        vaedecode = VAEDecode(
+            samples=samplercustomadvanced.out('OUTPUT'),
+            vae=vaeloader_2.out('VAE'),
+        )
+
+        samplercustomadvanced_2 = SamplerCustomAdvanced(
+            guider=cfgguider_2.out('GUIDER'),
+            latent_image=emptyflux2latentimage_2.out('LATENT'),
+            noise=randomnoise.out('NOISE'),
+            sampler=ksamplerselect.out('SAMPLER'),
+            sigmas=flux2scheduler_2.out('SIGMAS'),
+        )
+
+        # Outputs
+        saveimage = SaveImage(
+            filename_prefix='Flux2-Klein',
+            images=vaedecode.out('IMAGE'),
+        )
+
+        vaedecode_2 = VAEDecode(
+            samples=samplercustomadvanced_2.out('OUTPUT'),
+            vae=vaeloader.out('VAE'),
+        )
+
+        saveimage_2 = SaveImage(
+            filename_prefix='Flux2-Klein',
+            images=vaedecode_2.out('IMAGE'),
+        )
+
+        wf = wf.finalize(PUBLIC_INPUT_METADATA, outputs=[
+        OutputSpec(node=saveimage, output_type='SaveImage', name='image', artifact_kind='image', mime_type='image/png', filename_prefix='Flux2-Klein', expected_cardinality='one'),
+        OutputSpec(node=saveimage_2, output_type='SaveImage'),
+    ])
+        wf.strict_types = False
+        return wf
+

@@ -1,0 +1,679 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from vibecomfy.errors import ModelAssetError
+import vibecomfy.fetch as fetch
+from vibecomfy.ingest.loader import load_workflow_json
+from vibecomfy.model_assets import (
+    _asset_for_reference,
+    entries_from_scratchpad_path,
+    extract_from_raw_workflow,
+    resolve_referenced_assets,
+)
+from vibecomfy.registry.models_loader import ModelEntry, ModelSource, ModelTarget
+import vibecomfy.runtime.attempt as runtime_attempt
+from vibecomfy.runtime.session import SessionConfig, _model_assets_from_workflow
+from vibecomfy.workflow import VibeNode, VibeWorkflow, WorkflowSource
+from vibecomfy.schema import InputSpec, NodeSchema
+from vibecomfy.workflow_bundle import WorkflowBundleError, load_bundle
+
+
+def test_extract_from_raw_workflow_normalises_model_metadata() -> None:
+    raw = {
+        "nodes": [
+            {
+                "id": 30,
+                "type": "UNETLoader",
+                "properties": {
+                    "models": [
+                        {
+                            "name": "fallback.safetensors",
+                            "url": "https://example.test/models/fallback.safetensors?download=true",
+                        }
+                    ]
+                },
+            },
+            {
+                "id": 10,
+                "type": "UnknownLoader",
+                "properties": {
+                    "models": [
+                        {
+                            "name": "explicit.safetensors",
+                            "url": "https://example.test/models/explicit.safetensors?download=true&x=1",
+                            "directory": "custom_dir",
+                        },
+                        {
+                            "name": "skip-missing-url.safetensors",
+                        },
+                    ]
+                },
+            },
+            {
+                "id": 20,
+                "type": "NoDirectoryLoader",
+                "properties": {
+                    "models": [
+                        {
+                            "name": "split.safetensors",
+                            "url": "https://huggingface.co/org/repo/resolve/main/split_files/vae/split.safetensors?download=true",
+                        },
+                        {
+                            "name": "explicit.safetensors",
+                            "url": "https://example.test/models/explicit.safetensors?download=true",
+                            "directory": "custom_dir",
+                        },
+                    ]
+                },
+            },
+        ]
+    }
+
+    assert extract_from_raw_workflow(raw) == [
+        {
+            "name": "explicit.safetensors",
+            "url": "https://example.test/models/explicit.safetensors?x=1",
+            "subdir": "custom_dir",
+        },
+        {
+            "name": "split.safetensors",
+            "url": "https://huggingface.co/org/repo/resolve/main/split_files/vae/split.safetensors",
+            "subdir": "vae",
+        },
+        {
+            "name": "fallback.safetensors",
+            "url": "https://example.test/models/fallback.safetensors",
+            "subdir": "diffusion_models",
+        },
+    ]
+
+
+@pytest.mark.parametrize("target_path", ["", None, 0, []])
+def test_raw_malformed_target_path_is_preserved_and_rejected_before_network(
+    target_path: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    raw = {
+        "nodes": [
+            {
+                "id": 1,
+                "type": "CheckpointLoaderSimple",
+                "properties": {
+                    "models": [
+                        {
+                            "name": "model.safetensors",
+                            "url": "https://example.test/model.safetensors",
+                            "target_path": target_path,
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+    entry = extract_from_raw_workflow(raw)[0]
+    assert entry["target_path"] == target_path
+    monkeypatch.setattr(
+        fetch.httpx,
+        "stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed target_path must fail before network")
+        ),
+    )
+    with pytest.raises(ValueError, match="model asset target_path"):
+        fetch.download(entry, root=tmp_path / "models")
+
+
+@pytest.mark.parametrize("target_path", ["", None, 0, []])
+def test_scratchpad_malformed_target_path_is_preserved_and_rejected(
+    target_path: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scratchpad = tmp_path / "scratch.py"
+    scratchpad.write_text(
+        "READY_REQUIREMENTS = {'models': [{"
+        "'name': 'model.safetensors', "
+        "'url': 'https://example.test/model.safetensors', "
+        f"'target_path': {target_path!r}"
+        "}] }\n",
+        encoding="utf-8",
+    )
+    entry = entries_from_scratchpad_path(scratchpad)[0]
+    assert entry["target_path"] == target_path
+    monkeypatch.setattr(
+        fetch.httpx,
+        "stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed target_path must fail before network")
+        ),
+    )
+    with pytest.raises(ValueError, match="model asset target_path"):
+        fetch.download(entry, root=tmp_path / "models")
+
+
+def test_extract_from_raw_workflow_recurses_nested_subgraphs() -> None:
+    raw = {
+        "definitions": {
+            "subgraphs": [
+                {
+                    "nodes": [
+                        {
+                            "id": "2",
+                            "type": "CLIPLoader",
+                            "properties": {
+                                "models": [
+                                    {
+                                        "name": "outer.safetensors",
+                                        "url": "https://example.test/outer.safetensors",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "definitions": {
+                        "subgraphs": [
+                            {
+                                "nodes": [
+                                    {
+                                        "id": "1",
+                                        "type": "VAELoader",
+                                        "properties": {
+                                            "models": [
+                                                {
+                                                    "name": "inner.safetensors",
+                                                    "url": "https://example.test/inner.safetensors",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    }
+
+    assert extract_from_raw_workflow(raw) == [
+        {"name": "outer.safetensors", "url": "https://example.test/outer.safetensors", "subdir": "text_encoders"},
+        {"name": "inner.safetensors", "url": "https://example.test/inner.safetensors", "subdir": "vae"},
+    ]
+
+
+def test_extract_from_raw_workflow_returns_empty_for_api_shaped_workflow() -> None:
+    assert extract_from_raw_workflow({"1": {"class_type": "VAELoader", "inputs": {}}}) == []
+
+
+def test_entries_from_scratchpad_path_reads_materialized_requirements(tmp_path: Path) -> None:
+    scratchpad = tmp_path / "scratch.py"
+    scratchpad.write_text(
+        "READY_REQUIREMENTS = {'models': ["
+        "{'name': 'model.safetensors', 'url': 'https://example.test/model.safetensors?download=true', 'subdir': 'checkpoints'},"
+        "'legacy.safetensors',"
+        "{'name': 'model.safetensors', 'url': 'https://example.test/duplicate.safetensors', 'subdir': 'checkpoints'}"
+        "], 'custom_nodes': []}\n",
+        encoding="utf-8",
+    )
+
+    assert entries_from_scratchpad_path(scratchpad) == [
+        {"name": "model.safetensors", "url": "https://example.test/model.safetensors", "subdir": "checkpoints"}
+    ]
+
+
+def test_entries_from_scratchpad_path_preserves_reproducibility_pins(tmp_path: Path) -> None:
+    scratchpad = tmp_path / "pinned.py"
+    scratchpad.write_text(
+        "READY_REQUIREMENTS = {'models': ["
+        "{'name': 'model.safetensors', 'url': 'https://example.test/model.safetensors', 'subdir': 'checkpoints', "
+        "'sha256': 'abc', 'hf_revision': 'rev1', 'size_bytes': 42}"
+        "]}\n",
+        encoding="utf-8",
+    )
+
+    assert entries_from_scratchpad_path(scratchpad) == [
+        {
+            "name": "model.safetensors",
+            "url": "https://example.test/model.safetensors",
+            "subdir": "checkpoints",
+            "sha256": "abc",
+            "hf_revision": "rev1",
+            "size_bytes": 42,
+        }
+    ]
+
+
+def test_entries_from_scratchpad_path_resolves_literal_module_constants(tmp_path: Path) -> None:
+    scratchpad = tmp_path / "scratch.py"
+    scratchpad.write_text(
+        "MODEL_ASSETS = ["
+        "{'name': 'from_constant.safetensors', 'url': 'https://example.test/from_constant.safetensors', 'subdir': 'vae'}"
+        "]\n"
+        "READY_REQUIREMENTS = {'models': MODEL_ASSETS, 'custom_nodes': []}\n",
+        encoding="utf-8",
+    )
+
+    assert entries_from_scratchpad_path(scratchpad) == [
+        {
+            "name": "from_constant.safetensors",
+            "url": "https://example.test/from_constant.safetensors",
+            "subdir": "vae",
+        }
+    ]
+
+
+def test_entries_from_scratchpad_path_respects_explicit_subdir_for_non_split_asset(tmp_path: Path) -> None:
+    scratchpad = tmp_path / "scratch.py"
+    scratchpad.write_text(
+        "READY_REQUIREMENTS = {'models': ["
+        "{'name': 'flux-2-klein-4b-fp8.safetensors', "
+        "'url': 'https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/flux-2-klein-4b-fp8.safetensors', "
+        "'subdir': 'diffusion_models'}"
+        "], 'custom_nodes': []}\n",
+        encoding="utf-8",
+    )
+
+    assert entries_from_scratchpad_path(scratchpad) == [
+        {
+            "name": "flux-2-klein-4b-fp8.safetensors",
+            "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/flux-2-klein-4b-fp8.safetensors",
+            "subdir": "diffusion_models",
+        }
+    ]
+
+
+def test_resolve_referenced_assets_preserves_classified_unresolved_references() -> None:
+    workflow = VibeWorkflow("models", WorkflowSource("models"))
+    workflow.nodes["1"] = VibeNode("1", "UNETLoader", inputs={"unet_name": "registry.safetensors"})
+    workflow.nodes["2"] = VibeNode(
+        "2",
+        "UNETLoader",
+        inputs={"unet_name": "https://example.test/models/external.safetensors"},
+    )
+    workflow.nodes["3"] = VibeNode("3", "VAELoader", inputs={"vae_name": "/models/vae/local.safetensors"})
+    workflow.nodes["4"] = VibeNode("4", "LoraLoader", inputs={"lora_name": "./loras/patch.safetensors"})
+    workflow.nodes["5"] = VibeNode("5", "CheckpointLoaderSimple", inputs={"ckpt_name": "missing.safetensors"})
+    registry = [
+        ModelEntry(
+            id="registry",
+            source=ModelSource(kind="url", url="https://example.test/registry.safetensors"),
+            canonical_name="registry.safetensors",
+            min_size=1,
+            targets=(ModelTarget(node_pack="comfy_core", path="diffusion_models/registry.safetensors"),),
+        )
+    ]
+
+    resolved, unresolved = resolve_referenced_assets(workflow, registry=registry)
+
+    assert resolved == [
+        {
+            "name": "registry.safetensors",
+            "url": "https://example.test/registry.safetensors",
+            "subdir": "diffusion_models",
+            "node_id": "1",
+            "class_type": "UNETLoader",
+            "field": "unet_name",
+            "value": "registry.safetensors",
+            "reference_type": "registry-backed",
+            "downloadable": True,
+        }
+    ]
+    assert {
+        (item["node_id"], item["reference_type"], item["downloadable"], item["subdir"])
+        for item in unresolved
+    } == {
+        ("2", "external-url", False, "diffusion_models"),
+        ("3", "absolute-path", False, "vae"),
+        ("4", "relative-path", False, "loras"),
+        ("5", "relative-path", False, "checkpoints"),
+    }
+    assert all({"node_id", "class_type", "field", "value", "subdir"} <= set(item) for item in unresolved)
+
+
+def test_ensure_models_resolves_historical_qualified_wan_alias_to_exact_workflow_path(tmp_path: Path) -> None:
+    workflow = VibeWorkflow("wan-alias", WorkflowSource("wan-alias"))
+    workflow.nodes["98"] = VibeNode(
+        "98",
+        "WanVideoLoraSelect",
+        inputs={"lora": r"WanVid\wan2.1-1.3b-control-lora-tile-v0.1_comfy.safetensors"},
+    )
+
+    entries = _model_assets_from_workflow(workflow)
+
+    assert len(entries) == 1
+    assert entries[0]["name"] == "WanVid/wan2.1-1.3b-control-lora-tile-v0.1_comfy.safetensors"
+    assert fetch.local_path(entries[0], root=tmp_path) == (
+        tmp_path / "loras/WanVid/wan2.1-1.3b-control-lora-tile-v0.1_comfy.safetensors"
+    )
+
+
+def test_nested_target_does_not_guess_undeclared_basename() -> None:
+    registry = (
+        ModelEntry(
+            id="nested",
+            source=ModelSource(kind="url", url="https://example.test/nested.bin"),
+            canonical_name="foo/bar.bin",
+            min_size=1,
+            targets=(ModelTarget(node_pack="wan_wrapper", path="loras/foo/bar.bin"),),
+        ),
+    )
+    bare = {"node_id": "1", "class_type": "WanVideoLoraSelect", "field": "lora", "value": "bar.bin", "subdir": "loras"}
+    qualified = {**bare, "value": "foo/bar.bin"}
+
+    assert _asset_for_reference(bare, registry=registry) is None
+    asset = _asset_for_reference(qualified, registry=registry)
+    assert asset is not None
+    assert asset["name"] == "foo/bar.bin"
+
+
+def test_ensure_models_resolves_pinned_klein_9b_vae_to_unique_target_name() -> None:
+    entry = ModelEntry(
+        id="flux2_vae_from_klein_9b",
+        source=ModelSource(
+            kind="huggingface",
+            repo="Comfy-Org/vae-text-encorder-for-flux-klein-9b",
+            filename="split_files/vae/flux2-vae.safetensors",
+            revision="3f62d9d8ae1fec33c6e91453d5c712855b096b55",
+        ),
+        canonical_name="flux2-klein-9b-vae.safetensors",
+        min_size=100,
+        size_bytes=336_211_292,
+        sha256="868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+        targets=(ModelTarget("comfy_gguf", "vae/flux2-klein-9b-vae.safetensors"),),
+    )
+    registry = (entry,)
+    reference = {
+        "node_id": "1",
+        "class_type": "VAELoader",
+        "field": "vae_name",
+        "value": "flux2-klein-9b-vae.safetensors",
+        "subdir": "vae",
+    }
+
+    asset = _asset_for_reference(reference, registry=registry)
+
+    assert asset is not None
+    assert asset["name"] == "flux2-klein-9b-vae.safetensors"
+    assert asset["url"].endswith(
+        "/Comfy-Org/vae-text-encorder-for-flux-klein-9b/resolve/"
+        "3f62d9d8ae1fec33c6e91453d5c712855b096b55/"
+        "split_files/vae/flux2-vae.safetensors"
+    )
+    assert asset["hf_revision"] == "3f62d9d8ae1fec33c6e91453d5c712855b096b55"
+    assert asset["size_bytes"] == 336_211_292
+    assert asset["sha256"] == "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"
+    assert _asset_for_reference({**reference, "value": "flux2-vae.safetensors"}, registry=registry) is None
+
+
+def test_model_asset_install_policy_still_ignores_non_registry_url_and_path_values() -> None:
+    workflow = VibeWorkflow("models", WorkflowSource("models"))
+    workflow.nodes["1"] = VibeNode("1", "UNETLoader", inputs={"unet_name": "https://example.test/model.safetensors"})
+    workflow.nodes["2"] = VibeNode("2", "VAELoader", inputs={"vae_name": "/models/vae/local.safetensors"})
+    workflow.nodes["3"] = VibeNode("3", "LoraLoader", inputs={"lora_name": "./loras/patch.safetensors"})
+
+    assert _model_assets_from_workflow(workflow) == []
+
+    workflow.nodes["4"] = VibeNode("4", "CheckpointLoaderSimple", inputs={"ckpt_name": "missing.safetensors"})
+    with pytest.raises(ModelAssetError, match="unresolved workflow model assets"):
+        _model_assets_from_workflow(workflow)
+
+
+def test_attempt_report_serializes_only_approved_model_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = VibeWorkflow("models", WorkflowSource("models"))
+    workflow.nodes["1"] = VibeNode(
+        "1",
+        "UNETLoader",
+        inputs={"unet_name": "registry.safetensors"},
+        uid="models-1",
+    )
+    registry = [
+        ModelEntry(
+            id="registry",
+            source=ModelSource(kind="url", url="https://example.test/registry.safetensors"),
+            canonical_name="registry.safetensors",
+            min_size=1,
+            targets=(
+                ModelTarget(
+                    node_pack="comfy_core",
+                    path="diffusion_models/registry.safetensors",
+                ),
+            ),
+        )
+    ]
+    monkeypatch.setattr("vibecomfy.registry.models_loader.load_registry", lambda: registry)
+    monkeypatch.setattr("vibecomfy.fetch.is_present", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runtime_attempt, "_collect_drift_for_bundle", lambda _workflow: {})
+
+    class Provider:
+        def get_schema(self, class_type: str):
+            if class_type == "UNETLoader":
+                return NodeSchema(
+                    "UNETLoader",
+                    None,
+                    {"unet_name": InputSpec("STRING", asset_kind="model")},
+                    [],
+                )
+            return None
+
+    approved_bundle = load_bundle(workflow)
+    record = approved_bundle.compile(schema_provider=Provider())
+    attempt = runtime_attempt.build_attempt_bundle(
+        approved_bundle, record, backend="api"
+    )
+    assert attempt["compiled_prompt"] == record.api_projection
+    assert attempt["model_manifest"] == [
+        {
+            "name": "registry.safetensors",
+            "subdir": "diffusion_models",
+            "url": "https://example.test/registry.safetensors",
+            "expected_sha256": None,
+            "actual_sha256": None,
+            "node_id": "1",
+            "class_type": "UNETLoader",
+            "field": "unet_name",
+            "value": "registry.safetensors",
+            "reference_type": "registry-backed",
+            "downloadable": True,
+        }
+    ]
+
+    refused = VibeWorkflow("unapproved-model", WorkflowSource("unapproved-model"))
+    refused.nodes["1"] = VibeNode(
+        "1",
+        "UNETLoader",
+        inputs={"unet_name": "https://example.test/external.safetensors"},
+        uid="unapproved-model-1",
+    )
+    with pytest.raises(WorkflowBundleError, match="model reference"):
+        load_bundle(refused).compile(schema_provider=Provider())
+
+def test_attempt_hash_uses_fetch_target_path_and_not_models_subdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    models_root = checkout / "models"
+    destination = checkout / "custom_nodes" / "pack" / "ckpts" / "yolox.onnx"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"custom-node asset")
+    decoy = models_root / "checkpoints" / "yolox.onnx"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_bytes(b"models-root decoy")
+    monkeypatch.setenv("VIBECOMFY_MODELS_ROOT", str(models_root))
+
+    asset = {
+        "name": "yolox.onnx",
+        "subdir": "checkpoints",
+        "target_path": "custom_nodes/pack/ckpts/yolox.onnx",
+    }
+
+    assert runtime_attempt._compute_actual_sha256(asset) == hashlib.sha256(
+        b"custom-node asset"
+    ).hexdigest()
+
+
+def test_attempt_hash_uses_configured_models_root_for_target_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_base = tmp_path / "configured"
+    ambient_base = tmp_path / "ambient"
+    configured_root = configured_base / "models"
+    ambient_root = ambient_base / "models"
+    configured_destination = configured_base / "custom_nodes" / "pack" / "asset.bin"
+    ambient_destination = ambient_base / "custom_nodes" / "pack" / "asset.bin"
+    configured_destination.parent.mkdir(parents=True)
+    ambient_destination.parent.mkdir(parents=True)
+    configured_destination.write_bytes(b"configured")
+    ambient_destination.write_bytes(b"ambient")
+    monkeypatch.setenv("VIBECOMFY_MODELS_ROOT", str(ambient_root))
+
+    asset = {
+        "name": "asset.bin",
+        "subdir": "checkpoints",
+        "target_path": "custom_nodes/pack/asset.bin",
+    }
+
+    expected = hashlib.sha256(b"configured").hexdigest()
+    assert runtime_attempt._compute_actual_sha256(
+        asset, config={"models_root": str(configured_root)}
+    ) == expected
+    assert runtime_attempt._compute_actual_sha256(
+        asset,
+        config=SessionConfig(extra={"models_root_normalized": str(configured_root)}),
+    ) == expected
+
+
+def test_attempt_model_digest_reuses_fetch_verification_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("VIBECOMFY_MODELS_ROOT", str(tmp_path))
+    path = tmp_path / "checkpoints" / "large.safetensors"
+    path.parent.mkdir()
+    path.write_bytes(b"large-model")
+    asset = {
+        "name": path.name,
+        "subdir": "checkpoints",
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    body_reads = 0
+    original_open = Path.open
+
+    def tracked_open(self: Path, *args, **kwargs):
+        nonlocal body_reads
+        if self == path:
+            body_reads += 1
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+
+    assert runtime_attempt._compute_actual_sha256(asset) == asset["sha256"]
+    assert runtime_attempt._compute_actual_sha256(asset) == asset["sha256"]
+    assert body_reads == 1
+
+
+def test_model_install_policy_only_requires_registry_or_authored_downloadables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = VibeWorkflow("models", WorkflowSource("models"))
+    workflow.metadata["model_assets"] = [
+        {
+            "name": "authored.safetensors",
+            "url": "https://example.test/authored.safetensors",
+            "subdir": "vae",
+        }
+    ]
+    workflow.nodes["1"] = VibeNode("1", "UNETLoader", inputs={"unet_name": "registry.safetensors"})
+    workflow.nodes["2"] = VibeNode(
+        "2",
+        "UNETLoader",
+        inputs={"unet_name": "https://example.test/models/external.safetensors"},
+    )
+    workflow.nodes["3"] = VibeNode("3", "VAELoader", inputs={"vae_name": "/models/vae/local.safetensors"})
+    workflow.nodes["4"] = VibeNode("4", "LoraLoader", inputs={"lora_name": "./loras/patch.safetensors"})
+    registry = [
+        ModelEntry(
+            id="registry",
+            source=ModelSource(kind="url", url="https://example.test/registry.safetensors"),
+            canonical_name="registry.safetensors",
+            min_size=1,
+            targets=(ModelTarget(node_pack="comfy_core", path="diffusion_models/registry.safetensors"),),
+        )
+    ]
+    monkeypatch.setattr("vibecomfy.registry.models_loader.load_registry", lambda: registry)
+
+    assert _model_assets_from_workflow(workflow) == [
+        {
+            "name": "authored.safetensors",
+            "url": "https://example.test/authored.safetensors",
+            "subdir": "vae",
+        },
+        {
+            "name": "registry.safetensors",
+            "url": "https://example.test/registry.safetensors",
+            "subdir": "diffusion_models",
+            "node_id": "1",
+            "class_type": "UNETLoader",
+            "field": "unet_name",
+            "value": "registry.safetensors",
+            "reference_type": "registry-backed",
+            "downloadable": True,
+        },
+    ]
+
+    workflow.nodes["5"] = VibeNode("5", "CheckpointLoaderSimple", inputs={"ckpt_name": "missing.safetensors"})
+    with pytest.raises(ModelAssetError) as exc_info:
+        _model_assets_from_workflow(workflow)
+    message = str(exc_info.value)
+    assert "CheckpointLoaderSimple 5.ckpt_name='missing.safetensors'" in message
+    assert "external.safetensors" not in message
+    assert "local.safetensors" not in message
+    assert "patch.safetensors" not in message
+
+
+def test_workflow_local_nested_model_asset_does_not_require_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = VibeWorkflow("local-model", WorkflowSource("local-model"))
+    workflow.metadata["model_assets"] = [{
+        "name": "nested/local.safetensors",
+        "url": None,
+        "subdir": "diffusion_models",
+    }]
+    workflow.nodes["1"] = VibeNode(
+        "1", "UNETLoader", inputs={"unet_name": "nested/local.safetensors"}
+    )
+    model_path = tmp_path / "diffusion_models" / "nested" / "local.safetensors"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model")
+    monkeypatch.setattr(
+        "vibecomfy.registry.models_loader.load_registry",
+        lambda: (_ for _ in ()).throw(AssertionError("local asset must not load registry")),
+    )
+
+    assets = _model_assets_from_workflow(workflow, models_root=tmp_path)
+    assert assets[0]["name"] == "nested/local.safetensors"
+    assert assets[0]["url"] is None
+    assert assets[0]["subdir"] == "diffusion_models"
+
+
+def test_real_wan_t2v_extracts_three_assets() -> None:
+    entries = extract_from_raw_workflow(load_workflow_json("ready_templates/sources/official/video/wan_t2v.json"))
+
+    assert [(entry["name"], entry["subdir"]) for entry in entries] == [
+        ("wan2.1_t2v_1.3B_fp16.safetensors", "diffusion_models"),
+        ("umt5_xxl_fp8_e4m3fn_scaled.safetensors", "text_encoders"),
+        ("wan_2.1_vae.safetensors", "vae"),
+    ]
+    assert all("?download=true" not in entry["url"] for entry in entries)
+
+
+def test_real_flux2_subgraph_extracts_pre_policy_assets() -> None:
+    entries = extract_from_raw_workflow(load_workflow_json("ready_templates/sources/official/image/flux2_klein_9b_t2i.json"))
+
+    assert [(entry["name"], entry["subdir"]) for entry in entries] == [
+        ("flux-2-klein-base-9b-fp8.safetensors", "diffusion_models"),
+        ("qwen_3_8b_fp8mixed.safetensors", "text_encoders"),
+        ("full_encoder_small_decoder.safetensors", "vae"),
+    ]

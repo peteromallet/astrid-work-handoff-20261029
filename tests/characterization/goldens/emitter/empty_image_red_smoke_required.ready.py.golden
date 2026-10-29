@@ -1,0 +1,49 @@
+# vibecomfy: generated
+# For hand-editing, run: python -m vibecomfy.cli copy-to-recipe <id>
+# vibecomfy: surface=canonical
+"""Auto-generated ready_template — use python -m vibecomfy.cli copy-to-recipe <id> for hand-editing."""
+from __future__ import annotations
+
+from vibecomfy.templates import InputSpec, OutputSpec, ReadyMetadata, new_workflow, ref
+from vibecomfy.workflow import VibeWorkflow
+from vibecomfy.nodes.core import EmptyImage, SaveImage
+
+
+DEFAULT_WIDTH = 64
+DEFAULT_HEIGHT = 64
+
+
+PUBLIC_INPUT_METADATA = {
+    'width': InputSpec(node=ref('emptyimage'), field='width', default=DEFAULT_WIDTH, type='INT', infer_type=False),
+    'height': InputSpec(node=ref('emptyimage'), field='height', default=DEFAULT_HEIGHT, type='INT', infer_type=False),
+}
+
+
+READY_METADATA = ReadyMetadata.build(
+    capability='runtime_smoke',
+    template_id='smoke/empty_image_red',
+    inputs=PUBLIC_INPUT_METADATA,
+    approach='minimal Python ready template for cloud/runtime/artifact validation',
+    runtime_note='No model assets; use corpus/model matrices for production model coverage.',
+)
+
+def build() -> VibeWorkflow:
+    """Build the workflow (auto-generated)."""
+    with new_workflow(READY_METADATA, source_path=__file__) as wf:
+
+        emptyimage = EmptyImage(
+            width=DEFAULT_WIDTH,
+            height=DEFAULT_HEIGHT,
+            batch_size=1,
+            color=16711680,
+        )
+
+        saveimage = SaveImage(
+            filename_prefix='vibecomfy_ready_smoke_red',
+            images=emptyimage.out('IMAGE'),
+        )
+
+        wf = wf.finalize(PUBLIC_INPUT_METADATA, outputs=[OutputSpec(node=saveimage, output_type='SaveImage', name='image', artifact_kind='image', mime_type='image/png', filename_prefix='vibecomfy_ready_smoke_red', expected_cardinality='one')])
+        wf.strict_types = False
+        return wf
+

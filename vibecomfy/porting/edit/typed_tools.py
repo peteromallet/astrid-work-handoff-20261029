@@ -1,0 +1,355 @@
+"""Thin typed-tool adapter into canonical edit ops.
+
+This module owns no graph and applies nothing itself. It validates tool-shaped
+arguments, resolves render-visible bindings against an ``EditSession``, lowers
+them to canonical op dataclasses, then delegates to ``EditSession.apply_ops``.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Mapping, Sequence
+
+from vibecomfy.porting.edit.ops import (
+    AddNodeOp,
+    EditOp,
+    LinkSourceRef,
+    LinkTargetRef,
+    NodeFieldTarget,
+    NodeTarget,
+    RemoveLinkOp,
+    RemoveNodeOp,
+    SetModeOp,
+    SetNodeFieldOp,
+    UpsertLinkOp,
+)
+
+
+EDIT_TOOL_NAMES = frozenset(
+    {
+        "edit_node",
+        "add_node",
+        "remove_node",
+        "upsert_link",
+        "remove_link",
+        "set_node_mode",
+        "edit_batch",
+    }
+)
+_POSITIONAL = re.compile(r"^widget_\d+$")
+_MODES = {"enabled": 0, "muted": 2, "bypassed": 4}
+
+
+class EditToolError(ValueError):
+    def __init__(self, code: str, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
+class _BatchTargetResolver:
+    """Resolve session targets plus explicit UIDs added earlier in one batch.
+
+    This deliberately tracks identities only. The canonical evaluator remains
+    the owner of graph state, validation, and atomic application.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self.session = session
+        self._added: dict[tuple[str, str], str] = {}
+        workflow = getattr(session, "workflow", None)
+        self._existing_uids = {
+            str(getattr(node, "uid", "") or "")
+            for node in tuple(getattr(workflow, "nodes", {}).values())
+            if str(getattr(node, "uid", "") or "")
+        }
+
+    def resolve(self, target: Any, *, scope_path: str = "") -> str:
+        if isinstance(target, str):
+            normalized = target.strip()
+            added_uid = self._added.get((scope_path, normalized))
+            if added_uid is not None:
+                return added_uid
+        return resolve_target(self.session, target, scope_path=scope_path)
+
+    def register_add(self, operation: AddNodeOp) -> None:
+        # Generated identities are intentionally not exposed to later tool
+        # operations. A caller can refer only to a UID it explicitly chose.
+        raw_uid = str(operation.uid or "")
+        uid = raw_uid.strip()
+        if not uid:
+            return
+        if uid != raw_uid:
+            raise EditToolError(
+                "invalid_arguments",
+                "add_node uid must not have leading or trailing whitespace.",
+            )
+        key = (str(operation.scope_path or ""), uid)
+        if uid in self._existing_uids or key in self._added:
+            raise EditToolError(
+                "duplicate_identity",
+                f"add_node uid {uid!r} is already used by the workflow or this edit batch.",
+            )
+        self._added[key] = uid
+
+
+def _object(args: Any, *, tool: str) -> dict[str, Any]:
+    if not isinstance(args, Mapping):
+        raise EditToolError("invalid_arguments", f"{tool} requires an argument object.")
+    return dict(args)
+
+
+def _keys(
+    args: Mapping[str, Any],
+    *,
+    tool: str,
+    required: Sequence[str],
+    optional: Sequence[str] = (),
+) -> None:
+    missing = [key for key in required if key not in args]
+    unknown = sorted(set(args) - set(required) - set(optional))
+    if missing:
+        raise EditToolError(
+            "invalid_arguments", f"{tool} requires: {', '.join(missing)}."
+        )
+    if unknown:
+        raise EditToolError(
+            "invalid_arguments", f"{tool} does not accept: {', '.join(unknown)}."
+        )
+
+
+def resolve_target(session: Any, target: Any, *, scope_path: str = "") -> str:
+    if not isinstance(target, str) or not target.strip():
+        raise EditToolError("invalid_arguments", "target must be a non-empty binding or uid.")
+    target = target.strip()
+    if scope_path:
+        from vibecomfy.porting.edit._ir_utils import RecursiveEditError, build_recursive_edit_index
+
+        workflow = getattr(session, "workflow", None)
+        if workflow is None:
+            raise EditToolError("no_edit_session", "the edit session has no retained workflow.", retryable=False)
+        try:
+            return build_recursive_edit_index(workflow).node(scope_path, target).uid
+        except RecursiveEditError as exc:
+            raise EditToolError(exc.code, str(exc), retryable=False) from exc
+    nodes = tuple(getattr(getattr(session, "workflow", None), "nodes", {}).values())
+    uid_matches = [
+        str(node.uid)
+        for node in nodes
+        if str(getattr(node, "uid", "") or "") == target
+    ]
+    if len(uid_matches) == 1:
+        return uid_matches[0]
+    if len(uid_matches) > 1:
+        raise EditToolError(
+            "ambiguous_target", f"uid {target!r} resolves to multiple nodes.", retryable=False
+        )
+    uid = dict(getattr(session, "uid_by_name", {}) or {}).get(target)
+    if uid is None:
+        raise EditToolError("unknown_target", f"unknown render binding or uid {target!r}.")
+    return str(uid)
+
+
+def _source_ref(
+    session: Any,
+    payload: Any,
+    *,
+    scope_path: str = "",
+    resolver: _BatchTargetResolver | None = None,
+) -> LinkSourceRef:
+    if isinstance(payload, str):
+        source, output = payload, 0
+    elif isinstance(payload, Mapping):
+        _keys(payload, tool="link source", required=("source",), optional=("output", "scope_path"))
+        source, output = payload["source"], payload.get("output", 0)
+        scope_path = str(payload.get("scope_path", scope_path) or "")
+    elif isinstance(payload, (list, tuple)) and 1 <= len(payload) <= 2:
+        source, output = payload[0], payload[1] if len(payload) == 2 else 0
+    else:
+        raise EditToolError(
+            "invalid_arguments",
+            "a link source must be a binding, {source, output}, or [source, output].",
+        )
+    uid = (
+        resolver.resolve(source, scope_path=scope_path)
+        if resolver is not None
+        else resolve_target(session, source, scope_path=scope_path)
+    )
+    return LinkSourceRef(scope_path, uid, output)
+
+
+def _lower_one(
+    session: Any,
+    tool: str,
+    raw_args: Any,
+    *,
+    resolver: _BatchTargetResolver | None = None,
+) -> tuple[EditOp, ...]:
+    target_resolver = resolver if resolver is not None else _BatchTargetResolver(session)
+    if tool not in EDIT_TOOL_NAMES:
+        raise EditToolError("unknown_tool", f"unknown typed edit tool {tool!r}.", retryable=False)
+    args = _object(raw_args, tool=tool)
+    if tool == "edit_batch":
+        _keys(args, tool=tool, required=("ops",))
+        raw_ops = args["ops"]
+        if not isinstance(raw_ops, list) or not raw_ops:
+            raise EditToolError("invalid_arguments", "edit_batch.ops must be a non-empty list.")
+        lowered: list[EditOp] = []
+        for index, item in enumerate(raw_ops):
+            if not isinstance(item, Mapping) or not isinstance(item.get("op"), str):
+                raise EditToolError(
+                    "invalid_arguments", f"edit_batch.ops[{index}] requires a string `op`."
+                )
+            nested = str(item["op"])
+            if nested == "edit_batch":
+                raise EditToolError("invalid_arguments", "nested edit_batch calls are not allowed.")
+            nested_ops = _lower_one(
+                session,
+                nested,
+                {k: v for k, v in item.items() if k != "op"},
+                resolver=target_resolver,
+            )
+            lowered.extend(nested_ops)
+            for operation in nested_ops:
+                if isinstance(operation, AddNodeOp):
+                    target_resolver.register_add(operation)
+        return tuple(lowered)
+
+    if tool == "edit_node":
+        _keys(args, tool=tool, required=("target", "field", "value"), optional=("scope_path",))
+        scope_path = str(args.get("scope_path", "") or "")
+        field = args["field"]
+        if not isinstance(field, str) or not field or _POSITIONAL.match(field):
+            raise EditToolError(
+                "invalid_arguments", "field must be a non-positional render-visible name."
+            )
+        return (
+            SetNodeFieldOp(
+                "set_node_field",
+                NodeFieldTarget(scope_path, target_resolver.resolve(args["target"], scope_path=scope_path), field),
+                args["value"],
+            ),
+        )
+
+    if tool == "remove_node":
+        _keys(args, tool=tool, required=("target",), optional=("scope_path",))
+        scope_path = str(args.get("scope_path", "") or "")
+        return (RemoveNodeOp("remove_node", NodeTarget(scope_path, target_resolver.resolve(args["target"], scope_path=scope_path))),)
+
+    if tool == "set_node_mode":
+        _keys(args, tool=tool, required=("target", "mode"), optional=("scope_path",))
+        scope_path = str(args.get("scope_path", "") or "")
+        if args["mode"] not in _MODES:
+            raise EditToolError("invalid_arguments", "mode must be enabled, muted, or bypassed.")
+        return (
+            SetModeOp(
+                "set_mode",
+                NodeTarget(scope_path, target_resolver.resolve(args["target"], scope_path=scope_path)),
+                _MODES[args["mode"]],
+            ),
+        )
+
+    if tool == "remove_link":
+        _keys(args, tool=tool, required=("target", "target_input"), optional=("scope_path",))
+        scope_path = str(args.get("scope_path", "") or "")
+        field = args["target_input"]
+        if not isinstance(field, str) or not field:
+            raise EditToolError("invalid_arguments", "target_input must be a name.")
+        return (
+            RemoveLinkOp(
+                "remove_link",
+                target=LinkTargetRef(scope_path, target_resolver.resolve(args["target"], scope_path=scope_path), field),
+            ),
+        )
+
+    if tool == "upsert_link":
+        _keys(
+            args,
+            tool=tool,
+            required=("source", "target", "target_input"),
+            optional=("source_output", "scope_path", "source_scope_path", "target_scope_path"),
+        )
+        scope_path = str(args.get("scope_path", "") or "")
+        source_scope = str(args.get("source_scope_path", scope_path) or "")
+        target_scope = str(args.get("target_scope_path", scope_path) or "")
+        source = LinkSourceRef(
+            source_scope, target_resolver.resolve(args["source"], scope_path=source_scope), args.get("source_output", 0)
+        )
+        target_input = args["target_input"]
+        if not isinstance(target_input, str) or not target_input:
+            raise EditToolError("invalid_arguments", "target_input must be a name.")
+        return (
+            UpsertLinkOp(
+                "upsert_link",
+                source,
+                LinkTargetRef(target_scope, target_resolver.resolve(args["target"], scope_path=target_scope), target_input),
+            ),
+        )
+
+    # add_node
+    _keys(
+        args,
+        tool=tool,
+        required=("class_type",),
+        optional=("fields", "widget_values", "inputs", "uid", "node_id", "scope_path"),
+    )
+    if not isinstance(args["class_type"], str) or not args["class_type"]:
+        raise EditToolError("invalid_arguments", "class_type must be a non-empty string.")
+    if "fields" in args and "widget_values" in args:
+        raise EditToolError(
+            "invalid_arguments", "add_node accepts fields or widget_values, not both."
+        )
+    fields = args.get("fields", args.get("widget_values", {}))
+    inputs = args.get("inputs", {})
+    if not isinstance(fields, Mapping) or not isinstance(inputs, Mapping):
+        raise EditToolError("invalid_arguments", "add_node fields and inputs must be objects.")
+    return (
+        AddNodeOp(
+            "add_node",
+            str(args.get("scope_path", "") or ""),
+            args["class_type"],
+            dict(fields),
+            {
+                str(name): _source_ref(
+                    session,
+                    value,
+                    scope_path=str(args.get("scope_path", "") or ""),
+                    resolver=target_resolver,
+                )
+                for name, value in inputs.items()
+            },
+            uid=str(args["uid"]) if args.get("uid") is not None else None,
+            node_id=str(args["node_id"]) if args.get("node_id") is not None else None,
+        ),
+    )
+
+
+def lower_edit_tool_call(session: Any, tool: str, args: Any) -> tuple[EditOp, ...]:
+    """Lower one typed tool call without mutating the session."""
+    return _lower_one(session, tool, args)
+
+
+def apply_edit_tool_call(
+    session: Any,
+    tool: str,
+    args: Any,
+    *,
+    expected_revision: int | None = None,
+) -> Any:
+    """Lower and atomically apply a typed call through ``EditSession``.
+
+    ``EditSession.apply_ops`` owns the single evaluator/admission pass and
+    returns its transition report for accepted, rejected, and no-op batches.
+    """
+    ops = lower_edit_tool_call(session, tool, args)
+    return session.apply_ops(ops, expected_revision=expected_revision)
+
+
+__all__ = [
+    "EDIT_TOOL_NAMES",
+    "EditToolError",
+    "apply_edit_tool_call",
+    "lower_edit_tool_call",
+    "resolve_target",
+]

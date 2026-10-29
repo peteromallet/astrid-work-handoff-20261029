@@ -1,0 +1,237 @@
+---
+name: vibecomfy
+description: 'Drive the VibeComfy package to discover ComfyUI workflows, load ready Python templates, edit and compose them in a `VibeWorkflow` IR, validate, and execute either embedded locally, against an existing ComfyUI server, or on RunPod. Use whenever the user wants to generate images/video/audio/edits from ComfyUI workflows, tweak templates, build recipes, compose graphs in Python, or run existing `ready_templates` end-to-end.'
+---
+
+# VibeComfy
+
+VibeComfy is this package: a Python-first way to drive ComfyUI without hand-editing JSON. The center of gravity is `VibeWorkflow`: load a workflow, edit it in Python, validate it, then compile to ComfyUI API JSON and run it.
+
+Use this umbrella skill for orientation and package rules. For real work, route to the smallest focused skill:
+
+| User wants | Use |
+|---|---|
+| Configure ComfyUI paths, server URL, custom nodes, or models | `vibecomfy-setup` |
+| Find a workflow, precedent, node wiring, or Hivemind evidence | `search-comfy-workflows` |
+| Explain what a workflow does or answer questions about it | `explain-comfy-workflow` |
+| Clean up, regroup, or align a ComfyUI workflow layout without changing runtime behavior | `reorganise-comfy-workflow` |
+| Tweak or rewrite a workflow without running it | `edit-comfy-workflow` |
+| Execute a ready template, recipe, scratchpad, server run, or RunPod smoke | `run-comfy-workflow` |
+| Diagnose validation, conversion, node/model, or runtime failures | `debug-comfy-workflow` |
+| Add a durable package ready template | `add-comfy-workflow-template` |
+
+The operating path is:
+
+```text
+discover -> load_bundle -> edit/compose -> validate -> compile("api") -> run -> collect outputs
+```
+
+Custom Python functions use `@python_node` and lower to visible, executable
+`vibecomfy.exec` nodes. Complete modules/projects use
+`python_node.from_source` with a bounded source capsule; worker-installed
+packages use `python_node.from_installed`. Route authoring and source edits
+to `edit-comfy-workflow`, execution and queue evidence to
+`run-comfy-workflow`, and dependency/import failures to
+`vibecomfy-setup` or `debug-comfy-workflow`. Read
+[custom Python workflow nodes](../guides/custom-python-workflows.md) for the
+canonical syntax and validation boundaries.
+
+For a reusable source-to-Python onboarding path, including provenance and honest
+import/runtime blockers, see [workflow onboarding](../guides/workflow-onboarding.md).
+
+## First Moves
+
+Work from the user's project directory so relative import destinations and
+recipe paths are predictable. Repository maintenance commands may require the
+VibeComfy repo root. Prefer the `vibecomfy ...` console entrypoint; if an
+editable checkout has no console script, use `python -m vibecomfy.cli ...`.
+
+For a runnable starting point:
+
+```bash
+vibecomfy workflows list --ready
+vibecomfy inspect image/z_image
+vibecomfy copy-to-recipe image/z_image --out recipes/my_run.py
+vibecomfy validate recipes/my_run.py
+vibecomfy run recipes/my_run.py --runtime server --server-url http://127.0.0.1:8188
+```
+
+For raw JSON:
+
+```bash
+vibecomfy import workflow.json
+vibecomfy inspect workflows/workflow --json
+vibecomfy edit workflows/workflow set sampler.steps 30
+vibecomfy validate workflows/workflow --json
+vibecomfy doctor workflows/workflow --json
+```
+
+For a community workflow, obtain `workflow.json` by searching Hivemind through
+the deployed Astrid pack and fetching the selected accepted revision. Pull it
+only when needed, then import it into `workflows/`. Do not bulk-download or
+maintain a second local copy of Hivemind's workflow catalogue.
+
+`import` creates an editable folder with `workflow.py`,
+`workflow.vibe.json`, and a byte-identical `source.json`; provenance stays in
+the bundle metadata. Use `--out <directory>`, `--dry-run`, or `--json` as
+needed. This prepares authoring files but does not install dependencies or run
+the workflow. Use `validate` and `doctor` for checks, and
+`templates create` for intentional ready-template promotion. A
+`ready_templates/` entry is a curated executable adapter, not a replacement for
+the Hivemind source or the local `workflows/` ingestion bundle.
+This standalone route is local and untracked by default. Add `--project <name>`
+to `import` and `edit` to opt those transitions into an existing Astrid
+project. If the workflow is already being handled by Astrid, use its native
+`astrid media import` plus `astrid tasks create --capability vibecomfy.import`
+route instead; it inherits the admitted project/task context and does not use
+VibeComfy's `--project` flag. The [workflow onboarding guide](../guides/workflow-onboarding.md)
+explains the three routes, atomic batch edits, direct Python capture, validation,
+and Astrid history.
+
+For node details, use `vibecomfy node <ClassType>`. Its default view includes
+inputs, outputs, schema provenance, and locally available implementation class
+source. Use `--inputs`, `--outputs`, or `--source` to focus the result, combine
+filters when useful, and add `--json` for machine-readable output. Treat source
+unavailability separately from a missing schema; never substitute a generated
+wrapper for the underlying node implementation.
+
+For setup trouble:
+
+```bash
+vibecomfy config show --json
+vibecomfy runtime doctor
+```
+
+## Automatic Local Preparation
+
+Local canonical Python workflows are statically reconciled after load. Missing
+model URLs, node repositories, destinations, and class accounting gaps are
+reported together; the run stops before compilation, session changes, package
+or node installation, model transfer, or queueing. Common unresolved entries
+are written back to the same workflow source for the user to complete.
+
+Once the dependency report is resolved, `vibecomfy run` uses the existing model
+fetch, node-pack, lockfile, session, and bounded download plumbing automatically.
+`--deps reuse` is the default: it only compares the declared runtime target and
+emits one actionable drift warning; missing or demonstrably incompatible fields
+block before queueing. `--deps sync` is explicit and managed-target-only, and
+uses the existing preparation/install seams. Set `VIBECOMFY_OFFLINE=1` to make
+sync fail closed instead of attempting network access.
+Managed sync requires an existing VibeComfy-owned `runtime_root/.venv` or
+`runtime_root/venv` plus the `.vibecomfy-managed` marker written by the
+managed setup path; it never installs into an unrelated caller interpreter.
+`--runtime-root`, `--session`, `--keep-warm`, `--restart-session`,
+`--download-workers`, and `--json` remain available on the normal run command.
+Explicit `--server-url` runs are remote and non-mutating; unverifiable target
+fields are reported as such.
+
+The typed `requirements.runtime` declaration records the tested ComfyUI
+commit/version, Python version, package constraints, launch flags, model
+identities, and custom-node versions/commits. Legacy `metadata.python_env` and
+`metadata.comfy_commit` are normalized for compatibility; contradictory
+values fail at ingest rather than silently choosing one.
+
+The local repair loop is canonical and same-file: authored `ModelAsset` rows
+and `requirements.custom_node_refs` are the only dependency declarations.
+URL-only models use the current URL bytes and leave an observed SHA-256/size/
+effective-URL receipt; optional `hf_revision`, `sha256`, and node
+version/tag/branch/commit pins remain explicit. Matching model receipts and
+`custom_nodes.lock` entries are reused exactly. Before any setup or queueing,
+root and nested graph classes are checked against core classes, declared
+`classes`/`class_set`, and an unambiguous local pack catalog. Gaps are reported
+with source locations and actionable same-file placeholders; dynamic forms
+remain manual-edit diagnostics. Warm sessions and bounded concurrency are
+preserved after reconciliation. Live RunPod/GPU acceptance remains an
+explicitly separate validation and is not claimed from local structural tests.
+
+## Authoring Model
+
+Use one loader by default:
+
+```python
+from vibecomfy.cli_loader import load_bundle
+
+def build():
+    wf = load_bundle("image/z_image").workflow
+    wf.set_prompt("a glass teapot on basalt")
+    wf.set_seed(42)
+    wf.set_steps(20)
+    return wf.finalize_metadata()
+```
+
+Choose the lightest edit shape:
+
+| Shape | Use when |
+|---|---|
+| `VibeWorkflow` setters/direct methods | You are changing existing prompt, seed, steps, widgets, edges, or metadata. |
+| Patches | You are decorating an existing graph without changing the public handle shape. |
+| Blocks | You are adding graph structure that produces new handles. |
+| Recipes | You are making a user-specific composition or chaining logic. |
+| Ready templates | You are adding a durable package starting point by id. |
+
+Keep ComfyUI's terms precise: a **workflow** is any graph; a **template** is a curated starting-point workflow under `ready_templates/`.
+
+## Rules
+
+- Treat raw UI/API JSON as import evidence. Use `vibecomfy import <workflow.json>` for a local bundle, then load the folder through `load_bundle()` before editing or running. The folder is accepted by `inspect`, `analyze info`, `validate`, `doctor`, and `run`.
+- Treat the worktree as shared. Do not revert, overwrite, or clean up edits you did not make.
+- Keep changes scoped to the requested workflow, command, template, or doc surface.
+- Do not bulk-create a workflow corpus. Local workflow files belong in the ignored `workflows/` ingestion store; generated snapshots and template manifests change only during an explicit ready-template promotion.
+- Never invent node class names, sockets, widget fields, or model layouts. Use `inspect`, `analyze info`, `node <ClassType>`, local precedents, or `search-comfy-workflows`.
+- Sync indexes only when needed: `vibecomfy sources sync`.
+- Add focused tests when changing command routing, parser behavior, conversion, validation, search, runtime-facing code, or template coverage.
+- Keep tests deterministic; avoid requiring ComfyUI, RunPod, network, or local model files unless the test is explicitly marked for that environment.
+
+## Agent-Edit Policy
+
+- Prefer normal static graph edits first.
+- Use `vibecomfy.loop` only for bounded visible sweeps that cannot lower cleanly to ordinary nodes. Keep iteration counts bounded and metadata typed.
+- Use `vibecomfy.code` only for inspectable typed logic when no shipped shape fits. Default to sandboxed modes. Never emit unrestricted execution from agent-authored code.
+- Reject side-effecting, unbounded, runtime-only, external-I/O, or otherwise unrepresentable requests at policy level.
+- Editor-only intent nodes may be valid for Canvas Apply, but they are Queue blockers until lowered to normal runtime nodes.
+- When emitting an intent node programmatically, build metadata with `intent_node_properties(...)`.
+
+## When You Need More Detail
+
+## Schema Capture and Preflight (Batch E)
+
+Missing schema captures block preflight — the harness fails closed and tells you exactly how to provision:
+
+```bash
+vibecomfy schemas ensure --manifest <comparison-manifest.json>
+```
+
+What the command does (no parallel schema system, compose only):
+
+- **Registry → ephemeral clone → extraction ladder → cache + provenance tier.** Registry resolves the owning pack (`pack_resolver`), a shallow clone is materialized in the LRU-bounded sandbox `~/.cache/vibecomfy/schema-sandbox` (max 64 packs / 2 GiB), then `extract_pack_schemas` runs rung 1 (static AST) and rung 2 (stubbed-subprocess `INPUT_TYPES` — always on for this command). Rung 3 (embedded comfy-as-library) is deferred; the command fails closed if a class needs it.
+- **Persist with honest tier.** `persist_on_demand_pack` stamps `source_kind` as `on_demand_static` (rung 1) or `on_demand_import` (rung 2), writes `Pack@on_demand_*-{sha7}.json` (never `@runpod-snapshot` or `@stub.json`), and attests `provenance.json` with `repo`, `locked_commit` (clone HEAD), `extraction_rung`, `registry_pack_version`, `source_kind`, `schema_sha256`.
+
+How preflight accepts it:
+
+- Declarations accepted: `authoritative_object_info` | `on_demand_static` | `on_demand_import` | `on_demand_embedded`. Preflight requires the declared `source` to match the cache entry's `source_kind` exactly — no silent upgrades (`on_demand_static` does not satisfy `authoritative_object_info`, `on_demand_import` does not satisfy `on_demand_static`).
+- `@stub.json` / `workflow_json_stub` never counts as evidence (filtered and stub-rejected even if indexed).
+- Campaign-grade strict lane: `VIBECOMFY_OBLIGATION_RUNTIME_ONLY=1` rejects any `on_demand_*` declaration — runtime-family captures only.
+
+Discovering the command:
+
+- `vibecomfy schemas validate-coverage --manifest <m> --json` reports `missing_classes` and `ensure_command` (`vibecomfy schemas ensure --manifest <m>`); it exits 1 when `--manifest` and gaps exist (template positional keeps exit 0 for back-compat).
+- `vibecomfy doctor <workflow.py>` on `unknown_class_type` / missing schema prints `vibecomfy schemas ensure <workflow.py>` and the generic `vibecomfy schemas ensure --manifest <comparison.json>` hint. Doctor never clones or extracts — reporting only.
+
+
+Read [REFERENCE.md](REFERENCE.md) for the API surface, layer model, command catalog, plugin hooks, known limitations, RunPod environment, and durable-template checklist.
+
+In-repo references:
+
+- `docs/authoring.md` — blocks, patches, handles, opaque subgraphs, recipes
+- `docs/vibeworkflow.md` — IR contract
+- `docs/api/m6-public-api.md` — public imports and compatibility aliases
+- `docs/custom_nodes.md` — node packs, install/lock/restore
+- `docs/runtime/lifecycle.md`, `docs/runtime/surface.md` — embedded vs server runtime
+- `docs/errors_and_doctor.md` — what `doctor` flags and how to fix it
+- `docs/templates/adding_templates_models.md` — full ready-template addition process
+
+When in doubt, stay in Python and descend only as far as needed:
+
+```text
+op -> Artifact -> preview_workflow -> VibeWorkflow -> compile("api") -> run
+```

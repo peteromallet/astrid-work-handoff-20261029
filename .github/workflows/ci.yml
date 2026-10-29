@@ -1,0 +1,93 @@
+# Maintained CI suite.
+#
+# Runs on every push and on every pull_request.
+#
+# Steps:
+#   1. Checkout (fetch-depth: 2 so PR diffs see the merge base if needed).
+#   2. Install uv.
+#   3. Install the package plus the pinned AppMana ComfyUI optional dependency
+#      used by the oracle converter.
+#   4. Run `make ci`, the shared local/GitHub contract for root hygiene, the
+#      bounded fast Python tier, browser smoke, snapshot freshness, and the
+#      Comfy oracle gate. The repository-wide Python tier is explicit and
+#      separate (`make broad-pytest`).
+#   5. Upload coverage.xml as a workflow artifact.
+#
+# Branch protection on `main` requires repo-admin action and is tracked as a
+# user_action; this workflow only exposes the `test` status check.
+
+name: ci
+
+on:
+  push: {}
+  pull_request: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: |
+          uv venv --seed
+          make PYTHON=.venv/bin/python install-ci
+
+      - name: Enforce IR boundary
+        run: PYTHONPATH=. .venv/bin/python scripts/check_ir_boundary.py
+
+      - name: Run maintained fast repo gate
+        # Makefile is the local/GitHub contract for repo hygiene, the bounded
+        # fast Python tier, browser smoke, snapshot freshness, the Comfy
+        # oracle, and the IR boundary checker.
+        run: make PYTHON=.venv/bin/python ci
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+  browser-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install VibeComfy and ComfyUI
+        run: |
+          uv venv --seed
+          make PYTHON=.venv/bin/python install-ci
+
+      - name: Install Chromium test runtime
+        working-directory: tests/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Prove the extension boots in a real browser
+        env:
+          VIBECOMFY_DEMO_PICKER: "1"
+          PYBIN: ${{ github.workspace }}/.venv/bin/python
+        run: |
+          export PATH="$PWD/.venv/bin:$PATH"
+          node tests/e2e/run.mjs --no-seed -- \
+            --config tests/e2e/playwright.config.mjs \
+            tests/e2e/specs/extension_boot.spec.mjs

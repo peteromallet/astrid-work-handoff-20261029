@@ -1,0 +1,38 @@
+{
+ "id": "video-video-output-workflow-f855de",
+ "query": "The final output video is unacceptably blurry and shows heavy banding in dark areas, even though no explicit blur or compression step is visible in the node graph. I need you to inspect the custom nodes and connections to identify what's causing this loss of detail.",
+ "workflow_path": "tests/fixtures/live_agentic_corpus/corpus/f855deb7cdef4ace.json",
+ "apply": true,
+ "network": true,
+ "timeout": 420,
+ "assessment": {
+  "expect_graph_changed": true
+ },
+ "desired": {
+  "outcome": "Diagnose and fix.",
+  "quality": "Diagnosis identifies the correct root cause; fix actionable and directionally correct.",
+  "alternatives_ok": true
+ },
+ "hint_level": "none",
+ "_tags": {
+  "modality": "video",
+  "query_type": "edit",
+  "abstraction": "high",
+  "complexity": "high",
+  "manifest_complexity": 4,
+  "task_type": "other",
+  "requires_custom_nodes": true,
+  "techniques": [
+   "video",
+   "save-video",
+   "custom-nodes",
+   "workflow"
+  ],
+  "source_workflow_id": "f855deb7cdef4ace",
+  "source": "external_workflows/corpus",
+  "staged": true,
+  "authored_by": "deepseek-v4-pro",
+  "author_rationale": "Requires tracing artifact to specific node(s) in a complex graph without obvious culprits, testing deep diagnostic reasoning.",
+  "solution_confirmed": false
+ }
+}

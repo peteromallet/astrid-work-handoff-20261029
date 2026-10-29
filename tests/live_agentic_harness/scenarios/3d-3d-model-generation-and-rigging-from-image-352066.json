@@ -1,0 +1,52 @@
+{
+  "id": "3d-3d-model-generation-and-rigging-from-image-352066",
+  "query": "The generated model's rig has the knees bending backward. Correct the joint orientation so the legs bend forward naturally.",
+  "workflow_path": "tests/fixtures/live_agentic_corpus/corpus/352066ccef9dbe37.json",
+  "network": true,
+  "timeout": 320,
+  "apply": false,
+  "assessment": {
+    "expect_graph_changed": false,
+    "allow_safe_refusal_outcome_kinds": ["clarify"],
+    "expected_no_candidate_reason": "No authored node in this corpus workflow exposes joint orientation: the authoritative schema gives TripoRigNode only a model task id input and TripoRetargetNode only a model task id plus an animation preset, and the skeleton itself is produced by the Tripo cloud task. The query deliberately demands an unauthorable feature; the typed evidence mode is a structural-feature absence (joint_orientation checks below) carried by a structural_feature_absent authoring blocker, with clarify as the terminal refusal kind — a generic no_changes label is never evidence.",
+    "expected_no_candidate_absent_features": [
+      {
+        "feature": "joint_orientation",
+        "checks": [
+          {
+            "class_type": "TripoRigNode",
+            "member_kind": "input",
+            "member": "joint_orientation"
+          },
+          {
+            "class_type": "TripoRetargetNode",
+            "member_kind": "input",
+            "member": "joint_orientation"
+          }
+        ]
+      }
+    ]
+  },
+  "_tags": {
+    "modality": "3d",
+    "query_type": "edit",
+    "abstraction": "low",
+    "complexity": "low",
+    "manifest_complexity": 2,
+    "task_type": "other",
+    "requires_custom_nodes": false,
+    "techniques": [
+      "3d-modeling",
+      "texturing",
+      "rigging",
+      "retargeting",
+      "image-to-3d",
+      "preview-3d"
+    ],
+    "source_workflow_id": "352066ccef9dbe37",
+    "source": "external_workflows/corpus",
+    "staged": true,
+    "authored_by": "deepseek-v4-flash",
+    "author_rationale": "The query asks for an edit, but deliberately demands a feature no authored node exposes: joint orientation is decided inside the Tripo cloud rig task, and the frozen schema attests TripoRigNode/TripoRetargetNode carry no joint-orientation input. The scenario's designation is expected-no-candidate under a typed structural-feature contract — the assessor independently replays each declared check against the source graph and the authoritative index before any leg passes; the honest outcome is a grounded clarify refusal, not an edit."
+  }
+}

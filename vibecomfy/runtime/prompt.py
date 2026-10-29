@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from vibecomfy.errors import VibeComfyError, WorkflowBuildError, WorkflowValidationError
+from vibecomfy.workflow import VibeWorkflow
+from vibecomfy.workflow_bundle import ApprovedProjectionRecord, WorkflowBundle, WorkflowBundleError
+
+
+def emit_schema_unavailable_once(owner: Any, logger: Any, msg: str) -> None:
+    if getattr(owner, "_schema_warning_emitted", False):
+        return
+    logger.warning("vibecomfy schema gate: %s", msg)
+    owner._schema_warning_emitted = True
+
+
+def _schema_validate_disabled() -> bool:
+    return os.environ.get("VIBECOMFY_SCHEMA_VALIDATE", "1").strip() in {"0", "false", "False", "no", "off"}
+
+
+def _build_schema_provider(server_url: str | None) -> Any | None:
+    if _schema_validate_disabled():
+        return None
+    from vibecomfy.schema import RuntimeSchemaProvider, TargetSchemaProvider
+
+    if server_url:
+        return TargetSchemaProvider(server_url=server_url)
+    return RuntimeSchemaProvider(server_url=server_url)
+
+
+async def _warm_schema_provider(
+    provider: Any | None,
+    *,
+    on_unavailable,
+    cache_only: bool = False,
+) -> Any | None:
+    if provider is None:
+        return None
+    from vibecomfy.schema.cache import ObjectInfoPayloadError
+    target_provider = bool(getattr(provider, "requires_fresh_target", False))
+    if target_provider:
+        cache_only = False
+
+    try:
+        if getattr(provider, "_object_info", None) is not None:
+            return provider
+        if cache_only:
+            from vibecomfy.schema.cache import (
+                load_object_info_cache,
+                validate_object_info_cache,
+            )
+
+            cached = load_object_info_cache(provider.cache_path)
+            if cached is None:
+                on_unavailable(f"object_info cache unavailable at {provider.cache_path}; using structural validation only")
+                return None
+            expected = (
+                provider._cache_validation_expected()
+                if callable(getattr(provider, "_cache_validation_expected", None))
+                else {}
+            )
+            result = validate_object_info_cache(
+                cached,
+                expected=expected,
+                policy="strict",
+                cache_path=provider.cache_path,
+            )
+            if not result.ok:
+                on_unavailable(
+                    f"object_info cache rejected at {provider.cache_path}: {result.reason}; "
+                    "using structural validation only"
+                )
+                return None
+            setter = getattr(provider, "_set_object_info", None)
+            if callable(setter):
+                setter(cached)
+            else:
+                provider._object_info = cached
+            return provider
+
+        from vibecomfy.schema.cache import validate_object_info_payload_shape
+
+        object_info = await provider.object_info_async()
+        validate_object_info_payload_shape(object_info)
+        provider._object_info = object_info
+        return provider
+    except ObjectInfoPayloadError as exc:
+        if target_provider:
+            raise
+        on_unavailable(f"{type(exc).__name__}: {exc}; using structural validation only")
+        return None
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        if target_provider:
+            raise
+        on_unavailable(f"{type(exc).__name__}: {exc}; using structural validation only")
+        return None
+
+
+def _prepare_prompt(
+    record: ApprovedProjectionRecord,
+    bundle: WorkflowBundle,
+    *,
+    backend: str,
+    schema_provider: Any | None = None,
+) -> dict[str, Any]:
+    if backend != "api" or not isinstance(record, ApprovedProjectionRecord) or not isinstance(bundle, WorkflowBundle):
+        raise WorkflowBundleError("runtime prompt preparation requires an approved API record and bundle")
+    record.assert_matches(
+        bundle,
+        record.selected_variant,
+        record.input_binding,
+        api_projection=record.api_projection,
+        ui_projection=record.ui_projection,
+    )
+    return record.to_dict()["api_projection"]
+
+
+async def _prepare_prompt_async(
+    record: ApprovedProjectionRecord,
+    bundle: WorkflowBundle,
+    *,
+    backend: str,
+    schema_provider: Any | None,
+    on_unavailable,
+    cache_only: bool = False,
+) -> dict[str, Any]:
+    effective = await _warm_schema_provider(
+        schema_provider,
+        on_unavailable=on_unavailable,
+        cache_only=cache_only,
+    )
+    del effective
+    return _prepare_prompt(record, bundle, backend=backend, schema_provider=schema_provider)
+
+
+def _validation_failed_message(report: Any) -> str:
+    from vibecomfy.schema.validate import format_issue
+
+    return "Workflow validation failed:\n  - " + "\n  - ".join(
+        format_issue(issue) for issue in report.issues if issue.severity == "error"
+    )

@@ -1,0 +1,1031 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from vibecomfy.porting.edit import (
+    ClaimReferenceError,
+    EditSession,
+    EditToolError,
+    apply_edit_tool_call,
+    close_terminal_checkpoint,
+    lower_edit_tool_call,
+)
+from vibecomfy.porting.edit.apply_gate import editable_signature
+from vibecomfy.ingest.normalize import from_ui
+from vibecomfy.schema import (
+    FrozenSchemaSnapshotProvider,
+    InputSpec,
+    NodeSchema,
+    capture_schema_snapshot,
+    schema_payload_from_node_schema,
+)
+from tests.support.corpus_schema import graph_inferred_schema_provider
+
+
+_FLAT = Path(__file__).parent / "fixtures" / "agent_edit" / "flat.json"
+
+
+def _session() -> EditSession:
+    graph = json.loads(_FLAT.read_text(encoding="utf-8"))
+    source = graph_inferred_schema_provider(graph)
+    class_types = tuple(
+        dict.fromkeys(
+            str(node["type"])
+            for node in graph["nodes"]
+            if isinstance(node, dict) and isinstance(node.get("type"), str)
+        )
+    )
+    schemas = {}
+    for class_type in class_types:
+        schema = source.get_schema(class_type)
+        if schema is None:
+            raise AssertionError(f"fixture schema missing for {class_type}")
+        schemas[class_type] = schema_payload_from_node_schema(class_type, schema)
+    snapshot = capture_schema_snapshot(
+        class_types=class_types,
+        request_snapshot={
+            "contract_version": "schema_snapshot_v1",
+            "schemas": schemas,
+            "missing_classes": [],
+        },
+        node_classes={str(node["id"]): str(node["type"]) for node in graph["nodes"]},
+    )
+    return EditSession(graph, schema_provider=FrozenSchemaSnapshotProvider(snapshot))
+
+
+def _positional_scalar_session(
+    *,
+    class_type: str,
+    fields: tuple[tuple[str, InputSpec, object], ...],
+) -> EditSession:
+    """Retain the positional ingress IR while supplying its frozen schema."""
+    graph = {
+        "last_node_id": 1,
+        "last_link_id": 0,
+        "nodes": [
+            {
+                "id": 1,
+                "type": class_type,
+                "pos": [0, 0],
+                "size": [240, 120],
+                "flags": {},
+                "order": 0,
+                "mode": 0,
+                "inputs": [],
+                "outputs": [],
+                "properties": {"vibecomfy_uid": "1"},
+                "widgets_values": [value for _name, _spec, value in fields],
+            }
+        ],
+        "links": [],
+    }
+    schema = NodeSchema(
+        class_type=class_type,
+        pack="test",
+        inputs={name: spec for name, spec, _value in fields},
+        outputs=[],
+        widget_input_order=tuple(name for name, _spec, _value in fields),
+    )
+    snapshot = capture_schema_snapshot(
+        class_types=(class_type,),
+        request_snapshot={
+            "contract_version": "schema_snapshot_v1",
+            "schemas": {class_type: schema_payload_from_node_schema(class_type, schema)},
+            "missing_classes": [],
+        },
+        node_classes={"1": class_type},
+    )
+    # This is the production failure shape: import happened before the frozen
+    # schema was attached, so the retained IR has widget_N carriers. The edit
+    # operation must nevertheless retain the schema's canonical field name.
+    positional_ir = from_ui(graph, use_comfy_converter=False)
+    return EditSession(
+        graph,
+        schema_provider=FrozenSchemaSnapshotProvider(snapshot),
+        initial_workflow=positional_ir,
+    )
+
+
+_SCALAR_CASES = (
+    (
+        "SamplerCustom",
+        (
+            ("add_noise", InputSpec(type="BOOLEAN"), True),
+            ("noise_seed", InputSpec(type="INT"), 0),
+            ("control_after_generate", InputSpec(type="STRING"), "fixed"),
+            ("cfg", InputSpec(type="FLOAT"), 1.0),
+        ),
+        "add_noise",
+        False,
+        0,
+    ),
+    (
+        "SVD_img2vid_Conditioning",
+        (
+            ("width", InputSpec(type="INT"), 1024),
+            ("height", InputSpec(type="INT"), 576),
+            ("video_frames", InputSpec(type="INT"), 14),
+            ("motion_bucket_id", InputSpec(type="INT"), 127),
+            ("fps", InputSpec(type="INT"), 6),
+            ("augmentation_level", InputSpec(type="FLOAT"), 0.0),
+        ),
+        "motion_bucket_id",
+        180,
+        3,
+    ),
+)
+
+
+@pytest.mark.parametrize("door", ("python", "typed_tool"))
+@pytest.mark.parametrize(
+    ("class_type", "fields", "field", "new_value", "widget_index"),
+    _SCALAR_CASES,
+)
+def test_schema_named_scalar_edit_claims_its_positional_ingress_carrier(
+    door: str,
+    class_type: str,
+    fields: tuple[tuple[str, InputSpec, object], ...],
+    field: str,
+    new_value: object,
+    widget_index: int,
+) -> None:
+    session = _positional_scalar_session(class_type=class_type, fields=fields)
+
+    if door == "python":
+        binding = "samplercustom" if class_type == "SamplerCustom" else "svd_img2vid_conditioning"
+        result = session.apply_batch(f"{binding}.{field} = {new_value!r}")
+    else:
+        result = apply_edit_tool_call(
+            session,
+            "edit_node",
+            {"target": "1", "field": field, "value": new_value},
+            expected_revision=0,
+        )
+
+    assert result.ok is True
+    assert result.landed_ops[0].target.field_path == field
+    node = next(iter(session.workflow.nodes.values()))
+    assert node.widgets[f"widget_{widget_index}"] == new_value
+    assert session.working_ui["nodes"][0]["widgets_values"][widget_index] == new_value
+
+
+def test_schema_named_claim_does_not_cover_a_different_positional_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibecomfy.porting.edit._interpret as interpret_mod
+
+    class_type, fields, field, new_value, _widget_index = _SCALAR_CASES[1]
+    session = _positional_scalar_session(class_type=class_type, fields=fields)
+    original_interpret = interpret_mod.interpret
+
+    def _tamper(*args, **kwargs):
+        report = original_interpret(*args, **kwargs)
+        report.workflow.nodes["1"].widgets["widget_0"] = 2048
+        return report
+
+    monkeypatch.setattr(interpret_mod, "interpret", _tamper)
+    result = session.apply_batch(f"svd_img2vid_conditioning.{field} = {new_value!r}")
+
+    assert result.ok is False
+    assert result.landed_ops == ()
+    diagnostic = next(
+        item for item in result.diagnostics if item.code == "unattributed_value_change"
+    )
+    assert {change["field"] for change in diagnostic.detail["changes"]} == {
+        "widget_0"
+    }
+    assert session.workflow.nodes["1"].widgets["widget_0"] == 1024
+
+
+def test_python_and_typed_tool_lower_to_same_canonical_delta_and_ir() -> None:
+    python_session = _session()
+    tool_session = _session()
+
+    python_result = python_session.apply_batch("ksampler.steps = 25\n")
+    tool_result = apply_edit_tool_call(
+        tool_session,
+        "edit_node",
+        {"target": "ksampler", "field": "steps", "value": 25},
+        expected_revision=0,
+    )
+
+    assert python_result.ok and python_result.apply_eligible
+    assert tool_result.ok and tool_result.revision == 1
+    assert tool_result.delta_id is not None
+    assert tool_result.landed_ops == python_result.landed_ops
+    assert editable_signature(tool_session.workflow) == editable_signature(
+        python_session.workflow
+    )
+    assert tool_result.graph == tool_session.working_ui
+    assert close_terminal_checkpoint(tool_session).delta_ids == (
+        tool_result.delta_id,
+    ) == close_terminal_checkpoint(python_session).delta_ids
+
+
+def test_typed_batch_is_atomic_when_one_op_is_invalid() -> None:
+    session = _session()
+    before = editable_signature(session.workflow)
+    before_ui = session.working_ui
+
+    ops = lower_edit_tool_call(
+        session,
+        "edit_batch",
+        {
+            "ops": [
+                {"op": "edit_node", "target": "ksampler", "field": "steps", "value": 25},
+                {"op": "edit_node", "target": "ksampler", "field": "made_up", "value": 1},
+            ]
+        },
+    )
+    result = session.apply_ops(ops, expected_revision=0)
+
+    assert not result.ok
+    assert result.reason == "unknown_field"
+    assert result.landed_ops == ()
+    assert session.history == ()
+    assert session.revision == 0
+    assert editable_signature(session.workflow) == before
+    assert session.working_ui == before_ui
+
+
+def test_typed_batch_can_set_a_node_added_earlier_by_explicit_uid() -> None:
+    session = _session()
+
+    result = apply_edit_tool_call(
+        session,
+        "edit_batch",
+        {
+            "ops": [
+                {
+                    "op": "add_node",
+                    "class_type": "CLIPTextEncode",
+                    "uid": "batch-prompt",
+                    "fields": {"text": "added text"},
+                    "inputs": {"clip": "checkpointloadersimple"},
+                },
+                {
+                    "op": "edit_node",
+                    "target": "batch-prompt",
+                    "field": "text",
+                    "value": "changed text",
+                },
+            ]
+        },
+        expected_revision=0,
+    )
+
+    assert result.ok
+    assert result.revision == 1
+    assert len(result.landed_ops) == 1
+    assert result.landed_ops[0].uid == "batch-prompt"
+    assert result.landed_ops[0].fields["text"] == "changed text"
+
+
+def test_typed_batch_can_add_and_connect_preceding_new_nodes() -> None:
+    session = _session()
+
+    result = apply_edit_tool_call(
+        session,
+        "edit_batch",
+        {
+            "ops": [
+                {
+                    "op": "add_node",
+                    "class_type": "CLIPTextEncode",
+                    "uid": "batch-prompt",
+                    "fields": {"text": "added text"},
+                    "inputs": {"clip": "checkpointloadersimple"},
+                },
+                {
+                    "op": "add_node",
+                    "class_type": "KSampler",
+                    "uid": "batch-sampler",
+                    "fields": {
+                        "seed": 42,
+                        "steps": 20,
+                        "cfg": 8,
+                        "sampler_name": "euler",
+                        "scheduler": "normal",
+                        "denoise": 1.0,
+                    },
+                    "inputs": {
+                        "model": "checkpointloadersimple",
+                        "positive": "cliptextencode",
+                        "negative": "cliptextencode_2",
+                        "latent_image": "emptylatentimage",
+                    },
+                },
+                {
+                    "op": "upsert_link",
+                    "source": "batch-prompt",
+                    "target": "batch-sampler",
+                    "target_input": "positive",
+                },
+                {
+                    "op": "add_node",
+                    "class_type": "VAEDecode",
+                    "uid": "batch-decode",
+                    "inputs": {
+                        "samples": "batch-sampler",
+                        "vae": "checkpointloadersimple",
+                    },
+                },
+            ]
+        },
+        expected_revision=0,
+    )
+
+    assert result.ok
+    assert result.revision == session.revision == 1
+    node_ids = {
+        node["properties"]["vibecomfy_uid"]: str(node["id"])
+        for node in session.working_ui["nodes"]
+        if node.get("properties", {}).get("vibecomfy_uid", "").startswith("batch-")
+    }
+    assert set(node_ids) == {"batch-prompt", "batch-sampler", "batch-decode"}
+    ui_links = session.working_ui["links"]
+    prompt_to_sampler = next(
+        link
+        for link in ui_links
+        if str(link[1]) == node_ids["batch-prompt"]
+        and str(link[3]) == node_ids["batch-sampler"]
+        and link[4] == 1
+    )
+    sampler_to_decode = next(
+        link
+        for link in ui_links
+        if str(link[1]) == node_ids["batch-sampler"]
+        and str(link[3]) == node_ids["batch-decode"]
+        and link[4] == 0
+    )
+    assert prompt_to_sampler[2] == 0
+    assert sampler_to_decode[2] == 0
+    sampler_ui = next(
+        node for node in session.working_ui["nodes"]
+        if str(node["id"]) == node_ids["batch-sampler"]
+    )
+    positive = next(entry for entry in sampler_ui["inputs"] if entry["name"] == "positive")
+    assert positive["link"] == prompt_to_sampler[0]
+    assert any(
+        edge.from_node == node_ids["batch-sampler"]
+        and edge.to_node == node_ids["batch-decode"]
+        and edge.to_input == "samples"
+        for edge in session.workflow.edges
+    )
+
+
+def test_typed_batch_can_connect_new_node_to_existing_node() -> None:
+    session = _session()
+
+    result = apply_edit_tool_call(
+        session,
+        "edit_batch",
+        {
+            "ops": [
+                {
+                    "op": "add_node",
+                    "class_type": "CLIPTextEncode",
+                    "uid": "batch-prompt",
+                    "fields": {"text": "replacement positive prompt"},
+                    "inputs": {"clip": "checkpointloadersimple"},
+                },
+                {
+                    "op": "upsert_link",
+                    "source": "batch-prompt",
+                    "target": "ksampler",
+                    "target_input": "positive",
+                },
+            ]
+        },
+        expected_revision=0,
+    )
+
+    assert result.ok
+    assert result.revision == session.revision == 1
+    ui_nodes = session.working_ui["nodes"]
+    new_node = next(
+        node for node in ui_nodes
+        if node.get("properties", {}).get("vibecomfy_uid") == "batch-prompt"
+    )
+    sampler = next(
+        node for node in ui_nodes
+        if str(node["id"]) == "5"
+    )
+    positive = next(entry for entry in sampler["inputs"] if entry["name"] == "positive")
+    link = next(
+        item for item in session.working_ui["links"]
+        if item[0] == positive["link"]
+    )
+    assert str(link[1]) == str(new_node["id"])
+    assert link[2] == 0
+    assert str(link[3]) == str(sampler["id"])
+    assert link[4] == 1
+    assert any(
+        edge.from_node == str(new_node["id"])
+        and edge.to_node == str(sampler["id"])
+        and edge.to_input == "positive"
+        for edge in session.workflow.edges
+    )
+    assert not any(
+        edge.from_node == "2"
+        and edge.to_node == str(sampler["id"])
+        and edge.to_input == "positive"
+        for edge in session.workflow.edges
+    )
+
+
+def test_typed_batch_add_then_invalid_edit_rolls_back_atomically() -> None:
+    session = _session()
+    before = editable_signature(session.workflow)
+    before_ui = session.working_ui
+
+    ops = lower_edit_tool_call(
+        session,
+        "edit_batch",
+        {
+            "ops": [
+                {
+                    "op": "add_node",
+                    "class_type": "CLIPTextEncode",
+                    "uid": "batch-prompt",
+                    "fields": {"text": "added text"},
+                    "inputs": {"clip": "checkpointloadersimple"},
+                },
+                {
+                    "op": "edit_node",
+                    "target": "batch-prompt",
+                    "field": "made_up",
+                    "value": 1,
+                },
+            ]
+        },
+    )
+    result = session.apply_ops(ops, expected_revision=0)
+
+    assert not result.ok
+    assert any(diagnostic.code == "unknown_field" for diagnostic in result.diagnostics)
+    assert result.landed_ops == ()
+    assert session.history == ()
+    assert session.revision == 0
+    assert editable_signature(session.workflow) == before
+    assert session.working_ui == before_ui
+
+
+def test_typed_batch_rejects_forward_or_unidentified_add_targets() -> None:
+    session = _session()
+
+    with pytest.raises(EditToolError) as forward:
+        lower_edit_tool_call(
+            session,
+            "edit_batch",
+            {
+                "ops": [
+                    {
+                        "op": "edit_node",
+                        "target": "batch-latent",
+                        "field": "width",
+                        "value": 1024,
+                    },
+                    {
+                        "op": "add_node",
+                        "class_type": "EmptyLatentImage",
+                        "uid": "batch-latent",
+                    },
+                ]
+            },
+        )
+    assert forward.value.code == "unknown_target"
+
+    with pytest.raises(EditToolError) as missing:
+        lower_edit_tool_call(
+            session,
+            "edit_batch",
+            {
+                "ops": [
+                    {"op": "add_node", "class_type": "EmptyLatentImage"},
+                    {
+                        "op": "edit_node",
+                        "target": "batch-latent",
+                        "field": "width",
+                        "value": 1024,
+                    },
+                ]
+            },
+        )
+    assert missing.value.code == "unknown_target"
+
+
+def test_typed_batch_rejects_duplicate_explicit_add_identity() -> None:
+    session = _session()
+
+    with pytest.raises(EditToolError) as duplicate:
+        lower_edit_tool_call(
+            session,
+            "edit_batch",
+            {
+                "ops": [
+                    {
+                        "op": "add_node",
+                        "class_type": "EmptyLatentImage",
+                        "uid": "batch-latent",
+                    },
+                    {
+                        "op": "add_node",
+                        "class_type": "EmptyLatentImage",
+                        "uid": "batch-latent",
+                    },
+                ]
+            },
+        )
+    assert duplicate.value.code == "duplicate_identity"
+
+
+def test_stale_revision_fails_closed_without_mutation() -> None:
+    session = _session()
+    accepted = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "steps", "value": 25},
+        expected_revision=0,
+    )
+    stale = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "cfg", "value": 6.0},
+        expected_revision=0,
+    )
+
+    assert accepted.ok
+    assert not stale.ok and stale.reason == "stale_revision"
+    assert stale.revision == session.revision == 1
+    assert len(session.history) == 1
+
+
+def test_unknown_schema_and_wrong_channel_are_rejected() -> None:
+    session = _session()
+    with pytest.raises(EditToolError, match="unknown render binding"):
+        lower_edit_tool_call(
+            session, "edit_node", {"target": "forged", "field": "steps", "value": 25}
+        )
+
+    with pytest.raises(EditToolError, match="non-positional"):
+        lower_edit_tool_call(
+            session, "edit_node", {"target": "ksampler", "field": "widget_2", "value": 25}
+        )
+
+    # KSampler's model input is a socket, not a literal widget channel.
+    result = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "model", "value": "forged"},
+        expected_revision=0,
+    )
+    assert not result.ok
+    assert result.reason in {"wrong_channel", "unknown_field"}
+    assert session.history == ()
+
+
+def test_closed_checkpoint_preserves_accepted_delta_on_later_failure() -> None:
+    session = _session()
+    accepted = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "steps", "value": 25},
+        expected_revision=0,
+    )
+    assert accepted.ok
+    checkpoint = close_terminal_checkpoint(
+        session,
+        facts={"fact:steps": {"uid": "5", "value": 25}},
+        evidence_ids=("evidence:node-schema:KSampler",),
+    )
+
+    projection = checkpoint.project(
+        failure="reply continuation failed",
+        claims={
+            "delta_ids": [checkpoint.delta_ids[0]],
+            "fact_ids": ["fact:steps"],
+            "evidence_ids": ["evidence:node-schema:KSampler"],
+        },
+    )
+    assert projection.accepted
+    assert projection.landed_count == 1
+    assert projection.graph == accepted.graph
+    assert projection.failure == "reply continuation failed"
+    assert projection.terminal_state == "applied"
+    retry = checkpoint.project(
+        failure="reply continuation failed",
+        claims={
+            "delta_ids": [checkpoint.delta_ids[0]],
+            "fact_ids": ["fact:steps"],
+            "evidence_ids": ["evidence:node-schema:KSampler"],
+        },
+    )
+    assert retry.authority_fields() == projection.authority_fields()
+
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    [
+        ("delta_ids", "delta:forged"),
+        ("fact_ids", "fact:forged"),
+        ("evidence_ids", "evidence:forged"),
+    ],
+)
+def test_closed_checkpoint_rejects_forged_claim_references(field: str, forged: str) -> None:
+    session = _session()
+    result = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "steps", "value": 25},
+    )
+    assert result.ok
+    checkpoint = close_terminal_checkpoint(
+        session, facts={"fact:steps": 25}, evidence_ids=("evidence:real",)
+    )
+
+    with pytest.raises(ClaimReferenceError) as exc_info:
+        checkpoint.project(claims={field: [forged]})
+    assert exc_info.value.unknown[field] == (forged,)
+
+
+def test_rollback_advances_revision_to_prevent_aba() -> None:
+    session = _session()
+    result = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "steps", "value": 25},
+        expected_revision=0,
+    )
+    assert result.ok and session.revision == 1
+    assert session.rollback()
+    assert session.revision == 2
+    stale = apply_edit_tool_call(
+        session,
+        "edit_node",
+        {"target": "ksampler", "field": "steps", "value": 30},
+        expected_revision=0,
+    )
+    assert not stale.ok and stale.reason == "stale_revision"
+
+
+def _ksampler_uid(session: EditSession) -> str:
+    for node in session.workflow.nodes.values():
+        if node.class_type == "KSampler":
+            return str(node.uid)
+    raise AssertionError("KSampler missing from fixture graph")
+
+
+def _schema_pair(session: EditSession, *, extra_missing: str | None = "LayerMask: SegmentAnythingUltra V3"):
+    from vibecomfy.porting.edit.admit import AdmissionSnapshot
+    from vibecomfy.schema import capture_schema_snapshot
+
+    uid = _ksampler_uid(session)
+    node_classes = {uid: "KSampler"}
+    class_types = ["KSampler"]
+    object_info = {
+        "KSampler": {
+            "input": {
+                "required": {
+                    "steps": ["INT", {}],
+                    "cfg": ["FLOAT", {}],
+                    "seed": ["INT", {}],
+                    "model": ["MODEL", {}],
+                    "positive": ["CONDITIONING", {}],
+                    "negative": ["CONDITIONING", {}],
+                    "latent_image": ["LATENT", {}],
+                }
+            },
+            "output": ["LATENT"],
+        }
+    }
+    if extra_missing:
+        class_types.append(extra_missing)
+        node_classes["34"] = extra_missing
+    schema = capture_schema_snapshot(
+        class_types=class_types,
+        connected_object_info=object_info,
+        connected_object_info_verified=True,
+        node_classes=node_classes,
+    )
+    return AdmissionSnapshot(workflow=session.workflow_snapshot, schema=schema), uid
+
+
+def test_admit_operation_families_and_fail_closed_unknown_touched() -> None:
+    from vibecomfy.porting.edit.admit import (
+        AdmissionAllowed,
+        AdmissionRejected,
+        admit_operation,
+        admit_operations,
+    )
+
+    session = _session()
+    pair, uid = _schema_pair(session)
+    families = {
+        "field": {"op": "set_node_field", "target": ["", uid, "steps"], "value": 25},
+        "mode": {"op": "set_mode", "target": ["", uid], "mode": 2},
+        "remove": {"op": "remove_node", "target": ["", uid]},
+        "layout": {"op": "set_node_geometry", "uid": uid, "pos": [1, 2], "size": [10, 10]},
+        "link": {
+            "op": "upsert_link",
+            "from": ["", uid, 0],
+            "to": ["", uid, "latent_image"],
+        },
+    }
+    for name, op in families.items():
+        result = admit_operation(pair, op)
+        assert isinstance(result, AdmissionAllowed), (name, result)
+        assert result.touched_scope.class_types
+        assert uid in result.touched_scope.identities or name == "layout"
+
+    add_unknown = {"op": "add_node", "class_type": "LayerMask: SegmentAnythingUltra V3", "uid": "34"}
+    layout_unknown = {"op": "set_node_geometry", "uid": "34", "pos": [0, 0], "size": [1, 1]}
+    for op in (add_unknown, layout_unknown):
+        rejected = admit_operation(pair, op)
+        assert isinstance(rejected, AdmissionRejected)
+        assert rejected.typed_reason == "missing_touched_schema"
+        assert rejected.evidence_refs
+        assert any("schema_snapshot:" in ref for ref in rejected.evidence_refs)
+
+    group_op = {"op": "add_group", "id": "g1", "bounding": [0, 0, 10, 10], "title": "box", "color": None}
+    assert isinstance(admit_operation(pair, group_op), AdmissionAllowed)
+
+    mixed = admit_operations(
+        pair,
+        [families["field"], add_unknown],
+        working_workflow=session.workflow,
+    )
+    assert isinstance(mixed, AdmissionRejected)
+    assert mixed.typed_reason == "missing_touched_schema"
+
+
+def test_rejected_proposal_never_enters_accepted_delta_or_visible_candidate() -> None:
+    from vibecomfy.porting.edit.admit import AdmissionRejected, admit_operation
+    from vibecomfy.porting.edit.ops import NodeFieldTarget, SetNodeFieldOp
+
+    session = _session()
+    pair, _uid = _schema_pair(session)
+    before_ui = session.working_ui
+    before_ops = tuple(session.landed_ops)
+    unknown = {"op": "set_node_geometry", "uid": "34", "pos": [0, 0], "size": [8, 8]}
+    result = admit_operation(pair, unknown)
+    assert isinstance(result, AdmissionRejected)
+    apply_result = session.apply_ops(
+        [
+            SetNodeFieldOp(
+                op="set_node_field",
+                target=NodeFieldTarget("", "missing", "steps"),
+                value=1,
+            )
+        ]
+    )
+    assert not apply_result.ok
+    assert apply_result.landed_ops == ()
+    assert tuple(session.landed_ops) == before_ops
+    assert session.working_ui == before_ui
+    assert session.history == ()
+
+
+def test_layout_ops_use_the_same_admit_operation_gateway() -> None:
+    from vibecomfy.comfy_nodes.agent import layout_operation_v1
+    from vibecomfy.porting.edit.admit import (
+        AdmissionAllowed,
+        AdmissionRejected,
+        admit_operation,
+        rejected_ops_are_invisible,
+    )
+
+    session = _session()
+    pair, uid = _schema_pair(session, extra_missing=None)
+    ops = [
+        {"op": "set_node_geometry", "uid": uid, "pos": [4, 5]},
+        {"op": "add_group", "id": "g-new", "bounding": [0, 0, 20, 20], "title": "g", "color": None},
+        {"op": "set_group_geometry", "id": "missing-group", "bounding": [1, 1, 2, 2]},
+        {"op": "remove_group", "id": "missing-group"},
+    ]
+    allowed = admit_operation(pair, ops[0])
+    assert isinstance(allowed, AdmissionAllowed)
+    added = admit_operation(pair, ops[1], working_workflow=session.workflow)
+    assert isinstance(added, AdmissionAllowed)
+    missing_group = admit_operation(pair, ops[2], working_workflow=session.workflow)
+    assert isinstance(missing_group, AdmissionRejected)
+    assert missing_group.typed_reason == "unknown_target"
+    assert rejected_ops_are_invisible(missing_group) is True
+    assert rejected_ops_are_invisible(allowed) is False
+
+    normalized = layout_operation_v1._normalize_layout_op(ops[0], snapshot=pair, working_workflow=session.workflow)
+    assert normalized["op"] == "set_node_geometry"
+    try:
+        layout_operation_v1._normalize_layout_op(ops[2], snapshot=pair, working_workflow=session.workflow)
+        raise AssertionError("missing group must be rejected by the one gateway")
+    except layout_operation_v1.LayoutOperationError as exc:
+        assert exc.code == "unknown_target"
+
+    admit_fns = [
+        name
+        for name, obj in __import__("inspect").getmembers(layout_operation_v1, __import__("inspect").isfunction)
+        if "admit" in name.lower()
+    ]
+    assert admit_fns == []
+
+
+def test_admit_operation_does_not_mutate_snapshots() -> None:
+    from copy import deepcopy
+
+    from vibecomfy.porting.edit.admit import admit_operation
+
+    session = _session()
+    pair, uid = _schema_pair(session)
+    before_workflow = deepcopy(pair.workflow.semantic_digest)
+    before_schema = deepcopy(pair.schema.content_digest)
+    before_classes = dict(pair.schema.node_classes)
+    admit_operation(pair, {"op": "set_node_field", "target": ["", uid, "steps"], "value": 7})
+    admit_operation(pair, {"op": "set_node_geometry", "uid": "34", "pos": [0, 0], "size": [1, 1]})
+    assert pair.workflow.semantic_digest == before_workflow
+    assert pair.schema.content_digest == before_schema
+    assert dict(pair.schema.node_classes) == before_classes
+
+
+def test_rejected_typed_dsl_op_does_not_land_or_commit() -> None:
+    from vibecomfy.porting.edit._interpret import interpret
+    from vibecomfy.porting.edit.ops import NodeFieldTarget, SetNodeFieldOp
+
+    session = _session()
+    pair, _uid = _schema_pair(session)
+    session.schema_provider = pair.schema
+    before = {node.uid: dict(node.widgets) for node in session.workflow.nodes.values()}
+    rejected = SetNodeFieldOp(
+        op="set_node_field",
+        target=NodeFieldTarget("", "missing-uid", "steps"),
+        value=99,
+    )
+    result = interpret(session.workflow, (rejected,), schema_provider=session.schema_provider)
+    assert result.ok is False
+    assert result.landed_ops == ()
+    after = {node.uid: dict(node.widgets) for node in session.workflow.nodes.values()}
+    assert after == before
+
+
+def test_python_source_dsl_rejected_op_mutates_nothing() -> None:
+    session = _session()
+    pair, _uid = _schema_pair(session)
+    session.schema_provider = pair.schema
+    before_sig = editable_signature(session.workflow)
+    before_ops = tuple(session.landed_ops)
+    result = session.apply_batch("missing_node.steps = 99\n")
+    assert result.ok is False
+    assert result.landed_ops == ()
+    assert tuple(session.landed_ops) == before_ops
+    assert editable_signature(session.workflow) == before_sig
+    assert session.history == ()
+
+
+def test_apply_and_lint_block_every_typed_rejection() -> None:
+    from vibecomfy.porting.edit.apply_gate import verify_apply
+    from vibecomfy.porting.edit.lint import LintIndex, lint_delta
+    from vibecomfy.porting.edit.ops import NodeFieldTarget, SetNodeFieldOp
+
+    session = _session()
+    pair, _uid = _schema_pair(session)
+    malformed = SetNodeFieldOp(op="set_node_field", target=NodeFieldTarget("", "missing-uid", "steps"), value=1)
+    unknown_layout = {"op": "set_node_geometry", "uid": "34", "pos": [0, 0], "size": [8, 8]}
+    from vibecomfy.porting.edit._ir_utils import _cow_workflow_copy
+
+    post = _cow_workflow_copy(session.workflow)
+    gate = verify_apply(
+        session.workflow,
+        post,
+        landed_ops=(malformed,),
+        schema_provider=pair.schema,
+    )
+    assert gate.ok is False
+    assert gate.apply_eligible is False
+    assert gate.reason in {"unknown_target", "missing_touched_schema", "malformed_op"}
+
+    pre_ui_payload = session.working_ui
+    index = LintIndex.build(pre_ui_payload)
+    lint = lint_delta(
+        [malformed],
+        index,
+        schema_provider=pair.schema,
+        retained_authority=pair,
+        pre_workflow=session.workflow,
+        pre_ui_payload=pre_ui_payload,
+        schema_snapshot=pair.schema,
+    )
+    assert lint.surviving == ()
+    assert any(issue.code for issue in lint.issues)
+
+    from vibecomfy.porting.edit.admit import AdmissionRejected, admit_operation
+
+    rejected = admit_operation(pair, unknown_layout, working_workflow=session.workflow)
+    assert isinstance(rejected, AdmissionRejected)
+    layout_gate = verify_apply(
+        session.workflow,
+        post,
+        landed_ops=(unknown_layout,),
+        schema_provider=pair.schema,
+    )
+    assert layout_gate.ok is False
+
+
+def test_snapshot_none_fails_closed_on_semantic_and_layout_paths() -> None:
+    from vibecomfy.comfy_nodes.agent import layout_operation_v1
+    from vibecomfy.porting.edit.admit import (
+        AdmissionRejected,
+        admission_snapshot_for,
+        admit_operation,
+        admit_operations,
+    )
+    from vibecomfy.porting.edit.ops import EditOpParseError, require_known_schema_for_operation
+
+    unknown = {"op": "add_node", "class_type": "LayerMask: SegmentAnythingUltra V3", "uid": "34"}
+    field = {"op": "set_node_field", "target": ["", "5", "steps"], "value": 25}
+    geometry = {"op": "set_node_geometry", "uid": "5", "pos": [1, 2]}
+
+    for op in (unknown, field, geometry):
+        result = admit_operation(None, op)
+        assert isinstance(result, AdmissionRejected)
+        assert result.typed_reason == "missing_touched_schema"
+        assert result.evidence_refs
+
+    batch = admit_operations(None, [field])
+    assert isinstance(batch, AdmissionRejected)
+
+    # The layout parser normalizes syntax before the common admission gate; the
+    # gate is the fail-closed authority when no retained snapshot exists.
+    normalized_geometry = layout_operation_v1._normalize_layout_op(geometry)
+    assert normalized_geometry["op"] == "set_node_geometry"
+    layout_rejected = admit_operation(None, normalized_geometry)
+    assert isinstance(layout_rejected, AdmissionRejected)
+    assert layout_rejected.typed_reason == "missing_touched_schema"
+
+    admitted = admit_operations(admission_snapshot_for(None, None), [unknown])
+    assert isinstance(admitted, AdmissionRejected)
+    assert admitted.typed_reason == "missing_touched_schema"
+
+    try:
+        require_known_schema_for_operation(unknown, None)
+        raise AssertionError("None snapshot must fail closed for semantic ops")
+    except EditOpParseError as exc:
+        assert exc.code == "missing_touched_schema"
+
+
+
+
+def test_consumer_routing_is_behavioral_not_substring() -> None:
+    import inspect
+
+    from vibecomfy.comfy_nodes.agent import edit as agent_edit
+    from vibecomfy.executor import edit_suggestion_tools
+    from vibecomfy.porting.edit import _interpret
+    from vibecomfy.porting.edit.ops import NodeFieldTarget, SetNodeFieldOp
+
+    assert not hasattr(agent_edit, "_admit_operation")
+    rank_source = inspect.getsource(edit_suggestion_tools.rank_edit_targets)
+    assert "_ = admit_operation" not in rank_source
+    apply_source = inspect.getsource(_interpret._InterpretRunner._apply)
+    evaluator_source = inspect.getsource(_interpret._evaluate_operation)
+    assert "_evaluate_operation" in apply_source
+    assert "admit_operation" in evaluator_source
+
+    session = _session()
+    pair, _uid = _schema_pair(session)
+    session.schema_provider = pair.schema
+    before_ops = tuple(session.landed_ops)
+    before_sig = editable_signature(session.workflow)
+    rejected = session.apply_ops(
+        [
+            SetNodeFieldOp(
+                op="set_node_field",
+                target=NodeFieldTarget("", "missing-uid", "steps"),
+                value=1,
+            )
+        ]
+    )
+    assert rejected.ok is False
+    assert rejected.landed_ops == ()
+    assert tuple(session.landed_ops) == before_ops
+    assert editable_signature(session.workflow) == before_sig
+
+    python = session.apply_batch(f"ksampler.made_up = 1\n")
+    assert python.ok is False
+    assert python.landed_ops == ()
+    assert tuple(session.landed_ops) == before_ops
+
+
+def test_close_without_gateway_or_replay_is_rejected() -> None:
+    from vibecomfy.porting.edit.checkpoint import TerminalCloseError
+
+    with pytest.raises(TerminalCloseError):
+        close_terminal_checkpoint(
+            terminal_state="applied",
+            original_graph={"nodes": [], "links": []},
+            ops=({"op": "set_node_field"},),
+            admitted=None,
+            replay_verified=True,
+        )

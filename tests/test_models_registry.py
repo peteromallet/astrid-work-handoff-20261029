@@ -1,0 +1,1327 @@
+from __future__ import annotations
+
+import ast
+import errno
+import hashlib
+import os
+import re
+import socket
+import stat
+import warnings
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("dotenv", reason="requires runpod-launch extra (python-dotenv)")
+
+from vibecomfy.registry import models_loader
+from vibecomfy.registry.models_loader import (
+    ModelFile,
+    ModelEntry,
+    ModelSource,
+    ModelTarget,
+    canonical_filename,
+    composite_sha256,
+    load_registry,
+    normalize_alias,
+    resolve_model_entry,
+    stage_entry,
+    stage_many,
+)
+
+
+def _write_registry(path: Path, body: str) -> Path:
+    path.write_text(body, encoding="utf-8")
+    models_loader._clear_cache()
+    return path
+
+
+def _sample_registry(path: Path) -> Path:
+    return _write_registry(
+        path,
+        """
+models:
+  - id: sample
+    source:
+      kind: huggingface
+      repo: example/repo
+      filename: nested/model.bin
+    min_size: 3
+    targets:
+      - node_pack: comfy_gguf
+        path: checkpoints/model.bin
+      - node_pack: comfy_core
+        path: diffusion_models/model.bin
+    aliases:
+      - alias.bin
+    tags:
+      - phase:core
+    notes: sample model
+""",
+    )
+
+
+def test_load_registry_roundtrip_sample(tmp_path: Path) -> None:
+    entries = load_registry(_sample_registry(tmp_path / "models.yaml"))
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry == ModelEntry(
+        id="sample",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="nested/model.bin"),
+        min_size=3,
+        targets=(
+            ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),
+            ModelTarget(node_pack="comfy_core", path="diffusion_models/model.bin"),
+        ),
+        aliases=("alias.bin",),
+        tags=("phase:core",),
+        notes="sample model",
+    )
+
+
+def test_registry_rejects_legacy_gated_magic_literals(tmp_path: Path) -> None:
+    entries = load_registry(_sample_registry(tmp_path / "sample_models.yaml"))
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        """
+models:
+  - id: gated
+    source:
+      kind: huggingface
+      repo: example/repo
+      filename: model.bin
+      revision: gated
+    min_size: 1
+    sha256: gated
+    targets:
+      - node_pack: comfy_gguf
+        path: checkpoints/model.bin
+""",
+    )
+
+    with pytest.raises(ValueError, match="gated: true"):
+        load_registry(registry)
+    assert canonical_filename("sample", registry=entries) == "model.bin"
+
+
+def test_stage_entry_hardlinks_or_symlinks_all_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda repo_id, filename: str(source))
+    entry = load_registry(_sample_registry(tmp_path / "models.yaml"))[0]
+    models_root = tmp_path / "models-root"
+
+    staged_paths = stage_entry(entry, models_root=models_root)
+
+    assert staged_paths == [
+        models_root / "checkpoints/model.bin",
+        models_root / "checkpoints/alias.bin",
+        models_root / "diffusion_models/model.bin",
+        models_root / "diffusion_models/alias.bin",
+    ]
+    for staged in staged_paths:
+        assert staged.read_bytes() == b"model-bytes"
+        assert staged.exists()
+
+
+def test_load_registry_preserves_reproducibility_pins_and_dry_run_reports_them(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    digest = hashlib.sha256(b"model-bytes").hexdigest()
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        f"""
+models:
+  - id: pinned
+    source:
+      kind: huggingface
+      repo: example/repo
+      filename: nested/model.bin
+      revision: abc123
+    min_size: 1
+    sha256: {digest}
+    size_bytes: 11
+    targets:
+      - node_pack: comfy_gguf
+        path: checkpoints/model.bin
+""",
+    )
+
+    entry = load_registry(registry)[0]
+
+    assert entry.source.revision == "abc123"
+    assert entry.sha256 == digest
+    assert entry.size_bytes == 11
+    models_loader._print_dry_run([entry], models_root=tmp_path / "models")
+    output = capsys.readouterr().out
+    assert "hf://example/repo/nested/model.bin@abc123" in output
+    assert f"sha256={digest}" in output
+    assert "revision=abc123" in output
+    assert "size_bytes=11" in output
+
+
+def test_stage_entry_passes_hf_revision_and_verifies_pins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payload = b"model-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(payload)
+    calls: list[dict[str, str]] = []
+
+    def fake_hf_download(**kwargs: str) -> str:
+        calls.append(kwargs)
+        return str(source)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_download)
+    entry = ModelEntry(
+        id="pinned",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin", revision="abc123"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        sha256=digest,
+        size_bytes=len(payload),
+    )
+
+    staged_paths = stage_entry(entry, models_root=tmp_path / "models")
+
+    assert calls == [{"repo_id": "example/repo", "filename": "model.bin", "revision": "abc123"}]
+    assert staged_paths[0].read_bytes() == payload
+
+
+def test_stage_entry_keeps_existing_target_that_satisfies_pins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payload = b"model-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(payload)
+    target = tmp_path / "models" / "checkpoints" / "model.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    calls: list[object] = []
+
+    def fake_hf_download(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return str(source)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_download)
+    entry = ModelEntry(
+        id="pinned",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        sha256=digest,
+        size_bytes=len(payload),
+    )
+
+    staged_paths = stage_entry(entry, models_root=tmp_path / "models")
+
+    assert staged_paths == [target]
+    assert calls == []
+    assert target.read_bytes() == payload
+
+
+def test_stage_entry_creates_alias_for_existing_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payload = b"model-bytes"
+    target = tmp_path / "models" / "checkpoints" / "model.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    calls: list[object] = []
+
+    def fake_hf_download(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return str(tmp_path / "should-not-download")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_download)
+    entry = ModelEntry(
+        id="aliased",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        aliases=("alias.bin",),
+    )
+
+    staged_paths = stage_entry(entry, models_root=tmp_path / "models")
+
+    alias = tmp_path / "models" / "checkpoints" / "alias.bin"
+    assert staged_paths == [target, alias]
+    assert alias.read_bytes() == payload
+    assert calls == []
+
+
+def test_load_registry_supports_composite_files_and_deterministic_hash(tmp_path: Path) -> None:
+    first = hashlib.sha256(b"first").hexdigest()
+    second = hashlib.sha256(b"second").hexdigest()
+    files = (
+        ModelFile(path="encoder/model.bin", sha256=first, size_bytes=5),
+        ModelFile(path="decoder/model.bin", sha256=second, size_bytes=6),
+    )
+    composite = composite_sha256(files)
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        f"""
+models:
+  - id: composite
+    source:
+      kind: huggingface
+      repo: example/repo
+      revision: abc123
+    min_size: 1
+    composite_sha256: {composite}
+    files:
+      - path: encoder/model.bin
+        sha256: {first}
+        size_bytes: 5
+      - path: decoder/model.bin
+        sha256: {second}
+        size_bytes: 6
+    targets:
+      - node_pack: comfy_gguf
+        path: diffusion_models/composite
+""",
+    )
+
+    entry = load_registry(registry)[0]
+
+    assert entry.files == files
+    assert entry.composite_sha256 == composite
+    assert composite_sha256(tuple(reversed(files))) == composite
+
+
+def test_stage_entry_stages_composite_child_files_and_verifies_pins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payloads = {
+        "encoder/model.bin": b"first",
+        "decoder/model.bin": b"second",
+    }
+    source_root = tmp_path / "hf"
+    for relative, payload in payloads.items():
+        path = source_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    calls: list[dict[str, str]] = []
+
+    def fake_hf_download(**kwargs: str) -> str:
+        calls.append(kwargs)
+        return str(source_root / kwargs["filename"])
+
+    files = tuple(
+        ModelFile(path=relative, sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload))
+        for relative, payload in payloads.items()
+    )
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_download)
+    entry = ModelEntry(
+        id="composite",
+        source=ModelSource(kind="huggingface", repo="example/repo", revision="abc123"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="diffusion_models/composite"),),
+        files=files,
+        composite_sha256=composite_sha256(files),
+    )
+
+    staged_paths = stage_entry(entry, models_root=tmp_path / "models")
+
+    assert calls == [
+        {"repo_id": "example/repo", "filename": "encoder/model.bin", "revision": "abc123"},
+        {"repo_id": "example/repo", "filename": "decoder/model.bin", "revision": "abc123"},
+    ]
+    assert staged_paths == [
+        tmp_path / "models" / "diffusion_models/composite/encoder/model.bin",
+        tmp_path / "models" / "diffusion_models/composite/decoder/model.bin",
+    ]
+    assert [path.read_bytes() for path in staged_paths] == [b"first", b"second"]
+
+
+def test_stage_entry_rejects_pinned_sha_or_size_mismatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda repo_id, filename: str(source))
+    entry = ModelEntry(
+        id="pinned",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        sha256="0" * 64,
+        size_bytes=len(b"model-bytes") + 1,
+    )
+
+    with pytest.raises(RuntimeError, match="pinned size_bytes"):
+        stage_entry(entry, models_root=tmp_path / "models")
+
+
+def test_stage_entry_rejects_small_staged_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"tiny")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda repo_id, filename: str(source))
+    entry = ModelEntry(
+        id="small",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=100,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+    )
+
+    with pytest.raises(RuntimeError, match="small.*too small"):
+        stage_entry(entry, models_root=tmp_path / "models")
+
+
+def test_stage_entry_rejects_unrelated_existing_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"large-enough")
+    target = tmp_path / "models" / "checkpoints" / "model.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"unrelated-but-large-enough")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda repo_id, filename: str(source))
+    entry = ModelEntry(
+        id="collision",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=3,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        sha256=hashlib.sha256(b"large-enough").hexdigest(),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite unrelated existing file"):
+        stage_entry(entry, models_root=tmp_path / "models")
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo", "socket"])
+def test_stage_entry_rejects_non_regular_existing_target_without_mutating_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    models = tmp_path / "models"
+    target = models / "checkpoints/model.bin"
+    target.parent.mkdir(parents=True)
+    listener: socket.socket | None = None
+    if kind == "directory":
+        target.mkdir()
+    elif kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO is not supported on this platform")
+        os.mkfifo(target)
+    else:
+        if not hasattr(socket, "AF_UNIX"):
+            pytest.skip("Unix sockets are not supported on this platform")
+        listener = socket.socket(socket.AF_UNIX)
+        try:
+            listener.bind(str(target))
+        except OSError:
+            listener.close()
+            pytest.skip("Unix socket paths are not supported on this platform")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    entry = ModelEntry(
+        id=f"non_regular_{kind}",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="regular file|overwrite unrelated"):
+            stage_entry(entry, models_root=models)
+        assert target.exists() or target.is_symlink()
+        if kind == "directory":
+            assert target.is_dir()
+        elif kind == "fifo":
+            assert stat.S_ISFIFO(target.stat().st_mode)
+        else:
+            assert stat.S_ISSOCK(target.stat().st_mode)
+    finally:
+        if listener is not None:
+            listener.close()
+
+
+def test_normalize_alias_hits_and_misses(tmp_path: Path) -> None:
+    entries = load_registry(_sample_registry(tmp_path / "models.yaml"))
+
+    assert normalize_alias("alias.bin", registry=entries) == "model.bin"
+    assert normalize_alias("alias.bin", registry=entries, node_pack="comfy_gguf") == "model.bin"
+    assert normalize_alias("alias.bin", registry=entries, node_pack="missing") is None
+    assert normalize_alias("unknown.bin", registry=entries) is None
+
+
+def test_lookup_aliases_normalize_slashes_without_becoming_staging_aliases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        r"""
+models:
+  - id: qualified
+    source:
+      kind: huggingface
+      repo: example/repo
+      filename: model.bin
+    canonical_name: Pack/model.bin
+    min_size: 1
+    targets:
+      - node_pack: wan_wrapper
+        path: loras/target.bin
+    aliases:
+      - model.bin
+    lookup_aliases:
+      - Pack\model.bin
+""",
+    )
+    entries = load_registry(registry)
+    entry = entries[0]
+
+    assert resolve_model_entry("Pack/model.bin", registry=entries) is entry
+    assert resolve_model_entry(r"Pack\model.bin", registry=entries) is entry
+    assert normalize_alias(r"Pack\model.bin", registry=entries) == "Pack/model.bin"
+    models_loader._validate_staging_paths(entry, models_root=tmp_path / "models")
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"model")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    staged = stage_entry(entry, models_root=tmp_path / "models")
+    assert [path.relative_to(tmp_path / "models").as_posix() for path in staged] == [
+        "loras/target.bin",
+        "loras/model.bin",
+    ]
+    assert not (tmp_path / "models" / "loras" / "Pack" / "model.bin").exists()
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "foo/../bar", "foo/./bar", "/absolute/model.bin", r"C:\\model.bin"])
+def test_lookup_aliases_reject_non_relative_logical_paths(tmp_path: Path, bad: str) -> None:
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        f"""
+models:
+  - id: bad_lookup
+    source:
+      kind: huggingface
+      repo: example/repo
+      filename: model.bin
+    min_size: 1
+    targets:
+      - node_pack: wan_wrapper
+        path: loras/model.bin
+    lookup_aliases: [{bad!r}]
+""",
+    )
+    with pytest.raises(ValueError, match="bad_lookup.*lookup"):
+        load_registry(registry)
+
+
+def test_lookup_index_fails_closed_on_cross_entry_canonical_collision(tmp_path: Path) -> None:
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        """
+models:
+  - id: first
+    source: {kind: url, url: https://example.test/first}
+    canonical_name: Pack\\model.bin
+    min_size: 1
+    targets: [{node_pack: wan_wrapper, path: loras/first.bin}]
+  - id: second
+    source: {kind: url, url: https://example.test/second}
+    canonical_name: Pack/model.bin
+    min_size: 1
+    targets: [{node_pack: wan_wrapper, path: loras/second.bin}]
+""",
+    )
+    with pytest.raises(ValueError, match="duplicate alias or model lookup key"):
+        load_registry(registry)
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "match"),
+    [
+        (
+            """
+    targets: [{node_pack: comfy_core, path: checkpoints/shared.bin}]
+""",
+            """
+    targets: [{node_pack: comfy_gguf, path: checkpoints/shared.bin}]
+""",
+            "checkpoints/shared.bin.*first.*second",
+        ),
+        (
+            """
+    targets: [{node_pack: comfy_core, path: checkpoints/owner.bin}]
+    aliases: [shared.bin]
+""",
+            """
+    targets: [{node_pack: comfy_gguf, path: checkpoints/shared.bin}]
+""",
+            "checkpoints/shared.bin.*first.*second",
+        ),
+        (
+            """
+    targets: [{node_pack: comfy_core, path: checkpoints}]
+    files: [{path: shared.bin}]
+""",
+            """
+    targets: [{node_pack: comfy_gguf, path: checkpoints/shared.bin}]
+""",
+            "checkpoints/shared.bin.*first.*second",
+        ),
+        (
+            """
+    targets: [{node_pack: comfy_core, path: Foo//bar.bin}]
+""",
+            """
+    targets: [{node_pack: comfy_gguf, path: foo/./bar.bin}]
+""",
+            "foo/bar.bin.*first.*second",
+        ),
+        (
+            """
+    targets: [{node_pack: comfy_core, path: Café/model.bin}]
+""",
+            """
+    targets: [{node_pack: comfy_gguf, path: cafe\u0301/MODEL.bin}]
+""",
+            "café/model.bin.*first.*second",
+        ),
+    ],
+)
+def test_load_registry_rejects_cross_entry_materialized_destination_collisions(
+    tmp_path: Path, first: str, second: str, match: str
+) -> None:
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        f"""
+models:
+  - id: first
+    source: {{kind: huggingface, repo: example/repo, filename: first, revision: test}}
+    min_size: 0
+{first}
+  - id: second
+    source: {{kind: huggingface, repo: example/repo, filename: second, revision: test}}
+    min_size: 0
+{second}
+""",
+    )
+    with pytest.raises(ValueError, match=match):
+        load_registry(registry)
+
+
+def test_lookup_only_alias_does_not_claim_a_materialized_destination(tmp_path: Path) -> None:
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        """
+models:
+  - id: lookup
+    source: {kind: url, url: https://example.test/lookup}
+    min_size: 0
+    targets: [{node_pack: comfy_core, path: checkpoints/lookup.bin}]
+    lookup_aliases: [checkpoints/shared.bin]
+  - id: materialized
+    source: {kind: url, url: https://example.test/materialized}
+    min_size: 0
+    targets: [{node_pack: comfy_gguf, path: checkpoints/shared.bin}]
+""",
+    )
+    entries = load_registry(registry)
+    assert [entry.id for entry in entries] == ["lookup", "materialized"]
+
+
+def test_shipped_flux2_vae_rows_have_distinct_exact_identity() -> None:
+    entries = {entry.id: entry for entry in load_registry()}
+    four_b = entries["flux2_vae_from_klein_4b"]
+    nine_b = entries["flux2_vae_from_klein_9b"]
+
+    assert (
+        four_b.source.repo,
+        four_b.source.filename,
+        four_b.source.revision,
+        four_b.size_bytes,
+        four_b.sha256,
+        four_b.canonical_name,
+        four_b.targets[0].path,
+    ) == (
+        "Comfy-Org/flux2-dev",
+        "split_files/vae/flux2-vae.safetensors",
+        "ab9055628ea245000e610f2aa2c96f4746093546",
+        336_213_556,
+        "d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5",
+        "flux2-vae.safetensors",
+        "vae/flux2-vae.safetensors",
+    )
+    assert (
+        nine_b.source.repo,
+        nine_b.source.filename,
+        nine_b.source.revision,
+        nine_b.size_bytes,
+        nine_b.sha256,
+        nine_b.canonical_name,
+        nine_b.targets[0].path,
+    ) == (
+        "Comfy-Org/vae-text-encorder-for-flux-klein-9b",
+        "split_files/vae/flux2-vae.safetensors",
+        "3f62d9d8ae1fec33c6e91453d5c712855b096b55",
+        336_211_292,
+        "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+        "flux2-klein-9b-vae.safetensors",
+        "vae/flux2-klein-9b-vae.safetensors",
+    )
+    assert canonical_filename(four_b.id, registry=tuple(entries.values())) == "flux2-vae.safetensors"
+    assert canonical_filename(nine_b.id, registry=tuple(entries.values())) == "flux2-klein-9b-vae.safetensors"
+    assert resolve_model_entry("flux2-vae.safetensors", registry=tuple(entries.values()), subdir="vae") is four_b
+
+
+@pytest.mark.parametrize("payload", [b"wrong-owner", b"unknown-large-file" * 10])
+def test_four_b_staging_preserves_preexisting_old_path_on_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, payload: bytes
+) -> None:
+    source = tmp_path / "hf" / "four-b.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"four-b-payload")
+    old_path = tmp_path / "models" / "vae" / "flux2-vae.safetensors"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(payload)
+    entry = ModelEntry(
+        id="flux2_vae_from_klein_4b",
+        source=ModelSource("huggingface", repo="Comfy-Org/flux2-dev", filename="split_files/vae/flux2-vae.safetensors", revision="four-b"),
+        min_size=1,
+        size_bytes=len(source.read_bytes()),
+        sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        targets=(ModelTarget("comfy_core", "vae/flux2-vae.safetensors"),),
+    )
+    monkeypatch.setattr(models_loader, "_download_source", lambda *_args, **_kwargs: source)
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        stage_entry(entry, models_root=tmp_path / "models")
+    assert old_path.read_bytes() == payload
+
+
+def test_four_b_staging_reports_and_preserves_known_legacy_nine_b_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    legacy_payload = b"legacy-nine-b"
+    old_path = tmp_path / "models" / "vae" / "flux2-vae.safetensors"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(legacy_payload)
+    entry = ModelEntry(
+        id="flux2_vae_from_klein_4b",
+        source=ModelSource("huggingface", repo="r", filename="four", revision="four"),
+        min_size=1,
+        targets=(ModelTarget("comfy_core", "vae/flux2-vae.safetensors"),),
+    )
+    monkeypatch.setattr(models_loader, "_FLUX2_9B_SIZE_BYTES", len(legacy_payload))
+    monkeypatch.setattr(models_loader, "_FLUX2_9B_SHA256", hashlib.sha256(legacy_payload).hexdigest())
+    monkeypatch.setattr(models_loader, "_download_source", lambda *_args, **_kwargs: pytest.fail("must fail before download"))
+
+    with pytest.raises(RuntimeError, match="matches the pinned 9B artifact.*move it"):
+        stage_entry(entry, models_root=tmp_path / "models")
+    assert old_path.read_bytes() == legacy_payload
+
+
+def test_staging_core_then_gguf_materializes_distinct_pinned_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    four_source = tmp_path / "four.bin"
+    nine_source = tmp_path / "nine.bin"
+    four_source.write_bytes(b"four-b")
+    nine_source.write_bytes(b"nine-b")
+    four = ModelEntry(
+        id="four",
+        source=ModelSource("huggingface", repo="r", filename="four", revision="four"),
+        min_size=1,
+        size_bytes=len(four_source.read_bytes()),
+        sha256=hashlib.sha256(four_source.read_bytes()).hexdigest(),
+        targets=(ModelTarget("comfy_core", "vae/flux2-vae.safetensors"),),
+    )
+    nine = ModelEntry(
+        id="nine",
+        source=ModelSource("huggingface", repo="r", filename="nine", revision="nine"),
+        min_size=1,
+        size_bytes=len(nine_source.read_bytes()),
+        sha256=hashlib.sha256(nine_source.read_bytes()).hexdigest(),
+        targets=(ModelTarget("comfy_gguf", "vae/flux2-klein-9b-vae.safetensors"),),
+    )
+    monkeypatch.setattr(models_loader, "_download_source", lambda entry, **_kwargs: four_source if entry.id == "four" else nine_source)
+
+    stage_many((four, nine), models_root=tmp_path / "models", ids=("four",))
+    stage_many((four, nine), models_root=tmp_path / "models", ids=("nine",))
+    assert (tmp_path / "models/vae/flux2-vae.safetensors").read_bytes() == b"four-b"
+    assert (tmp_path / "models/vae/flux2-klein-9b-vae.safetensors").read_bytes() == b"nine-b"
+
+
+def test_shipped_registry_declares_four_lookup_only_aliases() -> None:
+    entries = load_registry()
+    lookup_aliases = {alias for entry in entries for alias in entry.lookup_aliases}
+    assert {
+        "WanVideo/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16_.safetensors",
+        "WanVid/wan2.1-1.3b-control-lora-tile-v0.1_comfy.safetensors",
+        "WanVideo/InfiniteTalk/InfiniteTalk/Wan2_1-InfiniteTalk_Single_Q8.gguf",
+        "WanVideo/wan2.1-i2v-14b-480p-Q8_0.gguf",
+    } <= lookup_aliases
+
+
+def test_shipped_registry_aliases_are_adjacent_and_staging_paths_prevalidate(
+    tmp_path: Path,
+) -> None:
+    entries = load_registry()
+
+    for entry in entries:
+        models_loader._validate_staging_paths(entry, models_root=tmp_path / "models")
+
+    expected_aliases = {
+        "wan_lightx2v_t2v_14b_v2_lora": (
+            "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16_.safetensors",
+        ),
+        "wan2_1_1_3b_control_lora_tile": (
+            "wan2.1-1.3b-control-lora-tile-v0.1_comfy.safetensors",
+        ),
+        "wan2_1_infinitetalk_single_q4_k_m": (
+            "Wan2_1-InfiniteTalk_Single_Q8.gguf",
+        ),
+        "wan2_1_i2v_14b_480p_q4_k_m_gguf": (
+            "wan2.1-i2v-14b-480p-Q8_0.gguf",
+        ),
+    }
+    assert {entry.id: entry.aliases for entry in entries if entry.id in expected_aliases} == expected_aliases
+
+
+def test_load_registry_rejects_duplicate_ids(tmp_path: Path) -> None:
+    text = _sample_registry(tmp_path / "models.yaml").read_text(encoding="utf-8")
+    duplicate = text + "\n" + text.split("models:\n", 1)[1]
+    _write_registry(tmp_path / "models.yaml", duplicate)
+
+    with pytest.raises(ValueError, match="duplicate model id"):
+        load_registry(tmp_path / "models.yaml")
+
+
+def test_load_registry_rejects_duplicate_aliases(tmp_path: Path) -> None:
+    text = _sample_registry(tmp_path / "models.yaml").read_text(encoding="utf-8")
+    second = (
+        text.split("models:\n", 1)[1]
+        .replace("id: sample", "id: second")
+        .replace("checkpoints/model.bin", "checkpoints_second/model.bin")
+        .replace("diffusion_models/model.bin", "diffusion_models_second/model.bin")
+    )
+    _write_registry(tmp_path / "models.yaml", text + "\n" + second)
+
+    with pytest.raises(ValueError, match="duplicate alias"):
+        load_registry(tmp_path / "models.yaml")
+
+
+@pytest.mark.parametrize("bad_path", ["/abs/model.bin", "../model.bin", "foo/../model.bin", "models/checkpoints/model.bin", "models\\checkpoints\\model.bin"])
+def test_load_registry_rejects_bad_target_paths(tmp_path: Path, bad_path: str) -> None:
+    registry = _write_registry(
+        tmp_path / "models.yaml",
+        f"""
+models:
+  - id: bad_path
+    source:
+      kind: huggingface
+      repo: example/repo
+      filename: model.bin
+    min_size: 0
+    targets:
+      - node_pack: comfy_gguf
+        path: '{bad_path}'
+""",
+    )
+
+    with pytest.raises(ValueError, match="bad_path.*target.path"):
+        load_registry(registry)
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "",
+        "/abs/model.bin",
+        r"C:\\models\\model.bin",
+        r"checkpoints\\model.bin",
+        "../model.bin",
+        "foo/../model.bin",
+        "checkpoints/.",
+        "checkpoints/",
+    ],
+)
+def test_stage_entry_rejects_direct_target_path_attacks_before_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_path: str
+) -> None:
+    calls: list[object] = []
+
+    def unexpected_download(**kwargs: object) -> str:
+        calls.append(kwargs)
+        raise AssertionError("unsafe target must fail before downloading")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", unexpected_download)
+    entry = ModelEntry(
+        id="direct_bad_path",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path=bad_path),),
+    )
+
+    with pytest.raises(ValueError, match="direct_bad_path.*target.path"):
+        stage_entry(entry, models_root=tmp_path / "models")
+    assert calls == []
+
+
+def test_stage_many_revalidates_direct_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not download")),
+    )
+    entry = ModelEntry(
+        id="direct_bad_many",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="../outside/model.bin"),),
+    )
+
+    with pytest.raises(ValueError, match="direct_bad_many.*target.path"):
+        stage_many((entry,), models_root=tmp_path / "models")
+
+
+def test_stage_entry_rolls_back_prior_direct_targets_on_later_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    bad = outside / "bad.bin"
+    bad.write_bytes(b"bad")
+    models = tmp_path / "models"
+    second = models / "checkpoints" / "second.bin"
+    second.parent.mkdir(parents=True)
+    second.symlink_to(bad)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    entry = ModelEntry(
+        id="rollback_direct",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(
+            ModelTarget(node_pack="comfy_gguf", path="checkpoints/first.bin"),
+            ModelTarget(node_pack="comfy_gguf", path="checkpoints/second.bin"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="rollback_direct.*resolves outside models_root"):
+        stage_entry(entry, models_root=models)
+    assert not (models / "checkpoints" / "first.bin").exists()
+    assert second.is_symlink() and second.resolve() == bad.resolve()
+    assert bad.read_bytes() == b"bad"
+
+
+def test_stage_entry_rolls_back_target_when_alias_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    bad = outside / "bad.bin"
+    bad.write_bytes(b"bad")
+    models = tmp_path / "models"
+    alias = models / "checkpoints" / "alias.bin"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(bad)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    entry = ModelEntry(
+        id="rollback_alias",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        aliases=("alias.bin",),
+    )
+
+    with pytest.raises(ValueError, match="rollback_alias.*resolves outside models_root"):
+        stage_entry(entry, models_root=models)
+    assert not (models / "checkpoints" / "model.bin").exists()
+    assert alias.is_symlink() and alias.resolve() == bad.resolve()
+    assert bad.read_bytes() == b"bad"
+
+
+def test_stage_composite_rolls_back_prior_files_on_later_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first_source = tmp_path / "hf" / "first.bin"
+    second_source = tmp_path / "hf" / "second.bin"
+    first_source.parent.mkdir()
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    bad = outside / "bad.bin"
+    bad.write_bytes(b"bad")
+    models = tmp_path / "models"
+    second = models / "checkpoints" / "second.bin"
+    second.parent.mkdir(parents=True)
+    second.symlink_to(bad)
+    sources = iter((first_source, second_source))
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(next(sources)))
+    entry = ModelEntry(
+        id="rollback_composite",
+        source=ModelSource(kind="huggingface", repo="example/repo", revision="abc123"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints"),),
+        files=(ModelFile(path="first.bin", min_size=1), ModelFile(path="second.bin", min_size=1)),
+    )
+
+    with pytest.raises(ValueError, match="rollback_composite.*resolves outside models_root"):
+        stage_entry(entry, models_root=models)
+    assert not (models / "checkpoints" / "first.bin").exists()
+    assert second.is_symlink() and second.resolve() == bad.resolve()
+    assert bad.read_bytes() == b"bad"
+
+
+@pytest.mark.parametrize("alias", ["nested/alias.bin", r"nested\\alias.bin"])
+def test_stage_entry_rejects_path_shaped_alias_before_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alias: str
+) -> None:
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must reject before download")),
+    )
+    entry = ModelEntry(
+        id="path_alias",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        aliases=(alias,),
+    )
+
+    with pytest.raises(ValueError, match="path_alias.*invalid alias"):
+        stage_entry(entry, models_root=tmp_path / "models")
+
+
+def test_stage_entry_rejects_preexisting_parent_and_final_symlink_escapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    models = tmp_path / "models"
+    outside = tmp_path / "outside"
+    models.mkdir()
+    outside.mkdir()
+    (models / "checkpoints").symlink_to(outside, target_is_directory=True)
+    entry = ModelEntry(
+        id="parent_escape",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+    )
+
+    with pytest.raises(ValueError, match="resolves outside models_root"):
+        stage_entry(entry, models_root=models)
+    assert list(outside.iterdir()) == []
+
+    safe_parent = models / "safe"
+    safe_parent.mkdir()
+    outside_file = outside / "existing.bin"
+    outside_file.write_bytes(b"do-not-touch")
+    final = safe_parent / "model.bin"
+    final.symlink_to(outside_file)
+    final_entry = ModelEntry(
+        id="final_escape",
+        source=entry.source,
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="safe/model.bin"),),
+    )
+
+    with pytest.raises(ValueError, match="resolves outside models_root"):
+        stage_entry(final_entry, models_root=models)
+    assert outside_file.read_bytes() == b"do-not-touch"
+
+
+def test_stage_entry_allows_external_cache_symlink_created_after_exdev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    monkeypatch.setattr(
+        "os.link", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross-device"))
+    )
+    entry = ModelEntry(
+        id="exdev_direct",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+    )
+
+    staged = stage_entry(entry, models_root=tmp_path / "models")
+
+    assert staged[0].is_symlink()
+    assert staged[0].resolve() == source
+    assert staged[0].read_bytes() == source.read_bytes()
+
+
+def test_stage_entry_allows_external_cache_symlinks_for_aliases_after_exdev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    monkeypatch.setattr(
+        "os.link", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross-device"))
+    )
+    entry = ModelEntry(
+        id="exdev_alias",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        aliases=("alias.bin",),
+    )
+
+    staged = stage_entry(entry, models_root=tmp_path / "models")
+
+    assert [path.name for path in staged] == ["model.bin", "alias.bin"]
+    assert all(path.is_symlink() and path.resolve() == source for path in staged)
+
+
+def test_stage_composite_allows_external_cache_symlink_after_exdev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "weights.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"weights")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    monkeypatch.setattr(
+        "os.link", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross-device"))
+    )
+    file = ModelFile(path="weights.bin", min_size=1, size_bytes=len(b"weights"))
+    entry = ModelEntry(
+        id="exdev_composite",
+        source=ModelSource(kind="huggingface", repo="example/repo", revision="abc123"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints"),),
+        files=(file,),
+    )
+
+    staged = stage_entry(entry, models_root=tmp_path / "models")
+
+    assert staged[0].is_symlink()
+    assert staged[0].resolve() == source
+    assert staged[0].read_bytes() == source.read_bytes()
+
+
+def test_stage_entry_reuses_matching_external_pinned_symlink_and_rejects_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = b"model-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    matching = outside / "matching.bin"
+    matching.write_bytes(payload)
+    models = tmp_path / "models"
+    target = models / "checkpoints" / "model.bin"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(matching)
+    entry = ModelEntry(
+        id="pinned_external",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        sha256=digest,
+        size_bytes=len(payload),
+    )
+    calls: list[object] = []
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: calls.append(kwargs))
+
+    assert stage_entry(entry, models_root=models) == [target]
+    assert calls == []
+
+    bad = outside / "bad.bin"
+    bad.write_bytes(b"bad")
+    target.unlink()
+    target.symlink_to(bad)
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(payload)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+
+    with pytest.raises(ValueError, match="resolves outside models_root"):
+        stage_entry(entry, models_root=models)
+    assert target.is_symlink()
+    assert target.resolve() == bad
+    assert bad.read_bytes() == b"bad"
+
+
+def test_stage_entry_rejects_alias_and_composite_symlink_or_lexical_escapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"model-bytes")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(source))
+    models = tmp_path / "models"
+    outside = tmp_path / "outside"
+    (models / "checkpoints").mkdir(parents=True)
+    outside.mkdir()
+    (models / "checkpoints" / "alias.bin").symlink_to(outside / "alias.bin")
+    alias_entry = ModelEntry(
+        id="alias_escape",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="checkpoints/model.bin"),),
+        aliases=("alias.bin",),
+    )
+
+    with pytest.raises(ValueError, match="alias_escape.*resolves outside models_root"):
+        stage_entry(alias_entry, models_root=models)
+
+    composite_entry = ModelEntry(
+        id="composite_escape",
+        source=ModelSource(kind="huggingface", repo="example/repo", revision="abc123"),
+        min_size=0,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="diffusion_models/composite"),),
+        files=(ModelFile(path="../outside.bin"),),
+    )
+
+    with pytest.raises(ValueError, match="composite_escape.*files.path"):
+        stage_entry(composite_entry, models_root=models)
+    assert list(outside.iterdir()) == []
+
+
+def test_stage_entry_allows_preexisting_symlinks_that_resolve_inside_models_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = b"model-bytes"
+    source = tmp_path / "hf" / "model.bin"
+    source.parent.mkdir()
+    source.write_bytes(payload)
+    models = tmp_path / "models"
+    actual = models / "checkpoints"
+    actual.mkdir(parents=True)
+    (models / "safe-alias").symlink_to(actual, target_is_directory=True)
+    (actual / "model.bin").write_bytes(payload)
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda **_kwargs: str(source),
+    )
+    entry = ModelEntry(
+        id="inside_symlink",
+        source=ModelSource(kind="huggingface", repo="example/repo", filename="model.bin"),
+        min_size=1,
+        targets=(ModelTarget(node_pack="comfy_gguf", path="safe-alias/model.bin"),),
+    )
+
+    assert stage_entry(entry, models_root=models) == [models / "safe-alias/model.bin"]
+    assert (actual / "model.bin").read_bytes() == payload
+
+
+def test_load_registry_rejects_unknown_tags(tmp_path: Path) -> None:
+    text = _sample_registry(tmp_path / "models.yaml").read_text(encoding="utf-8").replace("phase:core", "phase:typo")
+    _write_registry(tmp_path / "models.yaml", text)
+
+    with pytest.raises(ValueError, match="unknown tag"):
+        load_registry(tmp_path / "models.yaml")
+
+
+def test_filter_entries_selects_phase_and_env_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    entries = (
+        ModelEntry("core", ModelSource("huggingface", repo="r", filename="a.bin"), 0, (ModelTarget("pack", "a.bin"),), tags=("phase:core",)),
+        ModelEntry("gguf", ModelSource("huggingface", repo="r", filename="b.bin"), 0, (ModelTarget("pack", "b.bin"),), tags=("phase:gguf",)),
+        ModelEntry(
+            "lean",
+            ModelSource("huggingface", repo="r", filename="c.bin"),
+            0,
+            (ModelTarget("pack", "c.bin"),),
+            tags=("phase:core", "ltx_lean_excluded"),
+        ),
+        ModelEntry(
+            "token",
+            ModelSource("huggingface", repo="r", filename="d.bin"),
+            0,
+            (ModelTarget("pack", "d.bin"),),
+            tags=("phase:core", "requires_hf_token"),
+        ),
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("VIBECOMFY_MATRIX_SCOPE", "ltx_official")
+
+    selected = models_loader._filter_entries(entries, ids=None, select_phase="core")
+
+    assert [entry.id for entry in selected] == ["core"]
+
+
+def test_load_registry_caches_until_clear_cache(tmp_path: Path) -> None:
+    registry = _sample_registry(tmp_path / "models.yaml")
+    first = load_registry(registry)
+    registry.write_text(registry.read_text(encoding="utf-8").replace("id: sample", "id: changed"), encoding="utf-8")
+
+    assert load_registry(registry) is first
+    models_loader._clear_cache()
+    assert load_registry(registry)[0].id == "changed"
+
+
+# TODO: remove this test once the heredocs are deleted post-soak.
+def test_legacy_heredoc_downloads_match_registry_entries() -> None:
+    registry = load_registry()
+    by_source = {(entry.source.repo, entry.source.filename, entry.min_size): entry for entry in registry}
+
+    for phase, repo, filename, targets, min_size in _legacy_download_tuples():
+        entry = by_source[(repo, filename, min_size)]
+        assert f"phase:{phase}" in entry.tags
+        registry_targets = {target.path for target in entry.targets}
+        for target in targets:
+            assert target.startswith("models/")
+            assert target.removeprefix("models/") in registry_targets
+
+
+def _legacy_download_tuples() -> list[tuple[str, str, str, list[str], int]]:
+    pytest.importorskip("runpod_lifecycle", reason="requires sibling runpod-lifecycle package")
+    from scripts.runpod_corpus_matrix import _remote_script
+
+    blocks = [block for block in re.findall(r"\"\$PY\" - <<'PY'\n(.*?)\nPY", _remote_script(), flags=re.S) if "def materialize_model" in block]
+    phases = ["core", "gguf", "ltx", "wan_wrapper"]
+    assert len(blocks) == len(phases)
+    rows: list[tuple[str, str, str, list[str], int]] = []
+    for phase, block in zip(phases, blocks):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            parsed = ast.parse(block)
+        for repo, filename, targets, min_size in _extract_downloads_from_ast(parsed):
+            rows.append((phase, repo, filename, targets, min_size))
+    return rows
+
+
+def _extract_downloads_from_ast(module: ast.Module) -> list[tuple[str, str, list[str], int]]:
+    rows: list[tuple[str, str, list[str], int]] = []
+
+    def visit(statements: list[ast.stmt]) -> None:
+        for statement in statements:
+            if isinstance(statement, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "downloads" for target in statement.targets):
+                rows.extend(_tuples_from_list(statement.value))
+            elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+                call = statement.value
+                if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == "downloads":
+                    if call.func.attr == "extend":
+                        rows.extend(_tuples_from_list(call.args[0]))
+                    elif call.func.attr == "append":
+                        rows.append(_download_tuple(call.args[0]))
+            elif isinstance(statement, ast.If):
+                visit(statement.body)
+                visit(statement.orelse)
+
+    visit(module.body)
+    return rows
+
+
+def _tuples_from_list(node: ast.AST) -> list[tuple[str, str, list[str], int]]:
+    assert isinstance(node, ast.List)
+    return [_download_tuple(item) for item in node.elts]
+
+
+def _download_tuple(node: ast.AST) -> tuple[str, str, list[str], int]:
+    assert isinstance(node, ast.Tuple)
+    repo = ast.literal_eval(node.elts[0])
+    filename = ast.literal_eval(node.elts[1])
+    targets = [_path_arg(target) for target in node.elts[2].elts]  # type: ignore[attr-defined]
+    min_size = ast.literal_eval(node.elts[3])
+    return repo, filename, targets, min_size
+
+
+def _path_arg(node: ast.AST) -> str:
+    assert isinstance(node, ast.Call)
+    assert isinstance(node.func, ast.Name) and node.func.id == "Path"
+    return ast.literal_eval(node.args[0])

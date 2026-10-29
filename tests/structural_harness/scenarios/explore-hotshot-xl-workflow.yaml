@@ -1,0 +1,34 @@
+name: explore-hotshot-xl-workflow
+tier: 6
+description: "Executor research route: triage scopes deterministic research (search directions + source tiers) for Hotshot XL workflow lookup, then the semantic reply answers — no edit gate"
+mode: structural
+agents:
+  - id: builder
+    dispatcher: fake
+tags:
+  - m6
+  - research
+  - structural
+  - positive
+  - hotshot
+assessment:
+  subjective: true
+  enforced:
+    - "executor_result.json parses as valid JSON with ok=true and report.executor.plan.research=true."
+    - "research.json records a deterministic research call whose scoped query contains Hotshot XL or SVD-XT anchors."
+    - "research.json records sources=[\"workflows\",\"messages\",\"web\"] (the classifier's source_preferences forwarded as the explicit tier tuple)."
+    - "executor_result.json records a non-applyable research response with graph_unchanged=true."
+    - "actions.jsonl contains at least one entry with op=executor.run and a non-empty query."
+  graded:
+    - "Routing correctness: For a research-only question with no graph edit requested, the classifier should choose the research route with research=true and implement=false, not route to adapt, revise, clarify, respond, or inspect."
+    - "The frozen evidence demonstrates the research route ran deterministic executor research (scoped query + explicit source tiers) feeding the semantic reply phase — not the agent-edit batch loop."
+  observed:
+    - "The focused research query contains Hotshot XL/SVD-XT anchors and does not search generic words from the raw sentence."
+extras:
+  flow_kind: executor_full_pipeline
+  required_frozen_evidence:
+    - evidence/executor_result.json
+    - evidence/executor_report.json
+    - evidence/research.json
+    - evidence/metadata.json
+    - evidence/actions.jsonl

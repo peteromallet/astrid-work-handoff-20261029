@@ -1,0 +1,482 @@
+"""
+Ingest stage and stage helpers (T-038 extraction of the edit_ingest fragment).
+
+Extracted from the edit.py exec-assembled fragments (T-038, ORACLE-6).
+The fragment SOURCE string stays in edit.py until T-041 removes the machinery;
+this module is the live implementation. Imports of sibling _frag modules follow
+the foundation dependency order; names that would form an import cycle are
+resolved lazily at call time (marked with a T-038 late import comment).
+"""
+import os
+import time
+from typing import Any, Mapping
+from vibecomfy.comfy_nodes.agent.audit import write_json_artifact
+from vibecomfy.comfy_nodes.agent.contracts import FailureKind, StageResult, TurnContext
+from vibecomfy.comfy_nodes.agent.gates import apply_stage_gate_updates, update_state_match_gate
+from vibecomfy.comfy_nodes.agent.provider import build_delta_messages, build_messages
+from ._frag_state import AgentEditState, DeepSeekClient, _artifact, _duration_ms
+
+from vibecomfy.ingest.normalize import door_get_nodes
+def _record(context: TurnContext, result: StageResult) -> StageResult:
+    context.stage_results[result.stage] = result
+    apply_stage_gate_updates(context, result)
+    return result
+
+
+def _stamp_identity_on_original(graph: dict[str, Any], workflow: Any) -> int:
+    """Phase 1 (concrete-tree migration): stamp the IR's stable uid onto the
+    *original* UI nodes so the delta-scope guard (`guard_emit`) and pin-opaque
+    can match on a user's FIRST edit. A hand-authored ComfyUI canvas carries no
+    `properties.vibecomfy_uid`, so `guard_emit`'s scope (uids shared between the
+    original and the candidate) is otherwise empty and the whole preserve/guard
+    layer no-ops (blockers.md B12). The candidate inherits these same uids from
+    the IR, so stamping the original makes the scope non-empty.
+
+    See docs/agent-edit/concrete-tree.md. Match is by litegraph node id, which is
+    stable across the round-trip.
+    """
+    by_id = {str(nid): node for nid, node in getattr(workflow, "nodes", {}).items()}
+    stamped = 0
+    for ui_node in door_get_nodes(graph) or []:
+        if not isinstance(ui_node, dict):
+            continue
+        ir = by_id.get(str(ui_node.get("id")))
+        uid = getattr(ir, "uid", "") if ir is not None else ""
+        if not uid:
+            continue
+        props = ui_node.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            ui_node["properties"] = props
+        if not props.get("vibecomfy_uid"):
+            props["vibecomfy_uid"] = uid
+            stamped += 1
+    return stamped
+
+
+def _stale_rebaseline_recovery_issue(
+    state: AgentEditState,
+    gate_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    recovery = {
+        "action": "rebaseline",
+        "endpoint": "/vibecomfy/agent-edit/rebaseline",
+        "reason": "stale_state_recovery",
+        "last_known_baseline_graph_hash": state.baseline_graph_hash,
+        "submit_graph_hash": state.submit_graph_hash,
+        "submit_structural_graph_hash": state.submit_structural_graph_hash,
+        "client_graph_hash": state.submitted_client_graph_hash,
+        "client_structural_graph_hash": state.submitted_client_structural_graph_hash,
+    }
+    return {
+        "code": "stale_state_mismatch",
+        "severity": "error",
+        "failure_kind": FailureKind.STALE_STATE_MISMATCH.value,
+        "message": "Submitted graph no longer matches the current baseline.",
+        "detail": dict(gate_evidence),
+        "rebaseline_recovery": recovery,
+    }
+
+
+def _ensure_ingest_workflow(state: AgentEditState) -> Any:
+    """Return the retained ingest IR, building it exactly once if absent.
+
+    The public entrypoint retains the IR in ``AgentEditState.workflow`` at
+    allocation (batch 3), so the normal path never re-ingests.  Direct stage
+    callers and recovered states fall through here, which performs the SINGLE
+    named-door conversion (``ingest_workflow_and_ui`` — the only shape
+    dispatcher) and stores both the canonical graph and the retained
+    ``VibeWorkflow`` on state.  Recovered states consume the retained
+    :class:`WorkflowSnapshot` and never re-decode raw after that ingest.
+    """
+    from vibecomfy.ingest.snapshot import bind_snapshot_lineage, snapshot_of
+
+    existing = snapshot_of(state.workflow) if state.workflow is not None else None
+    if existing is not None:
+        state.workflow_snapshot = existing
+        return state.workflow
+    if getattr(state, "workflow_snapshot", None) is not None:
+        snapshot = state.workflow_snapshot
+        if state.workflow is None:
+            state.workflow = snapshot.workflow
+        return state.workflow
+    if state.workflow is None:
+        from vibecomfy.ingest.normalize import ingest_workflow_and_ui
+
+        # The production ingress door captures and retains the schema surface.
+        # Direct stage callers use the same conversion path; never warm a live
+        # provider here, because that duplicates discovery and can turn typed
+        # provider failures into apparent schema misses.
+        workflow, graph = ingest_workflow_and_ui(
+            state.graph,
+            schema_provider=state.schema_provider,
+        )
+        state.graph = graph
+        state.workflow = workflow
+        snapshot = snapshot_of(workflow)
+        if snapshot is not None:
+            session_id = getattr(getattr(state, "session_dir", None), "name", None)
+            turn_id = getattr(getattr(state, "turn_dir", None), "name", None)
+            state.workflow_snapshot = bind_snapshot_lineage(
+                workflow,
+                session_id=str(session_id) if session_id else None,
+                turn_id=str(turn_id) if turn_id else None,
+                baseline_id=state.baseline_graph_hash,
+            )
+    return state.workflow
+
+
+def _stage_ingest(state: AgentEditState, context: TurnContext) -> StageResult:
+    from vibecomfy.porting.layout_store import store_from_ui_json
+
+    start = time.monotonic()
+    request_ref = write_json_artifact(state.request_path, state.request_payload)
+    original_ui_ref = write_json_artifact(state.original_ui_path, state.graph)
+    # Batch 3: the ingest IR was retained at allocation (AgentEditState.workflow);
+    # direct stage callers / recovered states build it exactly once here via the
+    # named door.  No stage re-derives the IR from raw JSON.
+    _ensure_ingest_workflow(state)
+    state.prior_store = store_from_ui_json(state.graph)
+    # Phase 1 (concrete-tree migration, docs/agent-edit/concrete-tree.md): give the
+    # user's original graph stable identity so the delta-scope guard (guard_emit)
+    # engages on the FIRST edit. Stamp a COPY — never mutate state.graph, which is
+    # hashed/echoed/audited. The candidate inherits the same uids (verified: uid ==
+    # node id, preserved across the scratchpad round-trip), so the guard scope
+    # becomes non-empty.
+    #
+    # Gated OFF by default: with the guard engaged but the candidate still produced
+    # by the LOSSY regeneration path (Phase 2 not yet landed), guard_emit correctly
+    # refuses candidates that diverge from the original outside the intended delta.
+    # Enabling identity is therefore only safe once Phase 2 (verbatim-preserve)
+    # makes the candidate faithful. Toggle with VIBECOMFY_AGENT_EDIT_IDENTITY=1.
+    if os.getenv("VIBECOMFY_AGENT_EDIT_IDENTITY") == "1":
+        from copy import deepcopy as _deepcopy
+        guard_original = _deepcopy(state.graph)
+        _stamp_identity_on_original(guard_original, state.workflow)
+        state.guard_original_ui = guard_original
+    # Auto-rebaseline on submit: the live canvas the user submitted is always
+    # authoritative for an edit, so submit does NOT enforce a pinned baseline
+    # (baseline_graph_hash=None => the gate never blocks on canvas drift). The
+    # stale-state guard is retained on the APPLY path, where applying a candidate
+    # computed against an older canvas could clobber later manual edits.
+    update_state_match_gate(
+        context,
+        baseline_graph_hash=None,
+        client_graph_hash=state.submit_structural_graph_hash,
+        client_graph_hash_label="submit_structural_graph_hash",
+    )
+    state_match_gate = context.gate_results["state_match_ok"]
+    if not state_match_gate.ok:
+        stale_issue = _stale_rebaseline_recovery_issue(state, state_match_gate.evidence)
+        return StageResult(
+            stage="ingest",
+            ok=False,
+            blocking=True,
+            duration_ms=_duration_ms(start),
+            artifacts=(request_ref, original_ui_ref),
+            issues=(stale_issue,),
+            value={"failure_kind": FailureKind.STALE_STATE_MISMATCH.value},
+        )
+    return StageResult(
+        stage="ingest",
+        ok=True,
+        blocking=False,
+        duration_ms=_duration_ms(start),
+        artifacts=(request_ref, original_ui_ref),
+    )
+
+
+def _stage_ingest_v2(state: AgentEditState, context: TurnContext) -> StageResult:
+    from copy import deepcopy
+
+    start = time.monotonic()
+    request_ref = write_json_artifact(state.request_path, state.request_payload)
+    # The door dispatched the shape exactly once at allocation and its
+    # VibeWorkflow is retained in state.workflow. This stage consumes the
+    # retained IR — never re-ingests from raw JSON.
+    _ensure_ingest_workflow(state)
+    state.guard_original_ui = deepcopy(state.graph)
+    original_ui_ref = write_json_artifact(state.original_ui_path, state.guard_original_ui)
+    # Auto-rebaseline on submit: the live canvas the user submitted is always
+    # authoritative for an edit, so submit does NOT enforce a pinned baseline
+    # (baseline_graph_hash=None => the gate never blocks on canvas drift). The
+    # stale-state guard is retained on the APPLY path, where applying a candidate
+    # computed against an older canvas could clobber later manual edits.
+    update_state_match_gate(
+        context,
+        baseline_graph_hash=None,
+        client_graph_hash=state.submit_structural_graph_hash,
+        client_graph_hash_label="submit_structural_graph_hash",
+    )
+    state_match_gate = context.gate_results["state_match_ok"]
+    if not state_match_gate.ok:
+        stale_issue = _stale_rebaseline_recovery_issue(state, state_match_gate.evidence)
+        return StageResult(
+            stage="ingest",
+            ok=False,
+            blocking=True,
+            duration_ms=_duration_ms(start),
+            artifacts=(request_ref, original_ui_ref),
+            issues=(stale_issue,),
+            value={"failure_kind": FailureKind.STALE_STATE_MISMATCH.value},
+        )
+    return StageResult(
+        stage="ingest",
+        ok=True,
+        blocking=False,
+        duration_ms=_duration_ms(start),
+        artifacts=(request_ref, original_ui_ref),
+        value={
+            "mode": "batch_repl",
+            "node_count": len((getattr(state.workflow, "nodes", None) or {})),
+        },
+    )
+
+
+def _stage_convert(state: AgentEditState, _context: TurnContext) -> StageResult:
+    from vibecomfy.porting.convert import port_convert_and_write, port_convert_workflow
+
+    start = time.monotonic()
+    conversion = port_convert_workflow(
+        state.workflow,
+        source_path=str(state.original_ui_path),
+        schema_provider=state.schema_provider,
+        raw_workflow=state.graph,
+        # Editing a user's live canvas must preserve every node. Dead-branch
+        # pruning is for authoring minimal templates; here it would silently
+        # drop nodes that don't feed a recognized output (e.g. a GeminiNode
+        # feeding only a PreviewAny passthrough) and corrupt the round-trip.
+        prune_dead_branches=False,
+    )
+    # Keep the strict parity gate: with prune disabled + UI-only passthrough
+    # preservation (emitter), a faithful user canvas round-trips and passes here,
+    # while a genuinely-lossy conversion still fails honestly rather than applying
+    # a corrupted candidate.
+    port_convert_and_write(conversion, state.before_py_path)
+    state.python_before = state.before_py_path.read_text(encoding="utf-8")
+    return StageResult(
+        stage="convert",
+        ok=True,
+        blocking=False,
+        duration_ms=_duration_ms(start),
+        artifacts=(_artifact(state.before_py_path),),
+    )
+
+
+def _stage_project_v2(state: AgentEditState, _context: TurnContext) -> StageResult:
+    from vibecomfy.porting.render import LENS_SURFACE, render
+
+    start = time.monotonic()
+    _ensure_ingest_workflow(state)
+    projection_text = str(render(state.workflow, LENS_SURFACE) or "")
+    state.projection_text = projection_text
+    state.projection_path.write_text(projection_text, encoding="utf-8")
+    return StageResult(
+        stage="project",
+        ok=True,
+        blocking=False,
+        duration_ms=_duration_ms(start),
+        artifacts=(_artifact(state.projection_path),),
+        value={
+            "node_count": len(getattr(state.workflow, "nodes", {}) or {}),
+        },
+    )
+
+
+def _stage_agent(
+    state: AgentEditState,
+    _context: TurnContext,
+    *,
+    deepseek_client: DeepSeekClient | None = None,
+    route: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+) -> StageResult:
+    from ._frag_batch_memory import _normalize_test_client_response  # T-038 late import: sibling cycle broken; resolved at call time
+    from vibecomfy.comfy_nodes.agent.edit import run_agent_turn  # T-039 late import: provider seam patched on the assembled edit module; resolved at call time
+    start = time.monotonic()
+    messages = build_messages(task=state.task, python_source=state.python_before, execution_mode="sandboxed_loose")
+    write_json_artifact(state.model_request_path, {"messages": messages})
+    if deepseek_client is not None:
+        agent_result = _normalize_test_client_response(
+            deepseek_client(messages)
+        )
+    else:
+        agent_result = run_agent_turn(
+            state.task,
+            state.python_before,
+            route=route,
+            model=model,
+            effort=effort,
+        )
+    state.python_after = agent_result.python
+    state.user_message = agent_result.message
+    state.provider_metadata = dict(agent_result.audit_metadata or {})
+    model_response_ref = write_json_artifact(
+        state.model_response_path,
+        agent_result.to_dict(),
+    )
+    return StageResult(
+        stage="agent",
+        ok=True,
+        blocking=False,
+        duration_ms=_duration_ms(start),
+        artifacts=(_artifact(state.model_request_path), model_response_ref),
+        value={
+            "route": agent_result.route,
+            "model": agent_result.model,
+            "provider_metadata": state.provider_metadata,
+        },
+    )
+
+
+def _stage_agent_delta(
+    state: AgentEditState,
+    _context: TurnContext,
+    *,
+    deepseek_client: DeepSeekClient | None = None,
+    route: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+) -> StageResult:
+    from vibecomfy.comfy_nodes.agent.edit import run_agent_turn_delta  # T-039 late import: provider seam patched on the assembled edit module; resolved at call time
+    from vibecomfy.porting.edit.ops import (
+        DELTA_SCHEMA_VERSION,
+        EDIT_OP_RESPONSE_SCHEMA_V2,
+        EditOpParseError,
+        ensure_root_scoped_delta_envelope,
+        normalize_delta_test_client_response,
+        op_to_dict,
+    )
+
+    start = time.monotonic()
+    messages = build_delta_messages(
+        task=state.task,
+        projection=state.projection_text,
+        op_schema=EDIT_OP_RESPONSE_SCHEMA_V2,
+    )
+    write_json_artifact(
+        state.model_request_path,
+        {"messages": messages, "response_contract": "delta"},
+    )
+    if deepseek_client is not None:
+        agent_result = normalize_delta_test_client_response(deepseek_client(messages))
+    else:
+        agent_result = run_agent_turn_delta(
+            state.task,
+            state.projection_text,
+            op_schema=EDIT_OP_RESPONSE_SCHEMA_V2,
+            route=route,
+            model=model,
+            effort=effort,
+        )
+    state.user_message = agent_result.message
+    state.provider_metadata = dict(agent_result.audit_metadata or {})
+    try:
+        delta_envelope = ensure_root_scoped_delta_envelope(
+            {
+                "schema_version": DELTA_SCHEMA_VERSION,
+                "ops": [op_to_dict(op) for op in agent_result.delta],
+            },
+            strict=False,
+        )
+    except EditOpParseError as exc:
+        issue = {
+            "code": exc.code,
+            "message": str(exc),
+            "severity": "error",
+        }
+        if isinstance(exc.detail, Mapping) and exc.detail:
+            issue["detail"] = dict(exc.detail)
+        model_response_ref = write_json_artifact(
+            state.model_response_path,
+            {
+                "message": agent_result.message,
+                "route": agent_result.route,
+                "model": agent_result.model,
+                "audit_metadata": state.provider_metadata,
+                "delta_error": issue,
+            },
+        )
+        state.delta_diagnostics = [dict(issue)]
+        return StageResult(
+            stage="agent_delta",
+            ok=False,
+            blocking=True,
+            duration_ms=_duration_ms(start),
+            artifacts=(_artifact(state.model_request_path), model_response_ref),
+            issues=(issue,),
+            value={
+                "failure_kind": FailureKind.VALIDATION_ERROR.value,
+                "op_count": len(agent_result.delta),
+                "provider_metadata": state.provider_metadata,
+            },
+        )
+
+    state.delta_ops = delta_envelope.ops
+    delta_payload = delta_envelope.to_dict()
+    model_response_ref = write_json_artifact(
+        state.model_response_path,
+        {
+            "accepted_batch": [{"op": op} for op in delta_payload["ops"]],
+            "message": agent_result.message,
+            "route": agent_result.route,
+            "model": agent_result.model,
+            "audit_metadata": state.provider_metadata,
+        },
+    )
+    return StageResult(
+        stage="agent_delta",
+        ok=True,
+        blocking=False,
+        duration_ms=_duration_ms(start),
+        artifacts=(_artifact(state.model_request_path), model_response_ref),
+        value={
+            "route": agent_result.route,
+            "model": agent_result.model,
+            "op_count": len(agent_result.delta),
+            "provider_metadata": state.provider_metadata,
+        },
+    )
+
+
+_RESEARCH_TRIGGER_TERMS = (
+    "look up", "lookup", "research", "find out", "how does", "how do", "what is",
+    "what are", "explain how", "how can", "how to", "information about",
+)
+
+_GRAPH_EXPLAIN_TRIGGER_TERMS = (
+    "what's happening", "what is happening", "what's going on", "what is going on",
+    "explain this graph", "explain the graph", "describe this graph",
+    "describe the graph", "analyze this graph", "analyze the graph",
+    "inspect this graph", "inspect the graph", "what does this graph do",
+)
+
+_CODE_NODE_TRIGGER_TERMS = (
+    "code node",
+    "python",
+    "pil",
+    "pillow",
+    "custom image-processing",
+    "custom image processing",
+    "process images",
+    "image processing",
+)
+
+
+def _task_mentions_any(task: str, terms: tuple[str, ...]) -> bool:
+    lowered = task.lower()
+    return any(term in lowered for term in terms)
+
+
+def _is_research_intent(task: str) -> bool:
+    return _task_mentions_any(task, _RESEARCH_TRIGGER_TERMS)
+
+
+__all__ = (
+     "_CODE_NODE_TRIGGER_TERMS", "_GRAPH_EXPLAIN_TRIGGER_TERMS",
+     "_RESEARCH_TRIGGER_TERMS", "_is_research_intent", "_record", "_stage_agent",
+     "_stage_agent_delta", "_stage_convert", "_stage_ingest", "_stage_ingest_v2",
+     "_stage_project_v2", "_stale_rebaseline_recovery_issue",
+     "_stamp_identity_on_original", "_task_mentions_any",
+)

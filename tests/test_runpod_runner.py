@@ -1,0 +1,735 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+from concurrent.futures import ThreadPoolExecutor
+from collections import namedtuple
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("dotenv", reason="requires runpod-launch extra (python-dotenv)")
+pytest.importorskip("runpod_lifecycle", reason="requires sibling runpod-lifecycle package")
+
+from scripts import runpod_runner
+
+
+PNG_1X1_TRANSPARENT = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axf"
+    "p6kAAAAASUVORK5CYII="
+)
+
+
+def test_default_upload_excludes_skip_bulky_local_state(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    included = root / "vibecomfy" / "module.py"
+    excluded = root / "out" / "runpod_artifacts" / "large.bin"
+    pycache = root / "vibecomfy" / "__pycache__" / "module.pyc"
+    included.parent.mkdir(parents=True)
+    excluded.parent.mkdir(parents=True)
+    pycache.parent.mkdir(parents=True)
+    included.write_text("print('ok')\n", encoding="utf-8")
+    excluded.write_bytes(b"x")
+    pycache.write_bytes(b"x")
+
+    assert not runpod_runner.should_skip(included, root, runpod_runner.DEFAULT_UPLOAD_EXCLUDES)
+    assert runpod_runner.should_skip(excluded, root, runpod_runner.DEFAULT_UPLOAD_EXCLUDES)
+    assert runpod_runner.should_skip(pycache, root, runpod_runner.DEFAULT_UPLOAD_EXCLUDES)
+
+
+def test_runpod_lifecycle_dependency_api_imports_cleanly() -> None:
+    """The declared git dependency exposes every API imported by the wrapper."""
+    import runpod_lifecycle
+
+    dependency_src = Path(runpod_lifecycle.__file__).resolve().parents[1]
+    env = os.environ.copy()
+    # Do not inherit the wrapper's sibling-checkout override or an unrelated
+    # PYTHONPATH entry: this is intentionally a clean dependency import.
+    env.pop("VIBECOMFY_RUNPOD_LIFECYCLE_ROOT", None)
+    env["PYTHONPATH"] = str(dependency_src)
+    probe = (
+        "import inspect\n"
+        "import runpod_lifecycle as lifecycle\n"
+        "required = ('PodGuard', 'UploadHeartbeat', 'RunPodConfig', "
+        "'ship_and_run', 'ship_and_run_detached', 'ShipAndRunResult')\n"
+        "missing = [name for name in required if not hasattr(lifecycle, name)]\n"
+        "assert not missing, missing\n"
+        "assert 'local_root' in inspect.signature(lifecycle.ship_and_run_detached).parameters\n"
+        "from runpod_lifecycle.runner import DEFAULT_POLL_COMMAND_TEMPLATE, DEFAULT_POLL_EXIT_MARKER\n"
+        "assert '{poll_exit_marker}' in DEFAULT_POLL_COMMAND_TEMPLATE\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_build_upload_tarball_uses_excludes_and_custom_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    tmpdir = tmp_path / "upload_tmp"
+    keep = root / "scripts" / "keep.py"
+    skipped = root / ".venv" / "site-packages" / "huge.py"
+    keep.parent.mkdir(parents=True)
+    skipped.parent.mkdir(parents=True)
+    keep.write_text("print('keep')\n", encoding="utf-8")
+    skipped.write_text("print('skip')\n", encoding="utf-8")
+    monkeypatch.setenv("VIBECOMFY_UPLOAD_TMPDIR", str(tmpdir))
+
+    tar_path = runpod_runner._build_upload_tarball(runpod_runner.DEFAULT_UPLOAD_EXCLUDES, root=root)
+    try:
+        assert tar_path.parent == tmpdir
+        with tarfile.open(tar_path, "r:gz") as tar:
+            names = set(tar.getnames())
+        assert "scripts/keep.py" in names
+        assert ".venv/site-packages/huge.py" not in names
+    finally:
+        tar_path.unlink(missing_ok=True)
+
+
+def test_upload_disk_preflight_fails_early_with_actionable_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: Usage(total=1024, used=1014, free=10))
+
+    with pytest.raises(RuntimeError, match="VIBECOMFY_UPLOAD_TMPDIR"):
+        runpod_runner._preflight_upload_disk(tmp_path, estimated_bytes=10 * 1024 * 1024)
+
+
+def test_runpod_config_kwargs_delegates_disk_defaults_to_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VIBECOMFY_RUNPOD_DISK_SIZE_GB", raising=False)
+    monkeypatch.delenv("VIBECOMFY_RUNPOD_CONTAINER_DISK_GB", raising=False)
+
+    config_kwargs = runpod_runner._runpod_config_kwargs()
+
+    assert "disk_size_gb" not in config_kwargs
+    assert "container_disk_gb" not in config_kwargs
+
+
+def test_runpod_config_kwargs_preserves_vibecomfy_disk_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VIBECOMFY_RUNPOD_DISK_SIZE_GB", "50")
+    monkeypatch.setenv("VIBECOMFY_RUNPOD_CONTAINER_DISK_GB", "50")
+
+    config_kwargs = runpod_runner._runpod_config_kwargs()
+
+    assert config_kwargs["disk_size_gb"] == 50
+    assert config_kwargs["container_disk_gb"] == 50
+
+
+def test_runpod_config_kwargs_forwards_allowed_cuda_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VIBECOMFY_RUNPOD_ALLOWED_CUDA_VERSIONS", "13.0, 12.9,13.0")
+    assert runpod_runner._runpod_config_kwargs()["allowed_cuda_versions"] == ["13.0", "12.9"]
+
+
+@pytest.mark.parametrize("value", ["", " , ", "cuda13"])
+def test_runpod_config_kwargs_rejects_invalid_allowed_cuda_versions(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("VIBECOMFY_RUNPOD_ALLOWED_CUDA_VERSIONS", value)
+    with pytest.raises(ValueError, match="must contain"):
+        runpod_runner._runpod_config_kwargs()
+
+
+def test_runpod_config_old_dependency_fails_clearly_when_cuda_filter_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIBECOMFY_RUNPOD_ALLOWED_CUDA_VERSIONS", "13.0")
+
+    class OldConfig:
+        @classmethod
+        def from_env(cls, **kwargs):
+            raise TypeError("unexpected keyword argument 'allowed_cuda_versions'")
+
+    monkeypatch.setattr(runpod_runner, "RunPodConfig", OldConfig)
+    with pytest.raises(RuntimeError, match="does not support allowed CUDA"):
+        runpod_runner._build_runpod_config()
+
+
+def test_parse_tsv_returns_structured_rows(tmp_path: Path) -> None:
+    results = tmp_path / "results.tsv"
+    results.write_text("id\tstatus\tseconds\nred\tok\t3\nblue\tfail\t9\n", encoding="utf-8")
+
+    assert runpod_runner._parse_tsv(results) == [
+        {"id": "red", "status": "ok", "seconds": "3"},
+        {"id": "blue", "status": "fail", "seconds": "9"},
+    ]
+
+
+def test_png_info_reads_dimensions_without_pillow(tmp_path: Path) -> None:
+    image = tmp_path / "smoke.png"
+    image.write_bytes(PNG_1X1_TRANSPARENT)
+
+    assert runpod_runner._png_info(image) == {
+        "width": 1,
+        "height": 1,
+        "format": "PNG",
+        "mode": None,
+    }
+
+
+def test_finalize_artifacts_writes_manifest_and_report(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "bundle"
+    results = artifact_root / "out" / "corpus_matrix" / "results.tsv"
+    output = artifact_root / "output" / "smoke.png"
+    run_dir = artifact_root / "out" / "runs" / "run-1"
+    results.parent.mkdir(parents=True)
+    output.parent.mkdir(parents=True)
+    run_dir.mkdir(parents=True)
+    (artifact_root / "artifacts.tar.gz").write_bytes(b"archive")
+    results.write_text("id\tstatus\tseconds\tmedia_files\tbytes\nred\tok\t3\t1\t7\n", encoding="utf-8")
+    output.write_bytes(PNG_1X1_TRANSPARENT)
+    (results.parent / "remote_live.log").write_text("remote log\n", encoding="utf-8")
+    (results.parent / "remote_run.sh").write_text("echo run\n", encoding="utf-8")
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "workflow_id": "smoke-red",
+                "runtime": "embedded",
+                "queued": {"prompt_id": "prompt-1"},
+                "outputs": ["output/smoke.png"],
+                "workflow_hash": "abc",
+                "git_sha": "def",
+            }
+        ),
+        encoding="utf-8",
+    )
+    watchdog_body = {
+        "diagnosis": "crashed",
+        "diagnosis_reason": "event stream ended",
+        "state": {"stop_reason": "completed", "prompt_id": "prompt-1"},
+        "elapsed_seconds": 12.5,
+    }
+    (run_dir / "watchdog.json").write_text(
+        "WATCHDOG diagnosis=crashed prompt_id=prompt-1\n" + json.dumps(watchdog_body),
+        encoding="utf-8",
+    )
+
+    manifest = runpod_runner._finalize_artifacts(
+        artifact_root,
+        pod_id="pod-1",
+        exit_code=0,
+        terminated=True,
+        remote_command="cd /workspace/vibecomfy && bash /tmp/vibecomfy-remote-run.sh",
+        upload={"mode": "tarball", "archive_bytes": 123},
+    )
+
+    manifest_path = artifact_root / "manifest.json"
+    report_path = artifact_root / "report.md"
+    persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    report = report_path.read_text(encoding="utf-8")
+
+    assert manifest["summary"]["status"] == "pass"
+    assert persisted["pod_id"] == "pod-1"
+    assert persisted["exit_code"] == 0
+    assert persisted["terminated"] is True
+    assert persisted["summary"]["outputs"] == 1
+    assert persisted["summary"]["failures"] == 0
+    assert persisted["results"]["rows"][0]["id"] == "red"
+    assert persisted["outputs"][0]["relative_path"] == "output/smoke.png"
+    assert persisted["outputs"][0]["bytes"] == len(PNG_1X1_TRANSPARENT)
+    assert persisted["outputs"][0]["image"]["width"] == 1
+    assert persisted["outputs"][0]["image"]["height"] == 1
+    assert persisted["run_metadata"][0]["prompt_id"] == "prompt-1"
+    assert persisted["watchdogs"][0]["diagnosis"] == "crashed"
+    assert "watchdog diagnosis=crashed" in persisted["warnings"][0]
+    assert persisted["remote_script"]["relative_path"] == "out/corpus_matrix/remote_run.sh"
+    assert persisted["manifest_path"].endswith("manifest.json")
+    assert persisted["report_path"].endswith("report.md")
+    assert "# RunPod Evidence Report" in report
+    assert "| run-1 | crashed | completed | 12.5 | prompt-1 |" in report
+
+
+def test_artifact_manifest_counts_result_failures(tmp_path: Path) -> None:
+    results = tmp_path / "out" / "corpus_matrix" / "results.tsv"
+    results.parent.mkdir(parents=True)
+    results.write_text("id\tstatus\nred\tok\nblue\tfailed\n", encoding="utf-8")
+
+    manifest = runpod_runner._build_artifact_manifest(tmp_path, exit_code=0)
+
+    assert manifest["summary"]["status"] == "fail"
+    assert manifest["summary"]["failures"] == 1
+
+
+async def test_run_pod_cancellation_returns_130_and_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
+    terminated: list[bool] = []
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+
+    class FakeGuard:
+        pod = None
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def launch(self):
+            raise asyncio.CancelledError
+
+        async def terminate(self) -> None:
+            terminated.append(True)
+
+    monkeypatch.setattr(runpod_runner, "PodGuard", FakeGuard)
+    monkeypatch.setattr(runpod_runner, "install_signal_handlers", lambda _loop: asyncio.Event())
+
+    code = await runpod_runner.run_pod(
+        "echo unreachable",
+        name_prefix="test",
+        exclude=runpod_runner.DEFAULT_UPLOAD_EXCLUDES,
+        upload_mode="tarball",
+        timeout=1,
+    )
+
+    assert code == 130
+    assert terminated == [True]
+
+
+def test_lifecycle_snapshot_is_mutation_isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    source = root / "source.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("source", encoding="utf-8")
+    monkeypatch.setattr(runpod_runner, "ROOT", root)
+
+    staging_root = runpod_runner._stage_lifecycle_local_root(set())
+    try:
+        staged_source = staging_root / "source.txt"
+        assert staged_source.read_text(encoding="utf-8") == "source"
+        staged_source.write_text("lifecycle mutation", encoding="utf-8")
+        assert source.read_text(encoding="utf-8") == "source"
+    finally:
+        runpod_runner._cleanup_lifecycle_local_root(staging_root)
+    assert not staging_root.exists()
+
+
+@pytest.mark.parametrize("alias_kind", ["alias", "dangling"])
+def test_bind_artifact_root_rejects_lexical_symlink_aliases(
+    tmp_path: Path, alias_kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    expected = staging_root / "artifacts"
+    expected.mkdir(parents=True)
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+    if alias_kind == "alias":
+        returned = staging_root / "alias"
+        returned.symlink_to(expected, target_is_directory=True)
+    else:
+        returned = staging_root / "dangling"
+        returned.symlink_to(staging_root / "missing", target_is_directory=True)
+
+    destination = publication_root / "final"
+    assert runpod_runner._bind_artifact_root(
+        returned, destination, staging_root=staging_root
+    ) is None
+    assert not destination.exists()
+    assert returned.is_symlink()
+    assert expected.is_dir() and not expected.is_symlink()
+
+def test_bind_artifact_root_rejects_symlinked_staging_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    staging_root = linked_parent / "staging"
+    expected = staging_root / "artifacts"
+    expected.mkdir(parents=True)
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+
+    destination = publication_root / "final"
+    assert runpod_runner._bind_artifact_root(
+        expected, destination, staging_root=staging_root
+    ) is None
+    assert not destination.exists()
+    assert (real_parent / "staging" / "artifacts").is_dir()
+
+
+def test_bind_artifact_root_rejects_destination_parent_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    expected = staging_root / "artifacts"
+    expected.mkdir(parents=True)
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+
+    destination = publication_root / ".." / "outside"
+    assert runpod_runner._bind_artifact_root(
+        expected, destination, staging_root=staging_root
+    ) is None
+    assert not (tmp_path / "outside").exists()
+    assert expected.is_dir() and not expected.is_symlink()
+
+
+def test_bind_artifact_root_rejects_internal_symlink_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    expected = staging_root / "artifacts"
+    expected.mkdir(parents=True)
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+    target = tmp_path / "outside.txt"
+    target.write_text("must not be imported", encoding="utf-8")
+    (expected / "nested").mkdir()
+    (expected / "nested" / "alias.txt").symlink_to(target)
+
+    destination = publication_root / "final"
+    assert runpod_runner._bind_artifact_root(
+        expected, destination, staging_root=staging_root
+    ) is None
+    assert not destination.exists()
+    assert expected.is_dir() and (expected / "nested" / "alias.txt").is_symlink()
+    assert target.read_text(encoding="utf-8") == "must not be imported"
+
+
+def test_allocate_artifact_root_rejects_symlinked_publication_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_root = tmp_path / "runpod_artifacts"
+    linked_root.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", linked_root)
+
+    with pytest.raises(RuntimeError, match="not a real directory"):
+        runpod_runner._allocate_artifact_root()
+    assert list(outside.iterdir()) == []
+
+
+def test_bind_artifact_root_rejects_symlinked_intermediate_destination_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    expected = staging_root / "artifacts"
+    expected.mkdir(parents=True)
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (publication_root / "nested").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+
+    destination = publication_root / "nested" / "final"
+    assert runpod_runner._bind_artifact_root(
+        expected, destination, staging_root=staging_root
+    ) is None
+    assert not (outside / "final").exists()
+    assert expected.is_dir() and not expected.is_symlink()
+
+
+def test_bind_artifact_root_rejects_preexisting_destination_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    expected = staging_root / "artifacts"
+    expected.mkdir(parents=True)
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = publication_root / "final"
+    destination.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+
+    assert runpod_runner._bind_artifact_root(
+        expected, destination, staging_root=staging_root
+    ) is None
+    assert destination.is_symlink()
+    assert list(outside.iterdir()) == []
+    assert expected.is_dir() and not expected.is_symlink()
+
+
+def test_bind_artifact_root_concurrent_collision_publishes_one_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication_root = tmp_path / "runs"
+    publication_root.mkdir()
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", publication_root)
+    destinations = publication_root / "same"
+    roots: list[Path] = []
+    for label in ("a", "b"):
+        staging_root = tmp_path / f"staging-{label}"
+        artifact_root = staging_root / "artifacts"
+        artifact_root.mkdir(parents=True)
+        (artifact_root / "owner").write_text(label, encoding="utf-8")
+        roots.append(staging_root)
+
+    def bind(staging_root: Path) -> Path | None:
+        return runpod_runner._bind_artifact_root(
+            staging_root / "artifacts", destinations, staging_root=staging_root
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(bind, roots))
+    assert sum(result is not None for result in results) == 1
+    winner = destinations / "owner"
+    assert winner.read_text(encoding="utf-8") in {"a", "b"}
+    loser = roots[0] / "artifacts" if results[1] is not None else roots[1] / "artifacts"
+    assert (loser / "owner").exists()
+
+
+async def test_run_pod_detached_binds_unique_download_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    source_artifact = root / "artifacts" / "out" / "e2e" / "results.json"
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text('[{"status": "stale"}]', encoding="utf-8")
+    runs_root = root / "out" / "runpod_artifacts"
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr(runpod_runner, "ROOT", root)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", runs_root)
+    monkeypatch.setattr(runpod_runner, "install_signal_handlers", lambda _loop: asyncio.Event())
+    finalized: list[Path] = []
+    staging_roots: list[Path] = []
+
+    async def fake_ship_and_run_detached(*_args, **kwargs):
+        local_root = Path(kwargs["local_root"])
+        staging_roots.append(local_root)
+        assert not (local_root / "artifacts" / "out" / "e2e" / "results.json").exists()
+        current_results = local_root / "artifacts" / "out" / "e2e" / "results.json"
+        current_results.parent.mkdir(parents=True)
+        current_results.write_text('[{"status": "current"}]', encoding="utf-8")
+        return runpod_runner.ShipAndRunResult(
+            returncode=0,
+            artifact_root=local_root / "artifacts",
+            terminated=True,
+        )
+
+    monkeypatch.setattr(runpod_runner, "ship_and_run_detached", fake_ship_and_run_detached)
+    monkeypatch.setattr(
+        runpod_runner,
+        "_finalize_artifacts",
+        lambda artifact_root, **_kwargs: finalized.append(artifact_root),
+    )
+    monkeypatch.setattr(runpod_runner, "_print_detached_summary", lambda **_kwargs: None)
+
+    bound: list[Path | None] = []
+    assert (
+        await runpod_runner.run_pod_detached(
+            "echo run",
+            name_prefix="test",
+            exclude=set(),
+            upload_mode="tarball",
+            timeout=1,
+            artifact_root_out=bound,
+        )
+        == 0
+    )
+
+    assert len(bound) == 1
+    assert bound[0] is not None
+    assert bound[0].parent == runs_root
+    assert json.loads((bound[0] / "out" / "e2e" / "results.json").read_text()) == [
+        {"status": "current"}
+    ]
+    assert finalized == bound
+    assert all(not staging_root.exists() for staging_root in staging_roots)
+    assert source_artifact.read_text(encoding="utf-8") == '[{"status": "stale"}]'
+
+
+async def test_run_pod_detached_overlapping_invocations_keep_artifacts_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    source = root / "source.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("unchanged", encoding="utf-8")
+    runs_root = root / "out" / "runpod_artifacts"
+    first_ready = asyncio.Event()
+    second_written = asyncio.Event()
+    local_roots: dict[str, Path] = {}
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr(runpod_runner, "ROOT", root)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", runs_root)
+    monkeypatch.setattr(runpod_runner, "install_signal_handlers", lambda _loop: asyncio.Event())
+
+    async def fake_ship_and_run_detached(*args, **kwargs):
+        label = args[1]
+        local_root = Path(kwargs["local_root"])
+        local_roots[label] = local_root
+        artifact_dir = local_root / "artifacts"
+        artifact_dir.mkdir()
+        (artifact_dir / "owner.txt").write_text(label, encoding="utf-8")
+        if label == "A":
+            first_ready.set()
+            await second_written.wait()
+        else:
+            await first_ready.wait()
+            second_written.set()
+            await asyncio.sleep(0)
+        return runpod_runner.ShipAndRunResult(
+            returncode=0,
+            artifact_root=artifact_dir,
+            terminated=True,
+        )
+
+    monkeypatch.setattr(runpod_runner, "ship_and_run_detached", fake_ship_and_run_detached)
+    monkeypatch.setattr(runpod_runner, "_finalize_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runpod_runner, "_print_detached_summary", lambda **_kwargs: None)
+
+    bound_a: list[Path | None] = []
+    bound_b: list[Path | None] = []
+    codes = await asyncio.gather(
+        runpod_runner.run_pod_detached(
+            "A",
+            name_prefix="test",
+            exclude=set(),
+            upload_mode="tarball",
+            timeout=1,
+            artifact_root_out=bound_a,
+        ),
+        runpod_runner.run_pod_detached(
+            "B",
+            name_prefix="test",
+            exclude=set(),
+            upload_mode="tarball",
+            timeout=1,
+            artifact_root_out=bound_b,
+        ),
+    )
+
+    assert codes == [0, 0]
+    assert len(local_roots) == 2
+    assert local_roots["A"] != local_roots["B"]
+    assert bound_a[0] is not None and bound_b[0] is not None
+    assert bound_a[0] != bound_b[0]
+    assert (bound_a[0] / "owner.txt").read_text(encoding="utf-8") == "A"
+    assert (bound_b[0] / "owner.txt").read_text(encoding="utf-8") == "B"
+    assert all(not staging_root.exists() for staging_root in local_roots.values())
+    assert source.read_text(encoding="utf-8") == "unchanged"
+
+
+async def test_run_pod_detached_cleans_snapshot_on_lifecycle_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr(runpod_runner, "ROOT", root)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", root / "out" / "runs")
+    monkeypatch.setattr(runpod_runner, "install_signal_handlers", lambda _loop: asyncio.Event())
+    staging_roots: list[Path] = []
+
+    async def fake_ship_and_run_detached(*_args, **kwargs):
+        staging_roots.append(Path(kwargs["local_root"]))
+        raise RuntimeError("offline lifecycle failure")
+
+    monkeypatch.setattr(runpod_runner, "ship_and_run_detached", fake_ship_and_run_detached)
+    with pytest.raises(RuntimeError, match="offline lifecycle failure"):
+        await runpod_runner.run_pod_detached(
+            "echo run",
+            name_prefix="test",
+            exclude=set(),
+            upload_mode="tarball",
+            timeout=1,
+        )
+    assert len(staging_roots) == 1
+    assert not staging_roots[0].exists()
+
+
+async def test_run_pod_detached_cleans_snapshot_on_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr(runpod_runner, "ROOT", root)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", root / "out" / "runs")
+    monkeypatch.setattr(runpod_runner, "install_signal_handlers", lambda _loop: asyncio.Event())
+    staging_roots: list[Path] = []
+
+    async def fake_ship_and_run_detached(*_args, **kwargs):
+        staging_roots.append(Path(kwargs["local_root"]))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runpod_runner, "ship_and_run_detached", fake_ship_and_run_detached)
+    with pytest.raises(asyncio.CancelledError):
+        await runpod_runner.run_pod_detached(
+            "echo run",
+            name_prefix="test",
+            exclude=set(),
+            upload_mode="tarball",
+            timeout=1,
+        )
+    assert len(staging_roots) == 1
+    assert not staging_roots[0].exists()
+
+
+async def test_run_pod_detached_publishes_none_and_cleans_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr(runpod_runner, "ROOT", root)
+    monkeypatch.setattr(runpod_runner, "ARTIFACT_RUNS_ROOT", root / "out" / "runs")
+    monkeypatch.setattr(runpod_runner, "install_signal_handlers", lambda _loop: asyncio.Event())
+    staging_roots: list[Path] = []
+
+    async def fake_ship_and_run_detached(*_args, **kwargs):
+        staging_roots.append(Path(kwargs["local_root"]))
+        return runpod_runner.ShipAndRunResult(returncode=124, artifact_root=None)
+
+    monkeypatch.setattr(runpod_runner, "ship_and_run_detached", fake_ship_and_run_detached)
+    monkeypatch.setattr(
+        runpod_runner,
+        "_finalize_artifacts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("finalized None")),
+    )
+    summaries: list[Path | None] = []
+    monkeypatch.setattr(
+        runpod_runner,
+        "_print_detached_summary",
+        lambda **kwargs: summaries.append(kwargs["artifact_root"]),
+    )
+
+    bound: list[Path | None] = []
+    assert (
+        await runpod_runner.run_pod_detached(
+            "echo run",
+            name_prefix="test",
+            exclude=set(),
+            upload_mode="tarball",
+            timeout=1,
+            artifact_root_out=bound,
+        )
+        == 124
+    )
+    assert bound == [None]
+    assert summaries == [None]
+    assert len(staging_roots) == 1
+    assert not staging_roots[0].exists()
+
+
+async def _return_result_without_artifacts() -> runpod_runner.ShipAndRunResult:
+    return runpod_runner.ShipAndRunResult(returncode=124, artifact_root=None)
+
+
+def test_lifecycle_remote_contract_uses_concrete_exit_marker() -> None:
+    contract = runpod_runner._lifecycle_detached_remote_contract()
+
+    assert "{poll_exit_marker}" not in contract
+    assert "/tmp/runpod-lifecycle-exit-code" in contract
+    assert "poll: cat /tmp/runpod-lifecycle-exit-code 2>/dev/null || echo ''" in contract
+    assert 'printf "%s" "$rc"' in contract
+    assert "downloads artifacts after observing it" in contract

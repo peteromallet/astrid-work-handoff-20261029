@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+import pytest
+
+
+def test_top_level_public_api_exports_promised_names() -> None:
+    import vibecomfy
+    from vibecomfy.ingest.loader import load_template, load_workflow_json
+    from vibecomfy.registry.library import workflow_from_template
+    from vibecomfy.runtime.run import run_embedded, run_embedded_sync
+
+    expected = {
+        "load_workflow_json": load_workflow_json,
+        "load_template": load_template,
+        "workflow_from_template": workflow_from_template,
+        "run_embedded": run_embedded,
+        "run_embedded_sync": run_embedded_sync,
+    }
+
+    for name, value in expected.items():
+        assert getattr(vibecomfy, name) is value
+        assert name in vibecomfy.__all__
+
+
+def test_nodes_package_layout_keeps_runtime_and_stub_modules_aligned() -> None:
+    nodes_dir = Path("vibecomfy/nodes")
+
+    assert not (nodes_dir / "_generated").exists()
+    from vibecomfy.nodes import MODULES
+
+    assert {path.relative_to(nodes_dir).as_posix() for path in nodes_dir.rglob("*.pyi")} == {
+        "__init__.pyi", *(f"{name}.pyi" for name in MODULES)
+    }
+    for name in MODULES:
+        assert (nodes_dir / f"{name}.py").is_file()
+
+
+def test_runpod_dependencies_stay_out_of_core_metadata() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    core_dependencies = project["dependencies"]
+    runpod_dependencies = project["optional-dependencies"]["runpod-local"]
+
+    assert "python-dotenv>=1.0" not in core_dependencies
+    assert "python-dotenv>=1.0" in runpod_dependencies
+    assert not any("file://" in dependency or "/Users/" in dependency for dependency in runpod_dependencies)
+    lifecycle_ref = (
+        "runpod-lifecycle>=0.3.1.dev0,<0.4"
+    )
+    assert runpod_dependencies == ["python-dotenv>=1.0", lifecycle_ref]
+    assert project["optional-dependencies"]["runpod-launch"] == [
+        "python-dotenv>=1.0",
+        lifecycle_ref,
+    ]
+
+
+def test_agent_extra_uses_validated_arnold_ref() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    agent_dependencies = project["optional-dependencies"]["agent"]
+
+    assert agent_dependencies == [
+        "arnold @ git+https://github.com/peteromallet/Arnold.git@9d8b2a4af93ba764e7e82381656a8fffb3678cf7"
+    ]
+    assert not any("3db60a6cfe73e250b836d6147952ccf449151906" in dependency for dependency in agent_dependencies)
+
+
+def test_arnold_is_extra_only() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert not any(dependency.startswith("arnold ") for dependency in project["dependencies"])
+    assert any(dependency.startswith("arnold @ git+") for dependency in project["optional-dependencies"]["agent"])
+
+
+def test_unused_schema_dependencies_stay_out_of_core_metadata() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert "pydantic>=2" not in project["dependencies"]
+
+
+def test_web_dist_excluded_from_wheel_and_sdist() -> None:
+    hatch = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["hatch"]
+    web_dist_pattern = "/vibecomfy/comfy_nodes/web_dist/**"
+
+    wheel = hatch["build"]["targets"]["wheel"]
+    assert web_dist_pattern in wheel["exclude"]
+
+    sdist = hatch["build"]["targets"]["sdist"]
+    assert web_dist_pattern in sdist["exclude"]
+
+
+@pytest.fixture(scope="module")
+def installed_wheel(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    """Build and install a wheel into an isolated, no-dependency venv."""
+    build_check = subprocess.run(
+        [sys.executable, "-m", "build", "--version"],
+        capture_output=True,
+        text=True,
+    )
+    if build_check.returncode != 0:
+        pytest.skip("the wheel-build regression requires the `build` package")
+
+    root = tmp_path_factory.mktemp("wheel-install")
+    wheel_dir = root / "wheel"
+    wheel_dir.mkdir()
+    built = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheel_dir), "--no-isolation"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+    wheels = sorted(wheel_dir.glob("vibecomfy-*.whl"))
+    assert len(wheels) == 1
+
+    # Put the venv inside a checkout-shaped directory.  The installed package
+    # must still refuse checkout-only corpus access: its direct package-layout
+    # candidate is site-packages, not this ancestor checkout.
+    clone_dir = root / "clone"
+    clone_dir.mkdir()
+    (clone_dir / "pyproject.toml").write_text(
+        "[project]\nname = 'vibecomfy'\n",
+        encoding="utf-8",
+    )
+    venv_dir = clone_dir / ".venv"
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)],
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    venv_python = venv_dir / "bin" / "python"
+    if os.name == "nt":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    installed = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--no-deps", "--disable-pip-version-check", str(wheels[0])],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    return venv_python, wheels[0]
+
+
+def _install_wheel_in_venv(wheel: Path, venv_dir: Path) -> Path:
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)],
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    venv_python = venv_dir / "bin" / "python"
+    if os.name == "nt":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    installed = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--no-deps", "--disable-pip-version-check", str(wheel)],
+        cwd=venv_dir.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    return venv_python
+
+
+@pytest.mark.timeout(180)
+def test_wheel_isolated_import_cli_plugin_and_packaged_corpus(
+    installed_wheel: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    venv_python, _wheel = installed_wheel
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+    imports = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "import vibecomfy; from vibecomfy import VibeWorkflow, image, video; import vibecomfy.comfy_nodes; print(vibecomfy.__file__); print(VibeWorkflow.__name__)",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert imports.returncode == 0, imports.stdout + imports.stderr
+    package_file = Path(imports.stdout.splitlines()[0]).resolve()
+    assert package_file.is_relative_to(venv_python.parents[1].resolve())
+    assert "VibeWorkflow" in imports.stdout
+
+    help_result = subprocess.run(
+        [str(venv_python), "-m", "vibecomfy.cli", "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert help_result.returncode == 0, help_result.stdout + help_result.stderr
+    assert "usage: vibecomfy" in help_result.stdout
+
+    python_workflow = tmp_path / "direct.py"
+    python_workflow.write_text(
+        "from vibecomfy.workflow import VibeWorkflow, WorkflowSource\n\n"
+        "def build():\n"
+        "    return VibeWorkflow('wheel-python', WorkflowSource('wheel-python'))\n",
+        encoding="utf-8",
+    )
+    json_workflow = tmp_path / "direct.json"
+    json_workflow.write_text(
+        '{"1": {"class_type": "Integer", "inputs": {"value": 7}}}',
+        encoding="utf-8",
+    )
+    direct = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            (
+                "import sys; from vibecomfy import load_workflow_any; "
+                "print(load_workflow_any(sys.argv[1]).id); "
+                "print(load_workflow_any(sys.argv[2]).id)"
+            ),
+            str(python_workflow),
+            str(json_workflow),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert direct.returncode == 0, direct.stdout + direct.stderr
+    assert direct.stdout.splitlines() == ["wheel-python", "direct"]
+
+    corpus = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "from vibecomfy import load_workflow_any; wf = load_workflow_any('image/z_image'); "
+            "assert wf.nodes; print(wf.metadata['ready_template'])",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert corpus.returncode == 0, corpus.stdout + corpus.stderr
+    assert corpus.stdout.strip() == "image/z_image"
+
+
+@pytest.mark.timeout(180)
+def test_wheel_ready_template_load_and_path_trust_from_neutral_cwd(
+    installed_wheel: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    venv_python, _wheel = installed_wheel
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    script = r"""
+from pathlib import Path
+import sys
+import vibecomfy
+from vibecomfy.errors import CheckoutRequiredError
+from vibecomfy.registry.ready import repo_ready_template_root, workflow_from_ready
+from vibecomfy.scratchpad_loader import load_scratchpad
+from vibecomfy.security.gate import CapabilityFenceError, GateContext, set_gate_context
+from vibecomfy.security.loader_provenance import _provenance_for_path
+from vibecomfy.utils import find_repo_root
+
+package = Path(vibecomfy.__file__).resolve().parent
+assert package.is_relative_to(Path(sys.prefix).resolve())
+try:
+    find_repo_root()
+except CheckoutRequiredError:
+    pass
+else:
+    raise AssertionError("wheel unexpectedly found a checkout")
+root = repo_ready_template_root().resolve()
+assert root.is_relative_to(package)
+set_gate_context(GateContext(non_interactive=True, assume_yes=False, audit=[]))
+workflow = workflow_from_ready("image/z_image")
+assert workflow.nodes
+assert workflow.metadata["ready_template"] == "image/z_image"
+assert _provenance_for_path(root / "image" / "z_image.py") == "agent_authored"
+
+# Cwd-shaped checkout paths are never promoted to trusted roots.
+for directory in (Path.cwd() / "ready_templates", Path.cwd() / "out" / "scratchpads"):
+    directory.mkdir(parents=True)
+    path = directory / "evil.py"
+    path.write_text("from pathlib import Path\nPath('executed').write_text('yes')\n")
+    assert _provenance_for_path(path) == "untrusted_source"
+    try:
+        load_scratchpad(path)
+    except CapabilityFenceError as exc:
+        assert exc.detail["provenance"] == "untrusted_source"
+    else:
+        raise AssertionError("external path passed the headless gate")
+assert not Path("executed").exists()
+
+outside = Path.cwd() / "ready_templates" / "evil.py"
+escape = root / "escape_probe.py"
+escape.symlink_to(outside)
+try:
+    assert _provenance_for_path(escape) == "untrusted_source"
+    assert _provenance_for_path(root / ".." / ".." / ".." / outside.name) == "untrusted_source"
+finally:
+    escape.unlink()
+"""
+    result = subprocess.run(
+        [str(venv_python), "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_wheel_does_not_trust_spoofed_ancestor_pyproject(
+    installed_wheel: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _installed_python, wheel = installed_wheel
+    spoofed_root = tmp_path / "spoofed-ancestor"
+    spoofed_root.mkdir()
+    (spoofed_root / "pyproject.toml").write_text(
+        "[project]\nname = 'vibecomfy'\n",
+        encoding="utf-8",
+    )
+    spoofed_python = _install_wheel_in_venv(wheel, spoofed_root / ".venv")
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+    result = subprocess.run(
+        [
+            str(spoofed_python),
+            "-c",
+            "import vibecomfy; from vibecomfy.utils import find_repo_root; print(vibecomfy.__file__); find_repo_root()",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode != 0
+    package_file = Path(result.stdout.splitlines()[0]).resolve()
+    assert package_file.is_relative_to(spoofed_python.parents[1].resolve())
+    assert "CheckoutRequiredError" in result.stderr
+    assert "git checkout" in result.stderr
+
+
+def test_wheel_metadata_keeps_arnold_under_agent_extra(installed_wheel: tuple[Path, Path]) -> None:
+    venv_python, _wheel = installed_wheel
+    result = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "import importlib.metadata as m; print(*m.metadata('vibecomfy').get_all('Requires-Dist'), sep='\\n')",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    requirements = result.stdout.splitlines()
+    assert not any(line == "arnold" or line.startswith("arnold ") and "extra == 'agent'" not in line for line in requirements)
+    assert any("arnold @ git+https://github.com/peteromallet/Arnold.git@9d8b2a4af93ba764e7e82381656a8fffb3678cf7" in line and "extra == 'agent'" in line for line in requirements)

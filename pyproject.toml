@@ -1,0 +1,150 @@
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vibecomfy"
+version = "2.8.0"
+description = "Python scratchpads for discovering, editing, validating, and running ComfyUI workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "huggingface_hub[hf_xet]>=0.32.0",
+  "httpx>=0.25",
+  "pyyaml>=6",
+  "websockets>=12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "aiohttp>=3.9",
+  "hypothesis>=6.100",
+  "import-linter>=2.3",
+  "pytest>=7",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=4",
+  "pytest-rerunfailures>=14",
+  "pytest-timeout>=2.3",
+  "pytest-xdist>=3.6",
+]
+comfy = [
+  # Optional adoption hook only. No core VibeComfy feature depends on this;
+  # vibecomfy.comfy_backend.ensure_nodes() falls back to pure-Python when this
+  # extra is not installed. The package is published on AppMana's Python index;
+  # pip callers must pass --extra-index-url https://nodes.appmana.com/simple/.
+  #
+  # Frontend pin conflict: comfyui 0.26.0 pins comfyui-frontend-package<1.46
+  # while a fresh ComfyUI checkout tracks a 1.48.x frontend. Installing this
+  # extra into a checkout venv can therefore surface a pip resolver conflict; it
+  # is benign because the checkout's own comfy/ package wins when running
+  # main.py, but keep checkout venvs and [comfy]-extra venvs separate. See the
+  # "Use VibeComfy Inside ComfyUI" section of the README.
+  "comfyui==0.26.0",
+]
+png = [
+  # Optional image-ingest hook (M2 Step 11): read a ComfyUI workflow chunk
+  # embedded in a PNG/WebP. Kept in its OWN group (NOT [comfy]) so neither
+  # depends on the other; load_port_source raises a clear ImportError when a
+  # PNG/WebP source is requested without Pillow installed.
+  "Pillow>=10.0",
+]
+agent = [
+  # The agent-edit runtime backend (the package is named ``arnold``).
+  # OPTIONAL: only the VibeComfy agent-edit panel routing to the local
+  # Arnold/Hermes backend needs it. VibeComfy installs and tests without it;
+  # default agent turns still need ``arnold.agent``. The runtime is pluggable
+  # via VIBECOMFY_ARNOLD_RUNTIME_MODULE for explicit provider substitutions.
+  # Pinned to the latest pushed Arnold SHA we validate against; bump as Arnold
+  # stabilizes (a real release tag would replace this).
+  "arnold @ git+https://github.com/peteromallet/Arnold.git@9d8b2a4af93ba764e7e82381656a8fffb3678cf7",
+]
+runpod-local = [
+  "python-dotenv>=1.0",
+  "runpod-lifecycle>=0.3.1.dev0,<0.4",
+]
+runpod-launch = [
+  "python-dotenv>=1.0",
+  "runpod-lifecycle>=0.3.1.dev0,<0.4",
+]
+intent = [
+  # Optional extra for the intent-oracle gate (S3).  anthropic is needed for
+  # text-judge / vision-judge LLM calls; Pillow is needed for pHash-based
+  # structural diff detection.  Neither is required for any other module.
+  "anthropic>=0.40",
+  "Pillow>=10",
+]
+
+[project.scripts]
+vibecomfy = "vibecomfy.cli:main"
+vibecomfy-agent = "vibecomfy.agent.__main__:main"
+
+[project.entry-points."vibecomfy.plugins"]
+# my_plugin = "my_pkg:register"
+
+[project.entry-points."comfyui.custom_nodes"]
+vibecomfy = "vibecomfy.comfy_nodes"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vibecomfy"]
+artifacts = [
+  "vibecomfy/py.typed",
+  "vibecomfy/**/*.pyi",
+]
+exclude = [
+  "/vibecomfy/comfy_nodes/web_dist/**",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"ready_templates" = "vibecomfy/ready_templates"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/vibecomfy/comfy_nodes/web_dist/**",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-m 'not gpu'"
+timeout = 60
+markers = [
+  "comfy_version_compat: marks opt-in multi-ComfyUI-version compatibility tests (Sprint 4 scope).",
+  "gpu: marks tests that provision live GPU resources",
+  "intent_ci: marks fast, deterministic intent-oracle CI gate tests (invoke with `pytest -m intent_ci tests/intent`).",
+  "runpod: opt-in smoke tests that provision real RunPod GPU pods (requires --runpod and RUNPOD_API_KEY).",
+  "runpod_full: opt-in production-resolution matrix tests; multi-pod, ~$5-10 per run (requires --runpod-full and RUNPOD_API_KEY).",
+  "comfy: opt-in release gate that imports ComfyUI and runs convert_ui_to_api; skipped offline (requires VIBECOMFY_COMFY_SMOKE=1).",
+  "live: tests that call real model/provider APIs and require credentials (skipped when unavailable).",
+  "characterization: deterministic behavioural snapshot gate; requires PYTHONHASHSEED=0.",
+  "sprint_a: acceptance gate that must pass after Sprint A (see docs/megaplan_chains/node_resolution_epic/testing/testing.md).",
+
+  "sprint_b: acceptance gate that must pass after Sprint B (see docs/megaplan_chains/node_resolution_epic/testing/testing.md).",
+  "sprint_c: acceptance gate that must pass after Sprint C (see docs/megaplan_chains/node_resolution_epic/testing/testing.md).",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.coverage.run]
+source = ["vibecomfy"]
+branch = false
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = true
+exclude_lines = ["pragma: no cover", "raise NotImplementedError", "if TYPE_CHECKING:"]
+
+[project.entry-points.pytest11]
+vibecomfy = "vibecomfy.testing._pytest_plugin"
+
+[tool.uv.sources]
+comfyui = { index = "appmana" }
+# The selected RunPod candidate is staged as a hash-bound wheel inside this
+# candidate. candidate-dependencies.json binds its revision, tree and wheel
+# digest for isolated offline staging/install checks.
+runpod-lifecycle = { path = "vendor/wheels/runpod_lifecycle-0.3.1.dev0-py3-none-any.whl", editable = false }
+
+[[tool.uv.index]]
+name = "appmana"
+url = "https://nodes.appmana.com/simple/"
+explicit = true

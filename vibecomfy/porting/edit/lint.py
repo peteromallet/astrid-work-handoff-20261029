@@ -1,0 +1,1421 @@
+"""Pure lint data model and read-only index for agent-edit delta hygiene.
+
+Provides :class:`LintIssue`, :class:`LintResult`, :class:`LintNormalization`
+and the immutable :class:`LintIndex` that maps a raw LiteGraph UI dict into
+deterministic canonical-uid and LiteGraph-id lookups with no side effects.
+
+Design
+------
+- ``LintIndex`` is built from ``original_ui`` via ``UiGraphIndex.ingest()``.
+- Canonical uids (stamped by the ledger) and raw LiteGraph integer ids are
+  indexed separately so later lint rules can resolve either reference form.
+- Node metadata (class_type, input/output names, slot indices) is extracted
+  once and exposed read-only.
+- Link indexing covers both link-id and endpoint-based lookups.
+- All dataclasses are frozen; the index is never mutated after construction.
+
+``lint_delta()``
+----------------
+The main entry point accepts a sequence of :class:`EditOp` objects and a
+:class:`LintIndex`, and returns a :class:`LintResult` with:
+
+- **surviving** ops (possibly with LiteGraph ids rewritten to canonical uids)
+- **issues** (typed errors for unknown targets / fields / malformed ops)
+- **normalizations** (disposition of every original op)
+
+Rules enforced:
+
+- *identity* – LiteGraph integer ids in uid positions are normalised to the
+  canonical uid.  Ops whose target node exists pass through with the uid
+  rewritten if needed.
+- *unknown target* – any node, link, or field reference that cannot be
+  resolved produces a ``rejected`` disposition with a typed issue.
+- *field no-op* – ``set_node_field`` ops that would set a field to its
+  current value are dropped as ``dropped_noop``.
+- *mode no-op* – ``set_mode`` ops that set the mode the node already has
+  are dropped as ``dropped_noop``.
+- *add_node* – validates that ``class_type`` is non-empty and (when a
+  ``schema_provider`` is supplied) that the class is known and all
+  ``inputs`` keys name valid inputs on that class.
+- *upsert_link* – resolves source/target uids, validates output slots
+  and input fields exist, and detects no-ops when an identical link
+  already exists.  Socket-type compatibility is deferred to apply.
+- *remove_link* – validates link-id or target-based references and
+  detects no-ops when no matching link is found.  Does not dereference
+  link ids across scopes (link-id searches are root-scope only).
+"""
+
+from __future__ import annotations
+
+from vibecomfy.ingest.normalize import door_get_widgets_values
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+import re
+from typing import Any, Mapping, Sequence
+
+from .ops import (
+    AddNodeOp,
+    EditOp,
+    LinkSourceRef,
+    LinkTargetRef,
+    NodeFieldTarget,
+    NodeTarget,
+    RemoveLinkOp,
+    RemoveNodeOp,
+    SetModeOp,
+    SetNodeFieldOp,
+    UpsertLinkOp,
+)
+from ._session_types import OperationTransition, _freeze_report
+from vibecomfy.porting.resolution import (
+    _NodeMeta,
+    LintIndexBackend,
+    ResolutionContext,
+    ResolutionIssue,
+    build_lg_id_maps,
+)
+from vibecomfy.porting.edit._ir_utils import (
+    _canonical_input_name_for_class,
+    _input_spec_for_field,
+)
+from vibecomfy.porting.endpoint_invariant import dynamic_port_authorized
+from vibecomfy.porting.edit.admit import AdmissionSnapshot
+
+
+def _is_dynamic_add_node_input(
+    *,
+    class_type: str,
+    input_name: str,
+    fields: Mapping[str, Any],
+    schema_inputs: Mapping[str, Any],
+) -> bool:
+    authorized, _reason = dynamic_port_authorized(
+        class_type,
+        "input",
+        input_name,
+        fields=fields,
+        schema=SimpleNamespace(inputs=schema_inputs),
+    )
+    return authorized
+
+
+# ── data model ──────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class LintIssue:
+    """One lint finding for an edit operation.
+
+    Analogous to ``PortIssue`` but scoped to delta-level concerns:
+    no-op detection, identity resolution, structural malformation, etc.
+    """
+
+    code: str
+    message: str
+    severity: str = "error"  # "error", "warning", "info"
+    op_index: int | None = None  # position in the original delta
+    op_kind: str | None = None  # e.g. "add_node", "set_node_field"
+    scope_path: str | None = None
+    uid: str | None = None
+    lg_id: int | None = None
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class LintNormalization:
+    """Describes what happened to a single edit op during linting."""
+
+    op_index: int
+    op: EditOp
+    disposition: str  # "passed", "dropped_noop", "rejected"
+    issue: LintIssue | None = None  # set when disposition is not "passed"
+
+
+@dataclass(frozen=True, slots=True)
+class LintResult:
+    """The outcome of linting a delta against a :class:`LintIndex`.
+
+    ``surviving`` contains only the ops that passed lint (no-ops are dropped,
+    malformed ops are rejected).  ``normalizations`` records the disposition
+    of every op in the original delta so callers can emit diagnostics or adjust
+    landed-count accounting.
+    """
+
+    surviving: tuple[EditOp, ...]
+    issues: tuple[LintIssue, ...]
+    normalizations: tuple[LintNormalization, ...]
+    # Application/evaluation evidence is trailing so existing callers that
+    # construct the three core fields remain source-compatible.
+    transitions: tuple[OperationTransition, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Reports cross the session boundary.  Freeze nested operation values,
+        # issue details, and normalization payloads so a caller cannot mutate
+        # the evidence after it has been used for admission/replay.
+        # Surviving operations cross the same custody boundary as transitions;
+        # detach and recursively freeze their nested targets/values too.
+        object.__setattr__(
+            self,
+            "surviving",
+            tuple(_freeze_report(item) for item in self.surviving),
+        )
+        object.__setattr__(self, "issues", tuple(_freeze_report(item) for item in self.issues))
+        object.__setattr__(self, "normalizations", tuple(_freeze_report(item) for item in self.normalizations))
+        object.__setattr__(self, "transitions", tuple(_freeze_report(item) for item in self.transitions))
+
+    @property
+    def passed_count(self) -> int:
+        return sum(
+            1 for n in self.normalizations if n.disposition == "passed"
+        )
+
+    @property
+    def dropped_count(self) -> int:
+        return sum(
+            1 for n in self.normalizations if n.disposition == "dropped_noop"
+        )
+
+    @property
+    def rejected_count(self) -> int:
+        return sum(
+            1 for n in self.normalizations if n.disposition == "rejected"
+        )
+
+    @property
+    def apply_eligible(self) -> bool:
+        """Lint preview is analysis only and never grants commitment."""
+        return False
+
+
+# ── LintIndex ───────────────────────────────────────────────────────────────
+
+def _build_node_meta(
+    node_index: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[tuple[str, str], _NodeMeta]:
+    """Extract node metadata from every scoped node."""
+    meta: dict[tuple[str, str], _NodeMeta] = {}
+    for (scope_path, uid), node in node_index.items():
+        lg_id: int | None = node.get("id")
+        if not isinstance(lg_id, int):
+            # defensive: every LiteGraph node MUST have an integer id
+            lg_id = -1
+        class_type: str = node.get("type") or node.get("class_type") or ""
+        # input names in insertion order (LiteGraph preserves it)
+        raw_inputs = node.get("inputs")
+        input_names: tuple[str, ...] = ()
+        if isinstance(raw_inputs, list):
+            input_names = tuple(
+                entry.get("name") or ""
+                for entry in raw_inputs
+                if isinstance(entry, dict)
+            )
+        # output names + slot indices
+        raw_outputs = node.get("outputs")
+        output_names: tuple[str, ...] = ()
+        output_slots: dict[str, int] = {}
+        if isinstance(raw_outputs, list):
+            out_names: list[str] = []
+            for entry in raw_outputs:
+                if isinstance(entry, dict):
+                    name = entry.get("name") or ""
+                    out_names.append(name)
+                    slot = entry.get("slot_index")
+                    if isinstance(slot, int):
+                        output_slots[name] = slot
+            output_names = tuple(out_names)
+        meta[(scope_path, uid)] = _NodeMeta(
+            scope_path=scope_path,
+            uid=uid,
+            lg_id=lg_id,
+            class_type=class_type,
+            input_names=input_names,
+            output_names=output_names,
+            output_slots=output_slots,
+        )
+    return meta
+
+
+def _build_link_sets(
+    link_index: Mapping[tuple[str, int], Any],
+) -> tuple[
+    dict[str, frozenset[int]],
+    dict[tuple[str, int], Any],
+]:
+    """Collect existing link ids per scope and a link-by-id lookup."""
+    link_ids: dict[str, set[int]] = {}
+    link_by_id: dict[tuple[str, int], Any] = {}
+    for (scope_path, link_id), link in link_index.items():
+        link_ids.setdefault(scope_path, set()).add(link_id)
+        link_by_id[(scope_path, link_id)] = link
+    frozen: dict[str, frozenset[int]] = {
+        sp: frozenset(ids) for sp, ids in link_ids.items()
+    }
+    return frozen, link_by_id
+
+
+@dataclass(frozen=True, slots=True)
+class LintIndex:
+    """Read-only index over an ``original_ui`` LiteGraph dict.
+
+    Built deterministically from ``original_ui`` via ``UiGraphIndex.ingest()``.
+    Exposes canonical-uid and LiteGraph-id lookups, node metadata, and
+    existing link indexing for downstream lint rules.
+
+    Usage::
+
+        index = LintIndex.build(original_ui)
+
+        # resolve a node by canonical uid or LiteGraph id
+        index.node_by_uid(scope_path, uid)
+        index.node_by_lg_id(scope_path, lg_id)
+
+        # translate between uid and LiteGraph id
+        index.uid_for_lg_id(scope_path, lg_id)
+        index.lg_id_for_uid(scope_path, uid)
+
+        # inspect node metadata
+        meta = index.node_meta_for(scope_path, uid)
+        meta.class_type
+        meta.input_names
+        meta.output_names
+    """
+
+    graph: Mapping[str, Any] = field(repr=False)
+    _scopes: dict[str, Mapping[str, Any]] = field(repr=False)
+    _node_index: dict[tuple[str, str], Mapping[str, Any]] = field(repr=False)
+    # LiteGraph integer id → canonical uid (per scope)
+    _lg_id_to_uid: dict[tuple[str, int], str] = field(repr=False)
+    # canonical uid → LiteGraph integer id (per scope)
+    _uid_to_lg_id: dict[tuple[str, str], int] = field(repr=False)
+    # (scope_path, uid) → immutable node metadata
+    _node_meta: dict[tuple[str, str], _NodeMeta] = field(repr=False)
+    # scope_path → frozen set of existing link ids
+    _link_ids: dict[str, frozenset[int]] = field(repr=False)
+    # (scope_path, link_id) → raw link object
+    _link_by_id: dict[tuple[str, int], Any] = field(repr=False)
+
+    @classmethod
+    def build(cls, original_ui: Mapping[str, Any]) -> "LintIndex":
+        """Construct a read-only index from a raw LiteGraph UI dict.
+
+        *original_ui* is a LiteGraph serialisation dict (nodes, links,
+        definitions, etc.) as stored in the workflow JSON.
+        """
+        from vibecomfy.porting.reorganise.graph_facts import UiGraphIndex
+
+        indexed = UiGraphIndex.ingest(original_ui)
+        scopes = {path: scope.graph for path, scope in indexed.scopes.items()}
+        node_index = indexed.node_index
+        link_index = indexed.link_index
+        lg_id_to_uid, uid_to_lg_id = build_lg_id_maps(node_index)
+        node_meta = _build_node_meta(node_index)
+        link_ids, link_by_id = _build_link_sets(link_index)
+        return cls(
+            graph=dict(original_ui),
+            _scopes=scopes,
+            _node_index=node_index,
+            _lg_id_to_uid=lg_id_to_uid,
+            _uid_to_lg_id=uid_to_lg_id,
+            _node_meta=node_meta,
+            _link_ids=link_ids,
+            _link_by_id=link_by_id,
+        )
+
+    # -- scope helpers --------------------------------------------------------
+
+    @property
+    def scope_paths(self) -> tuple[str, ...]:
+        """All scope paths in insertion order (root ``""`` first)."""
+        return tuple(self._scopes.keys())
+
+    def has_scope(self, scope_path: str) -> bool:
+        return scope_path in self._scopes
+
+    # -- node resolution ------------------------------------------------------
+
+    def node_by_uid(
+        self, scope_path: str, uid: str
+    ) -> dict[str, Any] | None:
+        """Return the LiteGraph node dict for *uid* in *scope_path*."""
+        node = self._node_index.get((scope_path, uid))
+        return dict(node) if isinstance(node, Mapping) else None
+
+    def node_by_lg_id(
+        self, scope_path: str, lg_id: int
+    ) -> dict[str, Any] | None:
+        """Return the LiteGraph node dict for *lg_id* in *scope_path*."""
+        uid = self._lg_id_to_uid.get((scope_path, lg_id))
+        if uid is None:
+            return None
+        return self.node_by_uid(scope_path, uid)
+
+    # -- uid ↔ lg_id translation ----------------------------------------------
+
+    def uid_for_lg_id(self, scope_path: str, lg_id: int) -> str | None:
+        """Return the canonical uid for *lg_id* in *scope_path*."""
+        return self._lg_id_to_uid.get((scope_path, lg_id))
+
+    def lg_id_for_uid(self, scope_path: str, uid: str) -> int | None:
+        """Return the LiteGraph integer id for *uid* in *scope_path*."""
+        return self._uid_to_lg_id.get((scope_path, uid))
+
+    # -- node existence and metadata ------------------------------------------
+
+    def node_exists(self, scope_path: str, uid: str) -> bool:
+        """Return True if *uid* names a node in *scope_path*."""
+        return (scope_path, uid) in self._node_meta
+
+    def node_meta_for(
+        self, scope_path: str, uid: str
+    ) -> _NodeMeta | None:
+        """Return immutable metadata for *uid* in *scope_path*."""
+        return self._node_meta.get((scope_path, uid))
+
+    def class_type_for(self, scope_path: str, uid: str) -> str | None:
+        """Return the ``class_type`` for *uid* in *scope_path*."""
+        meta = self._node_meta.get((scope_path, uid))
+        return meta.class_type if meta is not None else None
+
+    def input_names_for(self, scope_path: str, uid: str) -> tuple[str, ...]:
+        """Return input names for *uid* in *scope_path* (empty if unknown)."""
+        meta = self._node_meta.get((scope_path, uid))
+        return meta.input_names if meta is not None else ()
+
+    def output_names_for(self, scope_path: str, uid: str) -> tuple[str, ...]:
+        """Return output names for *uid* in *scope_path* (empty if unknown)."""
+        meta = self._node_meta.get((scope_path, uid))
+        return meta.output_names if meta is not None else ()
+
+    def output_slot_for(
+        self, scope_path: str, uid: str, output_name: str
+    ) -> int | None:
+        """Return the LiteGraph slot_index for *output_name* (or None)."""
+        meta = self._node_meta.get((scope_path, uid))
+        if meta is None:
+            return None
+        return meta.output_slots.get(output_name)
+
+    # -- link indexing --------------------------------------------------------
+
+    def link_ids_for_scope(self, scope_path: str) -> frozenset[int]:
+        """Return the frozen set of existing link ids in *scope_path*."""
+        return self._link_ids.get(scope_path, frozenset())
+
+    def link_by_id(
+        self, scope_path: str, link_id: int
+    ) -> Any | None:
+        """Return the raw link object for *link_id* in *scope_path*."""
+        return self._link_by_id.get((scope_path, link_id))
+
+    def link_exists(self, scope_path: str, link_id: int) -> bool:
+        """Return True if *link_id* exists in *scope_path*."""
+        return (scope_path, link_id) in self._link_by_id
+
+
+# ── lint helpers ────────────────────────────────────────────────────────────
+
+def _node_label(index: LintIndex, scope_path: str, uid: str) -> str:
+    """Return a human-readable label for *uid* in *scope_path*.
+
+    Uses ``class_type`` as the primary label; appends ``title`` when it
+    is non-empty and differs from the class type (e.g.
+    ``"CLIPTextEncode 'my prompt'"``).  Falls back to the raw *uid* when
+    no metadata is available.
+    """
+    meta = index.node_meta_for(scope_path, uid)
+    if meta is None:
+        return uid
+    class_type = meta.class_type or "node"
+    node = index.node_by_uid(scope_path, uid)
+    title: str | None = None
+    if isinstance(node, dict):
+        raw_title = node.get("title")
+        if isinstance(raw_title, str) and raw_title.strip():
+            title = raw_title.strip()
+    if title and title != class_type:
+        return f"{class_type} '{title}'"
+    return class_type
+
+
+def _display_value(value: object, *, limit: int = 48) -> str:
+    """Render *value* as a compact, human-readable string (no raw dicts)."""
+    if isinstance(value, str):
+        text = value
+    elif value is None:
+        text = "null"
+    elif isinstance(value, (int, float, bool)):
+        text = str(value)
+    else:
+        import json as _json
+
+        try:
+            text = _json.dumps(_json_safe(value), sort_keys=True)
+        except (TypeError, ValueError):
+            text = str(value)
+    # Collapse whitespace
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: max(0, limit - 1)] + "…"
+    return text
+
+
+def _json_safe(obj: object) -> object:
+    """Coerce *obj* to a JSON-serialisable value."""
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    return str(obj)
+
+
+def _make_issue(
+    code: str,
+    message: str,
+    *,
+    severity: str = "error",
+    op_index: int | None = None,
+    op_kind: str | None = None,
+    scope_path: str | None = None,
+    uid: str | None = None,
+    lg_id: int | None = None,
+    detail: dict[str, Any] | None = None,
+) -> LintIssue:
+    return LintIssue(
+        code=code,
+        message=message,
+        severity=severity,
+        op_index=op_index,
+        op_kind=op_kind,
+        scope_path=scope_path,
+        uid=uid,
+        lg_id=lg_id,
+        detail=dict(detail or {}),
+    )
+
+
+_ctx = ResolutionContext()
+
+
+def _ri_to_lint_issue(
+    ri: ResolutionIssue,
+    *,
+    op_index: int,
+    op_kind: str,
+) -> LintIssue:
+    """Adapt a ResolutionIssue from ResolutionContext to a LintIssue."""
+    lg_id: int | None = ri.detail.get("lg_id") if ri.detail else None
+    if not isinstance(lg_id, int):
+        lg_id = None
+    return LintIssue(
+        code=ri.code,
+        message=ri.message,
+        severity=ri.severity,
+        op_index=op_index,
+        op_kind=op_kind,
+        scope_path=ri.scope_path,
+        uid=ri.uid,
+        lg_id=lg_id,
+        detail=ri.detail,
+    )
+
+
+def _resolve_uid(
+    index: LintIndex,
+    scope_path: str,
+    uid_str: str,
+    *,
+    op_index: int,
+    op_kind: str,
+) -> tuple[str | None, LintIssue | None]:
+    result = _ctx.resolve_uid(LintIndexBackend(index), scope_path, uid_str)
+    if result.value is not None:
+        return result.value, None
+    issue = _ri_to_lint_issue(result.issues[0], op_index=op_index, op_kind=op_kind) if result.issues else None
+    return None, issue
+
+
+def _resolve_node_target(
+    index: LintIndex,
+    target: NodeTarget,
+    *,
+    op_index: int,
+    op_kind: str,
+) -> tuple[NodeTarget | None, LintIssue | None]:
+    result = _ctx.resolve_node_target(LintIndexBackend(index), target)
+    if result.value is not None:
+        return result.value, None
+    issue = _ri_to_lint_issue(result.issues[0], op_index=op_index, op_kind=op_kind) if result.issues else None
+    return None, issue
+
+
+def _resolve_node_field_target(
+    index: LintIndex,
+    target: NodeFieldTarget,
+    *,
+    op_index: int,
+    op_kind: str,
+) -> tuple[NodeFieldTarget | None, LintIssue | None]:
+    result = _ctx.resolve_node_field_target(LintIndexBackend(index), target)
+    if result.value is not None:
+        return result.value, None
+    issue = _ri_to_lint_issue(result.issues[0], op_index=op_index, op_kind=op_kind) if result.issues else None
+    return None, issue
+
+
+def _resolve_link_source(
+    index: LintIndex,
+    source: LinkSourceRef,
+    *,
+    op_index: int,
+    op_kind: str,
+) -> tuple[LinkSourceRef | None, LintIssue | None]:
+    result = _ctx.resolve_link_source(LintIndexBackend(index), source)
+    if result.value is not None:
+        return result.value, None
+    issue = _ri_to_lint_issue(result.issues[0], op_index=op_index, op_kind=op_kind) if result.issues else None
+    return None, issue
+
+
+def _resolve_link_target(
+    index: LintIndex,
+    target: LinkTargetRef,
+    *,
+    op_index: int,
+    op_kind: str,
+) -> tuple[LinkTargetRef | None, LintIssue | None]:
+    result = _ctx.resolve_link_target(LintIndexBackend(index), target)
+    if result.value is not None:
+        return result.value, None
+    issue = _ri_to_lint_issue(result.issues[0], op_index=op_index, op_kind=op_kind) if result.issues else None
+    return None, issue
+
+
+def _link_origin_id(link: Any) -> int | None:
+    """Extract the origin node LiteGraph id from a raw link object."""
+    if isinstance(link, Mapping):
+        oid = link.get("origin_id")
+        if isinstance(oid, int):
+            return oid
+        return None
+    if isinstance(link, (list, tuple)) and len(link) >= 2:
+        oid = link[1]
+        if isinstance(oid, int):
+            return oid
+    return None
+
+
+def _link_origin_slot(link: Any) -> int | None:
+    """Extract the origin slot index from a raw link object."""
+    if isinstance(link, Mapping):
+        slot = link.get("origin_slot")
+        if isinstance(slot, int):
+            return slot
+        return None
+    if isinstance(link, (list, tuple)) and len(link) >= 3:
+        slot = link[2]
+        if isinstance(slot, int):
+            return slot
+    return None
+
+
+def _link_target_id(link: Any) -> int | None:
+    """Extract the target node LiteGraph id from a raw link object."""
+    if isinstance(link, Mapping):
+        tid = link.get("target_id")
+        if isinstance(tid, int):
+            return tid
+        return None
+    if isinstance(link, (list, tuple)) and len(link) >= 4:
+        tid = link[3]
+        if isinstance(tid, int):
+            return tid
+    return None
+
+
+def _link_target_slot(link: Any) -> int | None:
+    """Extract the target slot index from a raw link object."""
+    if isinstance(link, Mapping):
+        slot = link.get("target_slot")
+        if isinstance(slot, int):
+            return slot
+        return None
+    if isinstance(link, (list, tuple)) and len(link) >= 5:
+        slot = link[4]
+        if isinstance(slot, int):
+            return slot
+    return None
+
+
+def _resolve_output_slot_index(
+    index: LintIndex, scope_path: str, uid: str, output_slot: str | int,
+    *, schema_provider: Any = None, workflow: Any = None,
+) -> int | None:
+    # The canonical IR node is the shared exec-output authority.  The UI
+    # projection intentionally carries the physical ``out_N`` row name,
+    # while authored exec IO may expose the semantic/typed renderer alias
+    # (for example ``IMAGE_0``).  Ask the existing interpreter seam for the
+    # exact name and then use its frozen evidence to recover the physical
+    # index; do not infer a generic capacity or parse a second IO schema.
+    if workflow is not None and not scope_path:
+        node = (getattr(workflow, "nodes", {}) or {}).get(str(uid))
+        if node is not None:
+            from vibecomfy.porting.edit._interpret import (
+                _frozen_output_evidence,
+                canonical_renderer_output,
+            )
+
+            resolved_name = canonical_renderer_output(
+                node, output_slot, provider=schema_provider
+            )
+            if resolved_name is not None:
+                names, _types, _sources, _arity = _frozen_output_evidence(
+                    node, provider=schema_provider
+                )
+                for slot_index, name in names.items():
+                    if name == resolved_name:
+                        return slot_index
+            if str(getattr(node, "class_type", "")) == "vibecomfy.exec":
+                # Authored exec IO is complete authority.  Never fall back to
+                # the generic UI/provider roster when its alias is absent.
+                return None
+    result = _ctx.resolve_output_slot_index(
+        LintIndexBackend(index),
+        scope_path,
+        uid,
+        output_slot,
+        schema_provider=schema_provider,
+    )
+    return result.value
+
+
+def _resolve_input_slot_index(
+    index: LintIndex, scope_path: str, uid: str, input_field: str,
+    *, schema_provider: Any = None, workflow: Any = None,
+) -> int | None:
+    result = _ctx.resolve_input_slot_index(LintIndexBackend(index), scope_path, uid, input_field)
+    if result.value is not None:
+        return result.value
+    if workflow is None or scope_path:
+        return None
+    node = next(
+        (
+            candidate
+            for node_id, candidate in (getattr(workflow, "nodes", {}) or {}).items()
+            if str(node_id) == str(uid)
+            or str(getattr(candidate, "uid", "") or "") == str(uid)
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    metadata = getattr(node, "metadata", None) or {}
+    # Only nodes created during this transaction may materialize a frozen
+    # schema socket that was absent from the current presentation. Existing
+    # captured nodes remain governed by their actual UI socket roster.
+    if not (
+        isinstance(metadata, Mapping)
+        and metadata.get("_edit_created_in_transaction") is True
+    ):
+        return None
+    try:
+        from vibecomfy.schema import schema_for
+
+        schema = schema_for(schema_provider, str(getattr(node, "class_type", "") or ""))
+    except Exception:
+        schema = None
+    inputs = getattr(schema, "inputs", None)
+    if not isinstance(inputs, Mapping) or input_field not in inputs:
+        return None
+    return list(inputs).index(input_field)
+
+
+def _find_matching_link(
+    index: LintIndex,
+    scope_path: str,
+    source_uid: str,
+    output_slot: str | int,
+    target_uid: str,
+    input_field: str,
+) -> Any | None:
+    """Return the first existing link that matches the given endpoints.
+
+    Returns the raw link object if found, or ``None``.
+    """
+    source_lg_id = index.lg_id_for_uid(scope_path, source_uid)
+    target_lg_id = index.lg_id_for_uid(scope_path, target_uid)
+    if source_lg_id is None or target_lg_id is None:
+        return None
+
+    source_slot_idx = _resolve_output_slot_index(
+        index, scope_path, source_uid, output_slot,
+    )
+    target_slot_idx = _resolve_input_slot_index(
+        index, scope_path, target_uid, input_field,
+    )
+    if source_slot_idx is None or target_slot_idx is None:
+        return None
+
+    for link_id in index.link_ids_for_scope(scope_path):
+        link = index.link_by_id(scope_path, link_id)
+        if link is None:
+            continue
+        oid = _link_origin_id(link)
+        osl = _link_origin_slot(link)
+        tid = _link_target_id(link)
+        tsl = _link_target_slot(link)
+        if (oid == source_lg_id and osl == source_slot_idx
+                and tid == target_lg_id and tsl == target_slot_idx):
+            return link
+    return None
+
+
+def _node_field_value(
+    index: LintIndex,
+    scope_path: str,
+    uid: str,
+    field_path: str,
+    *,
+    schema_provider: Any = None,
+) -> Any:
+    """Read the current value of *field_path* from the live node dict.
+
+    Returns a sentinel (``_MISSING``) when the field does not exist.
+    """
+    node = index.node_by_uid(scope_path, uid)
+    if node is None:
+        return _MISSING
+    # Widget values are stored as a list.  The authoring surface accepts both
+    # explicit indexed paths (widgets.1 / widgets_values.1) and the positional
+    # aliases emitted for schema-light custom nodes (widget_1).  Lint must use
+    # the same aliases as apply or it emits false unknown_field warnings after
+    # an edit has already landed.
+    widget_index_match = re.fullmatch(r"widget_(\d+)", field_path)
+    indexed_widget_prefix = next(
+        (
+            prefix
+            for prefix in ("widgets.", "widgets_values.")
+            if field_path.startswith(prefix)
+        ),
+        None,
+    )
+    if widget_index_match is not None or indexed_widget_prefix is not None:
+        try:
+            idx = (
+                int(widget_index_match.group(1))
+                if widget_index_match is not None
+                else int(field_path.split(".", 1)[1])
+            )
+        except (ValueError, IndexError):
+            return _MISSING
+        widgets = door_get_widgets_values(node)
+        if isinstance(widgets, list) and 0 <= idx < len(widgets):
+            return widgets[idx]
+        return _MISSING
+    # Named widget via the same compact resolver apply uses (RC12c).
+    try:
+        from vibecomfy.porting.widgets.compact_resolver import (
+            missing_widget_value_sentinel,
+            widget_value_for_field,
+        )
+
+        resolved = widget_value_for_field(
+            node, field_path, schema_provider=schema_provider
+        )
+        if resolved is not missing_widget_value_sentinel():
+            return resolved
+    except Exception:
+        pass
+    # Top-level node property
+    if field_path in node:
+        return node[field_path]
+    # Nested property access via dotted path (e.g. "properties.some_key")
+    parts = field_path.split(".")
+    current: Any = node
+    for part in parts:
+        if isinstance(current, dict):
+            current = current.get(part, _MISSING)
+        else:
+            return _MISSING
+    return current
+
+
+class _MissingSentinel:
+    """Unique sentinel for absent field lookups."""
+
+    def __repr__(self) -> str:
+        return "<MISSING>"
+
+
+_MISSING = _MissingSentinel()
+
+
+# ── per-op linters ──────────────────────────────────────────────────────────
+
+def _lint_set_node_field(
+    op: SetNodeFieldOp,
+    op_index: int,
+    index: LintIndex,
+    *,
+    schema_provider: Any = None,
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Lint a ``set_node_field`` op.
+
+    Returns ``(normalized_op | None, issue | None, disposition)``.
+    """
+    target, issue = _resolve_node_field_target(
+        index, op.target, op_index=op_index, op_kind="set_node_field",
+    )
+    if target is None:
+        return None, issue, "rejected"
+
+    # Check that the field exists on the node
+    current = _node_field_value(
+        index,
+        target.scope_path,
+        target.uid,
+        target.field_path,
+        schema_provider=schema_provider,
+    )
+    if current is _MISSING:
+        # When a node carries widget values the field path may name a widget
+        # whose index we cannot resolve without schema assistance.  Rather
+        # than rejecting outright we pass through with a warning so that
+        # apply_delta (which has full widget-name resolution) makes the
+        # final decision.  Nodes with no widget surface at all still
+        # hard-reject genuinely unknown fields.
+        node = index.node_by_uid(target.scope_path, target.uid)
+        class_type = ""
+        if isinstance(node, dict):
+            class_type = str(node.get("type") or node.get("class_type") or "")
+        if schema_provider is not None and class_type and target.field_path:
+            from vibecomfy.porting.authoring_surface import input_spec_is_literal_widget
+            from vibecomfy.schema.provider import schema_for
+
+            schema = schema_for(schema_provider, class_type)
+            spec = _input_spec_for_field(
+                getattr(schema, "inputs", {}) or {},
+                target.field_path,
+            ) if schema is not None else None
+            if spec is not None and input_spec_is_literal_widget(spec):
+                # Schema-known literal widgets remain editable even when the
+                # current compact vector is empty because the field is linked.
+                return op, None, "passed"
+        widgets_values = door_get_widgets_values(node) if isinstance(node, dict) else None
+        has_widget_surface = (
+            isinstance(widgets_values, (list, dict))
+            and len(widgets_values) > 0
+        )
+        explicit_widget_index = bool(
+            re.fullmatch(r"widget_\d+", target.field_path)
+            or target.field_path.startswith("widgets.")
+            or target.field_path.startswith("widgets_values.")
+        )
+        # Only pass through unqualified names that might be widget names;
+        # explicit widget-index paths (widgets.N) that are out of range
+        # still hard-reject.
+        if has_widget_surface and not explicit_widget_index:
+            return op, _make_issue(
+                "unknown_field",
+                f"{_node_label(index, target.scope_path, target.uid)} field "
+                f"'{target.field_path}' was not resolved; the node has "
+                f"widget values so this may be a widget-name reference — "
+                f"passing through for apply_delta validation.",
+                severity="warning",
+                op_index=op_index,
+                op_kind="set_node_field",
+                scope_path=target.scope_path,
+                uid=target.uid,
+                detail={"field_path": target.field_path},
+            ), "passed"
+        return None, _make_issue(
+            "unknown_field",
+            f"{_node_label(index, target.scope_path, target.uid)} has no "
+            f"field '{target.field_path}'.",
+            op_index=op_index,
+            op_kind="set_node_field",
+            scope_path=target.scope_path,
+            uid=target.uid,
+            detail={"field_path": target.field_path},
+        ), "rejected"
+
+    # No-op detection: value unchanged
+    if current == op.value:
+        return None, _make_issue(
+            "noop_field",
+            f"{_node_label(index, target.scope_path, target.uid)} "
+            f"{target.field_path} is already {_display_value(op.value)}.",
+            severity="info",
+            op_index=op_index,
+            op_kind="set_node_field",
+            scope_path=target.scope_path,
+            uid=target.uid,
+            detail={"field_path": target.field_path, "current": current, "requested": op.value},
+        ), "dropped_noop"
+
+    # Pass through (possibly with rewritten uid)
+    if target is op.target:
+        return op, None, "passed"
+    return SetNodeFieldOp(op="set_node_field", target=target, value=op.value), None, "passed"
+
+
+def _lint_add_node(
+    op: AddNodeOp,
+    op_index: int,
+    index: LintIndex,
+    schema_provider: Any = None,
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Lint an ``add_node`` op.
+
+    Validates that ``class_type`` is non-empty and (when *schema_provider*
+    is available) that the class is a known node type and all ``inputs``
+    keys name valid inputs on that class.  Existence checks (duplicate
+    uids, etc.) are deferred to apply.
+    """
+    if not op.class_type.strip():
+        return None, _make_issue(
+            "empty_class_type",
+            "Cannot add a node with an empty class type.",
+            op_index=op_index,
+            op_kind="add_node",
+            scope_path=op.scope_path,
+        ), "rejected"
+
+    # Validate that the scope_path exists (empty string = root scope, always valid)
+    if op.scope_path and not index.has_scope(op.scope_path):
+        return None, _make_issue(
+            "unknown_scope",
+            f"Scope '{op.scope_path}' does not exist.",
+            op_index=op_index,
+            op_kind="add_node",
+            scope_path=op.scope_path,
+        ), "rejected"
+
+    # Schema-aware validation (only when a provider is supplied)
+    if schema_provider is not None:
+        from vibecomfy.schema import is_workflow_stub_schema, schema_for as _schema_for
+
+        schema = _schema_for(schema_provider, op.class_type.strip())
+        if schema is None or is_workflow_stub_schema(schema):
+            return None, _make_issue(
+                "unknown_class_type",
+                f"'{op.class_type.strip()}' is not a known node class.",
+                op_index=op_index,
+                op_kind="add_node",
+                scope_path=op.scope_path,
+                detail={"class_type": op.class_type.strip()},
+            ), "rejected"
+
+        # Validate input names when inputs are provided
+        canonical_fields = dict(op.fields)
+        canonical_inputs = dict(op.inputs)
+        try:
+            schema_inputs: dict[str, Any] = getattr(schema, "inputs", {}) or {}
+        except Exception:
+            schema_inputs = {}
+        if schema_inputs:
+            canonical_fields = {
+                _canonical_input_name_for_class(schema_inputs, op.class_type.strip(), str(name)): value
+                for name, value in op.fields.items()
+            }
+            canonical_inputs = {
+                _canonical_input_name_for_class(schema_inputs, op.class_type.strip(), str(name)): value
+                for name, value in op.inputs.items()
+            }
+            if canonical_fields != dict(op.fields) or canonical_inputs != dict(op.inputs):
+                op = AddNodeOp(
+                    op=op.op,
+                    scope_path=op.scope_path,
+                    class_type=op.class_type,
+                    fields=canonical_fields,
+                    inputs=canonical_inputs,
+                    anchor=op.anchor,
+                    uid=op.uid,
+                    node_id=op.node_id,
+                    widget_field_names=op.widget_field_names,
+                )
+
+        if op.inputs:
+            for input_name in op.inputs:
+                if input_name not in schema_inputs and not _is_dynamic_add_node_input(
+                    class_type=op.class_type.strip(),
+                    input_name=input_name,
+                    fields=op.fields,
+                    schema_inputs=schema_inputs,
+                ):
+                    return None, _make_issue(
+                        "invalid_add_node_input",
+                        f"'{input_name}' is not a valid input for "
+                        f"'{op.class_type.strip()}'.",
+                        op_index=op_index,
+                        op_kind="add_node",
+                        scope_path=op.scope_path,
+                        detail={
+                            "class_type": op.class_type.strip(),
+                            "invalid_input": input_name,
+                            "available_inputs": sorted(schema_inputs.keys()),
+                        },
+                    ), "rejected"
+
+    return op, None, "passed"
+
+
+def _lint_remove_node(
+    op: RemoveNodeOp, op_index: int, index: LintIndex
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Lint a ``remove_node`` op."""
+    target, issue = _resolve_node_target(
+        index, op.target, op_index=op_index, op_kind="remove_node",
+    )
+    if target is None:
+        return None, issue, "rejected"
+
+    if target is op.target:
+        return op, None, "passed"
+    return RemoveNodeOp(op="remove_node", target=target), None, "passed"
+
+
+def _lint_upsert_link(
+    op: UpsertLinkOp,
+    op_index: int,
+    index: LintIndex,
+    schema_provider: Any = None,
+    workflow: Any = None,
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Lint an ``upsert_link`` op.
+
+    Resolves source/target uids, validates endpoint slots exist,
+    and detects no-ops when an identical link already exists.
+    Socket-type compatibility is deferred to apply.
+    """
+    source, src_issue = _resolve_link_source(
+        index, op.source, op_index=op_index, op_kind="upsert_link",
+    )
+    if source is None:
+        return None, src_issue, "rejected"
+
+    target, tgt_issue = _resolve_link_target(
+        index, op.target, op_index=op_index, op_kind="upsert_link",
+    )
+    if target is None:
+        return None, tgt_issue, "rejected"
+
+    # Validate source output slot exists
+    output_slot_idx = _resolve_output_slot_index(
+        index,
+        source.scope_path,
+        source.uid,
+        source.output_slot,
+        schema_provider=schema_provider,
+        workflow=workflow,
+    )
+    if output_slot_idx is None:
+        return None, _make_issue(
+            "bad_output_slot",
+            f"{_node_label(index, source.scope_path, source.uid)} has no "
+            f"output slot '{source.output_slot}'.",
+            op_index=op_index,
+            op_kind="upsert_link",
+            scope_path=source.scope_path,
+            uid=source.uid,
+            detail={"output_slot": source.output_slot},
+        ), "rejected"
+
+    # Validate target input field exists
+    input_slot_idx = _resolve_input_slot_index(
+        index,
+        target.scope_path,
+        target.uid,
+        target.input_field,
+        schema_provider=schema_provider,
+        workflow=workflow,
+    )
+    if input_slot_idx is None:
+        return None, _make_issue(
+            "missing_target_input",
+            f"{_node_label(index, target.scope_path, target.uid)} has no "
+            f"input '{target.input_field}'.",
+            op_index=op_index,
+            op_kind="upsert_link",
+            scope_path=target.scope_path,
+            uid=target.uid,
+            detail={"input_field": target.input_field},
+        ), "rejected"
+
+    # No-op detection: link already exists with same endpoints
+    existing = _find_matching_link(
+        index,
+        source.scope_path,
+        source.uid,
+        source.output_slot,
+        target.uid,
+        target.input_field,
+    )
+    if existing is not None:
+        existing_id: int | None = None
+        if isinstance(existing, Mapping):
+            existing_id = existing.get("id")
+        elif isinstance(existing, (list, tuple)) and existing:
+            existing_id = existing[0] if isinstance(existing[0], int) else None
+        return None, _make_issue(
+            "noop_link",
+            f"A link from {_node_label(index, source.scope_path, source.uid)} "
+            f"to {_node_label(index, target.scope_path, target.uid)} "
+            f"({target.input_field}) already exists.",
+            severity="info",
+            op_index=op_index,
+            op_kind="upsert_link",
+            scope_path=source.scope_path,
+            detail={
+                "existing_link_id": existing_id,
+                "source_uid": source.uid,
+                "source_slot": source.output_slot,
+                "target_uid": target.uid,
+                "target_field": target.input_field,
+            },
+        ), "dropped_noop"
+
+    if source is op.source and target is op.target:
+        return op, None, "passed"
+    return UpsertLinkOp(op="upsert_link", source=source, target=target), None, "passed"
+
+
+def _lint_remove_link(
+    op: RemoveLinkOp,
+    op_index: int,
+    index: LintIndex,
+    schema_provider: Any = None,
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Lint a ``remove_link`` op.
+
+    - ``link_id``-based: rejects if the link does not exist.
+    - target-based: rejects unknown nodes; detects no-op when no link matches
+      the target endpoint.
+    """
+    if op.link_id is not None:
+        # link_id-based removal: validate link exists
+        scope_path = ""  # link_id searches default to root scope
+        if not index.link_exists(scope_path, op.link_id):
+            return None, _make_issue(
+                "unknown_link",
+                f"Link id {op.link_id} does not exist.",
+                op_index=op_index,
+                op_kind="remove_link",
+                scope_path=scope_path,
+                detail={"link_id": op.link_id},
+            ), "rejected"
+        return op, None, "passed"
+
+    if op.target is not None:
+        # target-based removal: resolve uid and check if a matching link exists
+        target, issue = _resolve_link_target(
+            index, op.target, op_index=op_index, op_kind="remove_link",
+        )
+        if target is None:
+            return None, issue, "rejected"
+
+        # Look for any link that matches the target endpoint
+        target_lg_id = index.lg_id_for_uid(target.scope_path, target.uid)
+        target_slot_idx = _resolve_input_slot_index(
+            index, target.scope_path, target.uid, target.input_field,
+        )
+        link_found = False
+        if target_lg_id is not None and target_slot_idx is not None:
+            for link_id in index.link_ids_for_scope(target.scope_path):
+                link = index.link_by_id(target.scope_path, link_id)
+                if link is None:
+                    continue
+                tid = _link_target_id(link)
+                tsl = _link_target_slot(link)
+                if tid == target_lg_id and tsl == target_slot_idx:
+                    link_found = True
+                    break
+
+        if not link_found:
+            return None, _make_issue(
+                "noop_remove_link",
+                f"No link targets {_node_label(index, target.scope_path, target.uid)} "
+                f"input '{target.input_field}'.",
+                severity="info",
+                op_index=op_index,
+                op_kind="remove_link",
+                scope_path=target.scope_path,
+                uid=target.uid,
+                detail={"input_field": target.input_field},
+            ), "dropped_noop"
+
+        if target is op.target:
+            return op, None, "passed"
+        return RemoveLinkOp(op="remove_link", link_id=None, target=target), None, "passed"
+
+    # Should not happen (parse_edit_op enforces this)
+    return None, _make_issue(
+        "malformed_op",
+        "A remove_link operation must specify either an id or a target.",
+        op_index=op_index,
+        op_kind="remove_link",
+    ), "rejected"
+
+
+def _lint_set_mode(
+    op: SetModeOp, op_index: int, index: LintIndex
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Lint a ``set_mode`` op.
+
+    Validates target node and detects mode no-ops.
+    """
+    target, issue = _resolve_node_target(
+        index, op.target, op_index=op_index, op_kind="set_mode",
+    )
+    if target is None:
+        return None, issue, "rejected"
+
+    # Check current mode
+    node = index.node_by_uid(target.scope_path, target.uid)
+    current_mode = node.get("mode") if node is not None else None
+
+    if current_mode == op.mode:
+        return None, _make_issue(
+            "noop_mode",
+            f"{_node_label(index, target.scope_path, target.uid)} is "
+            f"already in mode {op.mode}.",
+            severity="info",
+            op_index=op_index,
+            op_kind="set_mode",
+            scope_path=target.scope_path,
+            uid=target.uid,
+            detail={"current_mode": current_mode, "requested_mode": op.mode},
+        ), "dropped_noop"
+
+    if target is op.target:
+        return op, None, "passed"
+    return SetModeOp(op="set_mode", target=target, mode=op.mode), None, "passed"
+
+
+# ── ordered classifier and preview boundary ────────────────────────────────
+
+_LINTERS: dict[str, Any] = {
+    "set_node_field": _lint_set_node_field,
+    "add_node": _lint_add_node,
+    "remove_node": _lint_remove_node,
+    "upsert_link": _lint_upsert_link,
+    "remove_link": _lint_remove_link,
+    "set_mode": _lint_set_mode,
+}
+
+
+def _classify_operation(
+    op: EditOp,
+    op_index: int,
+    index: LintIndex,
+    *,
+    schema_provider: Any = None,
+    workflow: Any = None,
+    delta: Sequence[EditOp] = (),
+    future_wired_uids: frozenset[str] = frozenset(),
+) -> tuple[EditOp | None, LintIssue | None, str]:
+    """Run the established presentation classifier for one occurrence.
+
+    This function deliberately performs no application, schema recapture, or
+    workflow mutation.  The session preview/evaluator owns those transitions.
+    """
+    linter = _LINTERS.get(getattr(op, "op", None))
+    if linter is None:
+        return None, _make_issue(
+            "unknown_op",
+            f"Unknown edit operation '{getattr(op, 'op', None)}'.",
+            op_index=op_index,
+            op_kind=getattr(op, "op", None),
+        ), "rejected"
+    if isinstance(op, UpsertLinkOp):
+        normalized, issue, disposition = linter(
+            op, op_index, index, schema_provider=schema_provider, workflow=workflow
+        )
+    elif isinstance(op, (AddNodeOp, RemoveLinkOp, SetNodeFieldOp)):
+        normalized, issue, disposition = linter(
+            op, op_index, index, schema_provider=schema_provider
+        )
+    else:
+        normalized, issue, disposition = linter(op, op_index, index)
+
+    # Preserve the existing orphan-intent diagnostic.  It observes future
+    # syntax only; no rejected/future add becomes graph authority.
+    if (
+        isinstance(op, AddNodeOp)
+        and disposition == "passed"
+        and normalized is not None
+        and op.fields
+    ):
+        class_type = op.class_type.strip()
+        has_existing = any(m.class_type == class_type for m in index._node_meta.values())
+        if has_existing:
+            candidate_ids = {
+                str(value)
+                for value in (op.uid, getattr(normalized, "uid", None), op.node_id, getattr(normalized, "node_id", None))
+                if value
+            }
+            has_wiring = bool(op.inputs) or bool(
+                candidate_ids & future_wired_uids
+            )
+            if not has_wiring:
+                has_wiring = any(
+                    isinstance(other, UpsertLinkOp)
+                    and (other.source.uid in candidate_ids or other.target.uid in candidate_ids)
+                    for other in delta
+                )
+            if not has_wiring:
+                representative = next(
+                    (meta for meta in index._node_meta.values() if meta.class_type == class_type),
+                    None,
+                )
+                rep_id = representative.lg_id if representative and representative.lg_id != -1 else (
+                    representative.uid if representative else "unknown"
+                )
+                issue = _make_issue(
+                    "orphan_add_node",
+                    f"Unwired add_node '{class_type}' with no links when graph already has {class_type} id {rep_id}; "
+                    f"use set_node_field on the existing {class_type} (id {rep_id}) rather than adding a new one — new node is unreachable.",
+                    op_index=op_index,
+                    op_kind="add_node",
+                    scope_path=op.scope_path,
+                    detail={"class_type": class_type, "existing_id": rep_id, "fields": dict(op.fields)},
+                )
+                return None, issue, "rejected"
+    return normalized, issue, disposition
+
+
+def lint_delta(
+    delta: Sequence[EditOp],
+    index: LintIndex,
+    schema_provider: Any = None,
+    *,
+    retained_authority: AdmissionSnapshot,
+    pre_workflow: Any = None,
+    pre_ui_payload: Mapping[str, Any] | None = None,
+    schema_snapshot: Any = None,
+) -> LintResult:
+    """Analyze an ordered delta through the detached canonical session preview."""
+    if pre_workflow is None:
+        raise ValueError("lint_delta requires retained pre_workflow authority")
+    if schema_snapshot is None:
+        raise ValueError("lint_delta requires retained frozen schema_snapshot authority")
+    from vibecomfy.porting.edit.session import preview_lint_delta
+
+    return preview_lint_delta(
+        delta,
+        index,
+        schema_provider=schema_provider,
+        retained_authority=retained_authority,
+        pre_workflow=pre_workflow,
+        pre_ui_payload=pre_ui_payload,
+        schema_snapshot=schema_snapshot,
+    )
+
+
+__all__ = [
+    "LintIndex",
+    "LintIssue",
+    "LintNormalization",
+    "LintResult",
+    "lint_delta",
+]

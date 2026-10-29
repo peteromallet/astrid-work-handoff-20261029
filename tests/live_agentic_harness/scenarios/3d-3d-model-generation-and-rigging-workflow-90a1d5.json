@@ -1,0 +1,39 @@
+{
+  "id": "3d-3d-model-generation-and-rigging-workflow-90a1d5",
+  "query": "Set the text-to-3D generation node's geometry quality to 'detailed' so the model captures more surface features like wrinkles and folds, and leave its face-limit and quad settings exactly as they are so the polygon count does not grow.",
+  "workflow_path": "tests/fixtures/live_agentic_corpus/corpus/90a1d5ff9044902e.json",
+  "network": true,
+  "timeout": 360,
+  "apply": true,
+  "assessment": {
+    "expect_graph_changed": true
+  },
+  "desired": {
+    "outcome": "The generated model has more surface detail (e.g., wrinkles, folds) from the detailed geometry-quality setting while keeping the same polygon budget.",
+    "quality": "The generation node's geometry quality is set to 'detailed', its face-limit and quad settings are unchanged, all other nodes remain connected with no dangling nodes, and the pipeline stages (texturing, rigging, retargeting) still work correctly.",
+    "alternatives_ok": true
+  },
+  "_tags": {
+    "modality": "3d",
+    "query_type": "edit",
+    "abstraction": "med",
+    "complexity": "med",
+    "manifest_complexity": 3,
+    "task_type": "other",
+    "requires_custom_nodes": true,
+    "techniques": [
+      "3d-modeling",
+      "text-to-3d",
+      "rigging",
+      "retargeting",
+      "texturing",
+      "preview",
+      "workflow"
+    ],
+    "source_workflow_id": "90a1d5ff9044902e",
+    "source": "external_workflows/corpus",
+    "staged": true,
+    "authored_by": "deepseek-v4-flash",
+    "author_rationale": "This query targets a specific, actionable single-widget change: set TripoTextToModelNode.geometry_quality to 'detailed' while leaving the face-limit (-1) and quad (false) settings untouched, forcing the agent to locate the generation node's quality combo without disturbing the polygon budget."
+  }
+}

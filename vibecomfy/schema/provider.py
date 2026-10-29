@@ -1,0 +1,2227 @@
+from __future__ import annotations
+
+import asyncio
+import ast
+import json
+import logging
+import threading
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from vibecomfy.comfy_command import has_comfyui_runtime
+from vibecomfy.runtime.client import ComfyClient
+from vibecomfy.runtime.server import comfy_server
+from vibecomfy.porting.object_info.generation import active_cache_root, cache_file_witness
+
+from .cache import (
+    CACHE_METADATA_KEY,
+    load_object_info_cache,
+    object_info_cache_candidates,
+    object_info_cache_path,
+    object_info_payload_checksum,
+    runtime_fingerprint,
+    validate_object_info_payload_shape,
+    validate_object_info_cache,
+    write_object_info_cache,
+)
+from .types import (
+    FrozenSchemaSnapshotProvider,
+    InputSpec,
+    OutputSpec,
+    SchemaSnapshot,
+    _complete_schema_snapshot_with_provisional,
+    capture_schema_snapshot,
+    schema_payload_from_node_schema,
+    schema_snapshot_from_payload,
+)
+
+_logger = logging.getLogger(__name__)
+MAX_SCHEMA_INDEX_BYTES = 4 * 1024 * 1024
+MAX_SCHEMA_INDEX_ENTRIES = 100_000
+
+# DEEP-AUDIT-FIX-1-ADJUDICATION: exact provenance allowlist for bounded
+# generation completion. Only evidence-backed registry/workflow tags may enter
+# a new frozen generation through the explicit mid-turn completion seam.
+# Runtime/live, object-info, source-parser, on-demand, local-index, widget,
+# unknown, and persisted-snapshot sources may contribute at ingress only —
+# never through the mid-turn seam.
+_EVIDENCE_BACKED_PROVISIONAL_SOURCES = frozenset(
+    {
+        "workflow_json_provisional",
+        "comfy_registry_provisional",
+        "comfy_registry_class_map",
+    }
+)
+
+
+@dataclass
+class SchemaSourceInfo:
+    """Provenance metadata describing where a schema came from and with what confidence.
+
+    This is intentionally a plain (non-frozen) dataclass so callers can
+    mutate it incrementally while merging evidence from multiple providers.
+    """
+
+    provider_name: str = "unknown"
+    source_path: str | None = None
+    cache_path: str | None = None
+    server_url: str | None = None
+    package: str | None = None
+    version: str | None = None
+    hash: str | None = None
+    confidence: float = 1.0
+    conflicts: list[str] = field(default_factory=list)
+    ignored_evidence: list[str] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "provider_name": self.provider_name,
+            "source_path": self.source_path,
+            "cache_path": self.cache_path,
+            "server_url": self.server_url,
+            "package": self.package,
+            "version": self.version,
+            "hash": self.hash,
+            "confidence": self.confidence,
+            "conflicts": list(self.conflicts),
+            "ignored_evidence": list(self.ignored_evidence),
+        }
+
+
+@dataclass(frozen=True)
+class SourceScanWarning:
+    code: str
+    message: str
+    class_type: str | None = None
+    path: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "class_type": self.class_type,
+            "path": self.path,
+        }
+
+
+@dataclass(frozen=True)
+class NodeSchema:
+    class_type: str
+    pack: str | None
+    inputs: dict[str, InputSpec]
+    outputs: list[OutputSpec]
+    # Provider-only authoring evidence used to reject implicit coercion of a
+    # list output. Frozen edit snapshots and compiled graphs never perform that
+    # coercion, so this is intentionally outside their serialized schema ABI.
+    output_is_list: tuple[bool, ...] = ()
+    # Explicit compact widget-slot order: literal widget inputs in UI
+    # ``widgets_values`` order, including named UI-only slots such as
+    # ``control_after_generate``. Provenance-preserving — populated only
+    # from runtime-captured object_info evidence; never guessed. Snapshot
+    # serialization carries it (``schema_payload_from_node_schema``) so a
+    # frozen replay provider serves the exact same slot domain as live.
+    widget_input_order: tuple[str | None, ...] = ()
+    # -- provenance fields (defaults so existing code works unchanged) ------
+    source_provider: str = "unknown"
+    source_path: str | None = None
+    source_cache_path: str | None = None
+    source_server_url: str | None = None
+    source_package: str | None = None
+    source_version: str | None = None
+    source_hash: str | None = None
+    confidence: float = 1.0
+    conflicts: tuple[str, ...] = ()
+    ignored_evidence: tuple[str, ...] = ()
+
+
+def is_workflow_stub_schema(schema: object | None) -> bool:
+    """Return true for static stub schemas that are not authoring proof.
+
+    Static ``@stub.json`` cache rows are broad placeholders and should not enter
+    the baseline authoring catalog. Per-turn workflow/registry provisional
+    schemas are different: they are exact evidence for a candidate graph, but
+    still carry ``not_runtime_validated`` so queue/runtime validation can block
+    execution until the missing pack is installed.
+    """
+    if schema is None:
+        return False
+    source_version = str(getattr(schema, "source_version", "") or "").lower()
+    cache_path = str(getattr(schema, "source_cache_path", "") or "").lower()
+    return source_version == "stub" or cache_path.endswith("@stub.json")
+
+
+class SchemaIndexError(ValueError):
+    def __init__(self, path: Path, cause: Exception) -> None:
+        super().__init__(f"{path} could not be read: {type(cause).__name__}: {cause}")
+        self.path = path
+        self.cause = cause
+
+
+class SchemaProviderError(RuntimeError):
+    """A provider failed while answering a schema authority query."""
+
+    code = "schema_provider_error"
+
+    def __init__(self, class_type: str | None, cause: Exception) -> None:
+        label = f" for {class_type!r}" if class_type else ""
+        super().__init__(f"schema provider lookup failed{label}: {cause}")
+        self.class_type = class_type
+        self.cause = cause
+
+
+@runtime_checkable
+class SchemaProvider(Protocol):
+    def get_schema(self, class_type: str) -> NodeSchema | None: ...
+
+
+def schema_for(provider: object | None, class_type: str) -> object | None:
+    builtin = _builtin_schema(class_type)
+    if builtin is not None:
+        return builtin
+    if provider is None:
+        return None
+    getter = getattr(provider, "get_schema", None) or getattr(provider, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(class_type)
+    except SchemaProviderError:
+        raise
+    except Exception as exc:
+        raise SchemaProviderError(class_type, exc) from exc
+
+class SchemaSnapshotProvider:
+    """Ingress-bound provider: explicit request, verified object_info, then cache.
+
+    Workflow observation is never selected. After capture, lookups are frozen
+    and cannot perform a fresh ambient provider/cache fetch.
+    """
+
+    def __init__(
+        self,
+        *,
+        request_snapshot: Mapping[str, Any] | SchemaSnapshot | None = None,
+        connected_object_info: Mapping[str, Any] | None = None,
+        connected_object_info_verified: bool = False,
+        cache_payload: Mapping[str, Any] | None = None,
+        cache_path: str | Path | None = None,
+        runtime_fingerprint: str | None = None,
+        server_url: str | None = None,
+        class_types: Sequence[str] | None = None,
+        timestamp: str | None = None,
+        generation: int | None = None,
+        workflow_observation: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._snapshot = capture_schema_snapshot(
+            class_types=class_types,
+            request_snapshot=request_snapshot,
+            connected_object_info=connected_object_info,
+            connected_object_info_verified=connected_object_info_verified,
+            cache_payload=cache_payload,
+            cache_path=cache_path,
+            runtime_fingerprint=runtime_fingerprint,
+            server_url=server_url,
+            timestamp=timestamp,
+            generation=generation,
+            workflow_observation=workflow_observation,
+        )
+        self._frozen = FrozenSchemaSnapshotProvider(self._snapshot)
+
+    @property
+    def snapshot(self) -> SchemaSnapshot:
+        return self._snapshot
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self._frozen.get(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        return self.get(class_type)
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        return self._frozen.schemas()
+
+    def lookup_ambient(self, *args: Any, **kwargs: Any) -> None:
+        self._frozen.lookup_ambient(*args, **kwargs)
+
+
+def schema_snapshot_provider_from_payload(payload: Mapping[str, Any]) -> FrozenSchemaSnapshotProvider:
+    """Reconstruct the frozen provider from a persisted snapshot. No ambient lookup."""
+    return FrozenSchemaSnapshotProvider(schema_snapshot_from_payload(payload))
+
+
+
+def _builtin_schema(class_type: str) -> NodeSchema | None:
+    primitive_aliases: dict[str, tuple[str, str]] = {
+        "Integer": ("INT", "INT"),
+        "Float": ("FLOAT", "FLOAT"),
+        "String": ("STRING", "STRING"),
+        "Boolean": ("BOOLEAN", "BOOLEAN"),
+    }
+    primitive_alias = primitive_aliases.get(class_type)
+    if primitive_alias is not None:
+        input_type, output_type = primitive_alias
+        return NodeSchema(
+            class_type=class_type,
+            pack="comfy_core",
+            inputs={"value": InputSpec(input_type, required=False)},
+            outputs=[OutputSpec(output_type, output_type)],
+            source_provider="vibecomfy_builtin",
+            source_package="comfy_core",
+            confidence=1.0,
+        )
+    if class_type == "vibecomfy.exec":
+        from vibecomfy.comfy_nodes.exec_node import EXEC_SLOT_COUNT
+
+        inputs = {
+            "source": InputSpec("STRING", required=True),
+            "io": InputSpec("JSON", required=True),
+        }
+        inputs.update({f"in_{index}": InputSpec("*", required=False) for index in range(EXEC_SLOT_COUNT)})
+        return NodeSchema(
+            class_type="vibecomfy.exec",
+            pack="vibecomfy",
+            inputs=inputs,
+            outputs=[OutputSpec("*", f"out_{index}") for index in range(EXEC_SLOT_COUNT)],
+            source_provider="vibecomfy_builtin",
+            source_package="vibecomfy",
+            confidence=1.0,
+        )
+    if class_type == "vibecomfy.code":
+        return NodeSchema(
+            class_type="vibecomfy.code",
+            pack="vibecomfy",
+            inputs={
+                "value": InputSpec("*", required=False),
+                "runtime_backed": InputSpec("BOOLEAN", required=False),
+                "runtime_contract_version": InputSpec("STRING", required=False),
+                "execution_mode": InputSpec("STRING", required=False),
+                "timeout_ms": InputSpec("INT", required=False),
+                "max_source_bytes": InputSpec("INT", required=False),
+                "allowed_builtins": InputSpec("JSON", required=False),
+                "redaction_policy": InputSpec("JSON", required=False),
+                "policy_version": InputSpec("STRING", required=False),
+                "passthrough_on_non_json": InputSpec("BOOLEAN", required=False),
+                "vibecomfy_uid": InputSpec("STRING", required=False),
+                "kind": InputSpec("STRING", required=False),
+                "io": InputSpec("DICT", required=False),
+                "source": InputSpec("STRING", required=False),
+                "spec": InputSpec("STRING", required=False),
+            },
+            outputs=[OutputSpec("*", "value")],
+            source_provider="vibecomfy_builtin",
+            source_package="vibecomfy",
+            confidence=1.0,
+        )
+    if class_type == "vibecomfy.loop":
+        return NodeSchema(
+            class_type="vibecomfy.loop",
+            pack="vibecomfy",
+            inputs={"value": InputSpec("*", required=False)},
+            outputs=[OutputSpec("*", "value")],
+            source_provider="vibecomfy_builtin",
+            source_package="vibecomfy",
+            confidence=1.0,
+        )
+    return None
+
+
+def schema_registry_empty(provider: object | None) -> bool:
+    # Runtime providers can answer this from the raw object_info mapping.  Do
+    # not force them through ``schemas()`` here: that eagerly parses every
+    # installed node even when validation only touches a handful of classes.
+    is_empty = getattr(provider, "is_empty", None)
+    if callable(is_empty):
+        try:
+            return bool(is_empty())
+        except Exception:
+            return False
+    try:
+        schemas = schemas_for(provider)
+    except Exception:
+        return False
+    return schemas is not None and len(schemas) == 0
+
+
+def schemas_for(provider: object | None) -> dict[str, object] | None:
+    schemas = getattr(provider, "schemas", None)
+    if not callable(schemas):
+        return None
+    try:
+        result = schemas()
+    except SchemaProviderError:
+        raise
+    except Exception as exc:
+        raise SchemaProviderError(None, exc) from exc
+    if result is None:
+        return None
+    if not isinstance(result, Mapping):
+        raise SchemaProviderError(
+            None,
+            TypeError(
+                "schema enumeration must return a mapping or None, "
+                f"got {type(result).__name__}"
+            ),
+        )
+    try:
+        # Materialize the provider's surface once.  This both gives callers a
+        # stable authority view and keeps a mutable/custom Mapping from being
+        # re-read while aliases and graph classes are resolved.
+        return dict(result)
+    except Exception as exc:
+        raise SchemaProviderError(None, exc) from exc
+
+
+class LocalSchemaProvider:
+    def __init__(self, index_path: str | Path = "node_index.json") -> None:
+        self.index_path = Path(index_path)
+        self._schemas: dict[str, NodeSchema] | None = None
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.schemas().get(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        return self.get(class_type)
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        if self._schemas is None:
+            self._schemas = self._load()
+        return self._schemas
+
+    def _load(self) -> dict[str, NodeSchema]:
+        if not self.index_path.exists():
+            return {}
+        try:
+            rows = json.loads(self.index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SchemaIndexError(self.index_path, exc) from exc
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        if not isinstance(rows, list):
+            return {}
+        schemas: dict[str, NodeSchema] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            schema = _schema_from_index_row(row)
+            if schema is not None:
+                schemas[schema.class_type] = schema
+        return schemas
+
+
+class SourceSchemaProvider:
+    """Best-effort INPUT_TYPES reader for installed custom-node source trees."""
+
+    def __init__(
+        self,
+        roots: list[str | Path] | None = None,
+        *,
+        max_roots: int = 8,
+        max_files_per_root: int = 2_000,
+        max_total_files: int = 5_000,
+    ) -> None:
+        self.scan_warnings: list[SourceScanWarning] = []
+        self.max_roots = max(0, max_roots)
+        self.max_files_per_root = max(0, max_files_per_root)
+        self.max_total_files = max(0, max_total_files)
+        raw_roots = _default_source_roots() if roots is None else roots
+        self.roots = self._bounded_roots([Path(root) for root in raw_roots])
+        self._schemas: dict[str, NodeSchema | None] = {}
+        self._provenance: dict[str, SchemaSourceInfo] = {}
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.get_schema(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        if class_type not in self._schemas:
+            self._schemas[class_type] = self._find_schema(class_type)
+        return self._schemas[class_type]
+
+    def provenance_for(self, class_type: str) -> SchemaSourceInfo | None:
+        return self._provenance.get(class_type)
+
+    def warnings(self) -> list[SourceScanWarning]:
+        return list(self.scan_warnings)
+
+    def _bounded_roots(self, roots: list[Path]) -> list[Path]:
+        bounded: list[Path] = []
+        seen: set[Path] = set()
+        for root in roots:
+            normalized = root.expanduser()
+            key = normalized.resolve() if normalized.exists() else normalized
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(bounded) >= self.max_roots:
+                self.scan_warnings.append(
+                    SourceScanWarning(
+                        code="source_scan_root_cap_skipped",
+                        message=f"source scan root cap {self.max_roots} skipped {normalized}",
+                        path=str(normalized),
+                    )
+                )
+                continue
+            bounded.append(normalized)
+        return bounded
+
+    def _find_schema(self, class_type: str) -> NodeSchema | None:
+        for path in _direct_python_files(self.roots, class_type):
+            schema = self._schema_from_path(path, class_type)
+            if schema is not None or class_type in self._provenance:
+                return schema
+        for path in _candidate_python_files(
+            self.roots,
+            class_type,
+            warnings=self.scan_warnings,
+            max_files_per_root=self.max_files_per_root,
+            max_total_files=self.max_total_files,
+        ):
+            schema = self._schema_from_path(path, class_type)
+            if schema is not None or class_type in self._provenance:
+                return schema
+        return None
+
+    def _schema_from_path(self, path: Path, class_type: str) -> NodeSchema | None:
+        schema = _schema_from_python_source(path, class_type)
+        if schema is not None:
+            info = SchemaSourceInfo(
+                provider_name="source_parser",
+                source_path=str(path),
+                package=schema.pack,
+                confidence=0.9,
+            )
+            self._provenance[class_type] = info
+            for warning in self.scan_warnings:
+                if warning.class_type == class_type:
+                    info.ignored_evidence.append(warning.code)
+            return NodeSchema(
+                class_type=schema.class_type,
+                pack=schema.pack,
+                inputs=schema.inputs,
+                outputs=schema.outputs,
+                source_provider=info.provider_name,
+                source_path=info.source_path,
+                source_package=info.package,
+                confidence=info.confidence,
+                ignored_evidence=tuple(info.ignored_evidence),
+            )
+        if _source_contains_class(path, class_type):
+            warning = SourceScanWarning(
+                code="dynamic_input_types_miss",
+                message=f"{class_type} in {path} did not expose a statically parseable INPUT_TYPES return",
+                class_type=class_type,
+                path=str(path),
+            )
+            self.scan_warnings.append(warning)
+            self._provenance[class_type] = SchemaSourceInfo(
+                provider_name="source_parser",
+                source_path=str(path),
+                package=path.parent.name,
+                confidence=0.0,
+                ignored_evidence=[warning.code],
+            )
+        return None
+
+
+class ObjectInfoSchemaProvider:
+    """Schema provider backed by a captured ComfyUI /object_info JSON file."""
+
+    def __init__(self, object_info_path: str | Path) -> None:
+        self.object_info_path = Path(object_info_path)
+        self._schemas: dict[str, NodeSchema] | None = None
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.schemas().get(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        return self.get(class_type)
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        if self._schemas is None:
+            data = load_object_info_cache(self.object_info_path)
+            if data is None:
+                raise SchemaIndexError(self.object_info_path, ValueError("expected object_info JSON object"))
+            self._schemas = {
+                class_type: _schema_from_object_info(class_type, info)
+                for class_type, info in data.items()
+                if class_type != CACHE_METADATA_KEY and isinstance(info, dict)
+            }
+        return self._schemas
+
+
+class ObjectInfoIndexSchemaProvider:
+    """Schema provider backed by ``object_info/index.json`` class-to-file rows."""
+
+    # The index is a listing authority; focused lookups load one exact pack.
+    listing_only = True
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root).resolve()
+        self._active_root = self.root
+        self.index_path = self._active_root / "index.json"
+        self._index: dict[str, str] | None = None
+        self._file_cache: dict[str, dict[str, Any]] = {}
+        self._schemas: dict[str, NodeSchema | None] = {}
+        self._lock = threading.RLock()
+        self._marker_sig = None
+        self._marker_text = None
+        self._committed = False
+        self._index_sig = None
+        self._pack_sigs: dict[str, Any] = {}
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.get_schema(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        with self._lock:
+            for attempt in range(2):
+                self._sync_reader()
+                if class_type not in self._schemas:
+                    self._schemas[class_type] = self._load_schema(class_type)
+                if not self._sync_reader():
+                    return self._schemas[class_type]
+                if attempt:
+                    raise SchemaProviderError(class_type, ValueError("cache changed during schema load"))
+            return self._schemas[class_type]
+
+    def schemas(self) -> dict[str, NodeSchema | None]:
+        with self._lock:
+            self._sync_reader()
+            return {class_type: None for class_type in self._load_index()}
+
+    def _sync_reader(self) -> bool:
+        marker = self.root / "CURRENT"
+        marker_sig = cache_file_witness(marker)
+        if self._committed and marker_sig is None:
+            raise SchemaProviderError(None, ValueError(f"object_info cache marker disappeared: {marker}"))
+        marker_changed = marker_sig != self._marker_sig
+        if marker_sig is not None and marker_changed:
+            try:
+                active = active_cache_root(self.root)
+                marker_text = marker.read_text(encoding="utf-8").strip()
+            except Exception as exc:  # noqa: BLE001 - preserve typed boundary
+                raise SchemaProviderError(None, exc) from exc
+            committed = True
+        elif marker_sig is None:
+            active, marker_text, committed = self.root, None, False
+        else:
+            active, marker_text, committed = self._active_root, self._marker_text, self._committed
+        index_sig = cache_file_witness(active / "index.json")
+        pack_changed = any(cache_file_witness(active / name) != signature for name, signature in self._pack_sigs.items())
+        changed = marker_changed or index_sig != self._index_sig or pack_changed
+        if changed and committed and not (marker_sig is not None and marker_changed):
+            try:
+                active = active_cache_root(self.root)
+            except Exception as exc:  # noqa: BLE001 - preserve typed boundary
+                raise SchemaProviderError(None, exc) from exc
+            index_sig = cache_file_witness(active / "index.json")
+        if changed:
+            self._index = None
+            self._file_cache.clear()
+            self._schemas.clear()
+            self._pack_sigs.clear()
+        self._active_root, self.index_path = active, active / "index.json"
+        self._marker_sig, self._marker_text = marker_sig, marker_text
+        self._committed, self._index_sig = committed, index_sig
+        return changed
+
+    def _validated_pack_path(self, filename: str, class_type: str | None) -> Path:
+        """Return an indexed pack path confined to the authority root."""
+        try:
+            relative = PurePath(filename)
+            if not filename or relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("indexed pack filename must be relative and contain no '..'")
+            pack_path = (self._active_root / Path(filename)).resolve(strict=False)
+            pack_path.relative_to(self._active_root)
+            return pack_path
+        except (OSError, RuntimeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith("indexed pack filename"):
+                cause = exc
+            else:
+                cause = ValueError(f"indexed pack path escapes authority root: {filename!r}")
+            raise SchemaProviderError(class_type, cause) from exc
+
+    def _load_index(self) -> dict[str, str]:
+        if self._index is not None:
+            return self._index
+        index_missing = False
+        try:
+            index_size = self.index_path.stat().st_size
+        except FileNotFoundError:
+            index_missing = True
+            index_size = 0
+        except OSError as exc:
+            raise SchemaProviderError(None, exc) from exc
+        if index_size > MAX_SCHEMA_INDEX_BYTES:
+            raise SchemaProviderError(
+                None,
+                ValueError(
+                    f"schema index exceeds {MAX_SCHEMA_INDEX_BYTES} bytes: "
+                    f"{index_size}"
+                ),
+            )
+        try:
+            data = load_object_info_cache(self.index_path)
+        except Exception as exc:  # noqa: BLE001 - malformed index is not empty
+            raise SchemaProviderError(
+                None,
+                ValueError(
+                    f"schema index read failed: {self.index_path}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+        if data is None:
+            if not index_missing:
+                raise SchemaProviderError(
+                    None,
+                    ValueError(f"malformed or unreadable schema index: {self.index_path}"),
+                )
+            self._index = {}
+        else:
+            if len(data) > MAX_SCHEMA_INDEX_ENTRIES:
+                raise SchemaProviderError(
+                    None,
+                    ValueError(
+                        f"schema index exceeds {MAX_SCHEMA_INDEX_ENTRIES} entries: "
+                        f"{len(data)}"
+                    ),
+                )
+            index: dict[str, str] = {}
+            for key, value in data.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    continue
+                self._validated_pack_path(value, key)
+                if not value.lower().endswith("@stub.json"):
+                    index[key] = value
+            self._index = index
+        return self._index
+
+    def raw_widget_order(self, class_type: str) -> list[str | None] | None:
+        """Return the raw ``object_info_widget_order`` including ``None``/null entries.
+
+        Returns ``None`` when the class is not found in the cache.
+        This is the authoritative slot-count source (nulls denote UI-only slots);
+        the compacted null-free list is for widget VALUES emission only.
+        """
+        with self._lock:
+            self._sync_reader()
+            filename = self._load_index().get(class_type)
+            if not filename:
+                return None
+            data = self._load_pack(filename, class_type)
+            info = self._indexed_class_info(data, class_type, filename)
+        from vibecomfy.porting.object_info.consume import (  # noqa: PLC0415
+            reconciled_object_info_widget_order,
+        )
+
+        raw_order = reconciled_object_info_widget_order(info)
+        return raw_order if raw_order else None
+
+    def _load_schema(self, class_type: str) -> NodeSchema | None:
+        filename = self._load_index().get(class_type)
+        if not filename:
+            return None
+        data = self._load_pack(filename, class_type)
+        info = self._indexed_class_info(data, class_type, filename)
+        schema = _schema_from_object_info(class_type, info)
+        from vibecomfy.porting.object_info.consume import (  # noqa: PLC0415
+            compact_literal_widget_order,
+        )
+
+        # Compact widgets_values order from object_info, including named
+        # UI-only controls (``control_after_generate``). Socket placeholders
+        # are dropped so slot-0 is the first literal, not a leading None
+        # that collides with frame_rate / seed.
+        literal_order: list[str | None] = list(compact_literal_widget_order(info))
+        return NodeSchema(
+            class_type=schema.class_type,
+            pack=schema.pack,
+            inputs=schema.inputs,
+            outputs=schema.outputs,
+            output_is_list=schema.output_is_list,
+            widget_input_order=tuple(literal_order) if literal_order else (),
+            source_provider="object_info_index",
+            source_cache_path=str(self._active_root / filename),
+            source_package=schema.pack,
+            source_version=str(info.get("pack_version"))
+            if isinstance(info.get("pack_version"), str)
+            else None,
+        )
+
+    @staticmethod
+    def _indexed_class_info(
+        data: Mapping[str, Any], class_type: str, filename: str
+    ) -> dict[str, Any]:
+        info = data.get(class_type)
+        if not isinstance(info, dict):
+            raise SchemaProviderError(
+                class_type,
+                ValueError(
+                    f"indexed pack {filename!r} does not contain object_info "
+                    f"for advertised class {class_type!r}"
+                ),
+            )
+        return info
+
+    def _load_pack(self, filename: str, class_type: str) -> dict[str, Any]:
+        """Read one exact indexed pack, preserving read failures as typed errors."""
+        pack_path = self._validated_pack_path(filename, class_type)
+        data = self._file_cache.get(filename)
+        if data is not None:
+            return data
+        if not pack_path.exists():
+            raise SchemaProviderError(class_type, FileNotFoundError(str(pack_path)))
+        try:
+            data = load_object_info_cache(pack_path)
+        except Exception as exc:  # noqa: BLE001 - preserve typed authority failure
+            raise SchemaProviderError(class_type, exc) from exc
+        if data is None:
+            raise SchemaProviderError(
+                class_type,
+                ValueError(f"unreadable object_info pack: {pack_path}"),
+            )
+        self._file_cache[filename] = data
+        self._pack_sigs[filename] = cache_file_witness(pack_path)
+        return data
+
+
+class CompositeSchemaProvider:
+    def __init__(
+        self,
+        *providers: SchemaProvider,
+        snapshot: SchemaSnapshot | None = None,
+    ) -> None:
+        self.providers = providers
+        self._pinned_snapshot = snapshot
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.get_schema(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        for provider in self.providers:
+            schema = provider.get_schema(class_type)
+            if schema is not None:
+                return schema
+        return None
+
+    @property
+    def listing_only(self) -> bool:
+        """Whether any component exposes IDs without materializing schemas."""
+        return any(bool(getattr(provider, "listing_only", False)) for provider in self.providers)
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        merged: dict[str, NodeSchema] = {}
+        for provider in reversed(self.providers):
+            schemas = schemas_for(provider)
+            if schemas is not None:
+                if bool(getattr(provider, "listing_only", False)):
+                    for key in schemas:
+                        if isinstance(key, str):
+                            merged.setdefault(key, None)  # type: ignore[arg-type]
+                else:
+                    merged.update(
+                        {str(key): value for key, value in schemas.items() if isinstance(value, NodeSchema)}
+                    )
+        return merged
+
+    @property
+    def snapshot(self) -> SchemaSnapshot | None:
+        """Pinned immutable generation stored at composite construction.
+
+        DEEP-AUDIT-FIX-1-ADJUDICATION: composition no longer dynamically
+        forwards an inner provider's snapshot. :func:`with_provisional_gap_filler`
+        pins the exact completed generation it built onto the returned
+        composite; a bare composite has no authority snapshot (``None``), so a
+        consumer with no door-bound authority fails closed instead of silently
+        inheriting whatever an inner live provider happens to carry. Generic
+        lookup ordering stays live/runtime first for non-authority authoring
+        assistance — that never grants admission, because admission consumes
+        only ``CompositeSchemaProvider.snapshot``.
+        """
+        return self._pinned_snapshot
+
+
+def _pinned_authority_snapshot(provider: Any) -> SchemaSnapshot | None:
+    """Read the already-frozen snapshot a provider pins, or None."""
+    if isinstance(provider, SchemaSnapshot):
+        return provider
+    candidate = getattr(provider, "snapshot", None)
+    if callable(candidate):
+        try:
+            candidate = candidate()
+        except Exception:  # noqa: BLE001 - a failing read is no authority
+            return None
+    return candidate if isinstance(candidate, SchemaSnapshot) else None
+
+
+def with_provisional_gap_filler(
+    authoritative: SchemaProvider,
+    provisional: SchemaProvider,
+) -> CompositeSchemaProvider:
+    """Compose real/runtime schemas first; provisional fills only gaps.
+
+    ``CompositeSchemaProvider.get_schema`` is first-match-wins and
+    ``schemas()`` merges providers in reverse order, so the FIRST provider
+    dominates both views. Provisional registry/workflow-JSON schemas are weaker
+    evidence than real/runtime object-info schemas: they must never shadow a
+    real schema (semantic names/choices), only answer classes the
+    authoritative provider cannot. Every agent hydration site composes through
+    this helper so the ordering invariant lives in exactly one place.
+
+    DEEP-AUDIT-FIX-1-ADJUDICATION: the returned composite also carries the
+    bounded NEXT AUTHORITY GENERATION. It reads the already-frozen snapshot
+    from ``authoritative``, takes additions ONLY through
+    ``ProvisionalRegistrySchemaProvider.authority_completion_schemas`` (never
+    by calling the authoritative/live delegate to complete missing classes),
+    builds the completed generation once via
+    ``_complete_schema_snapshot_with_provisional``, and pins that exact
+    snapshot on the composite. Nested provisional composition starts from the
+    prior composite's pinned generation. If no frozen base snapshot exists, no
+    authoritative generation can be manufactured; admission remains fail
+    closed while ordinary authoring lookups keep working.
+    """
+    base = _pinned_authority_snapshot(authoritative)
+    if base is None:
+        return CompositeSchemaProvider(authoritative, provisional)
+    additions: dict[str, NodeSchema] = {}
+    if isinstance(provisional, ProvisionalRegistrySchemaProvider):
+        additions = provisional.authority_completion_schemas()
+    completed = _complete_schema_snapshot_with_provisional(base, additions)
+    return CompositeSchemaProvider(authoritative, provisional, snapshot=completed)
+
+class ProvisionalRegistrySchemaProvider:
+    """Evidence-backed schemas for missing custom nodes discovered by registry research.
+
+    These schemas are not runtime proof that a node is installed. They only let
+    the editor represent a missing custom node class in a candidate graph when a
+    registry/manager lookup supplied either a concrete object_info-like schema
+    or trusted class-map evidence for that exact class. Weak class-name
+    extraction from GitHub/web search remains install guidance, not an
+    authoring schema.
+    """
+
+    def __init__(self, candidates: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> None:
+        self._schemas = _provisional_schemas_from_candidates(candidates)
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.get_schema(class_type)
+
+    def authority_completion_schemas(self) -> dict[str, NodeSchema]:
+        """Schemas eligible for bounded frozen-generation completion.
+
+        DEEP-AUDIT-FIX-1-ADJUDICATION: this explicit capability is the ONLY
+        way admission/witness code may discover provisional evidence — never
+        by traversing a generic provider or calling generic ``get_schema``. A
+        schema is eligible only when every condition holds:
+
+        1. mapping key, requested class, and ``NodeSchema.class_type`` are
+           identical and non-empty;
+        2. ``source_provider`` is exactly one of
+           ``_EVIDENCE_BACKED_PROVISIONAL_SOURCES``;
+        3. ``ignored_evidence`` contains ``not_runtime_validated``;
+        4. for ``comfy_registry_class_map``, ``ignored_evidence`` also
+           contains ``class_only`` and ``schema_backed_resolution_required``;
+        5. serialization through ``schema_payload_from_node_schema`` succeeds.
+
+        Everything else — runtime/live provider, object-info,
+        source-parser, on-demand static resolver, local index, widget schema,
+        unknown, persisted snapshot — is ineligible for the mid-turn seam.
+        """
+        eligible: dict[str, NodeSchema] = {}
+        for mapping_key, schema in self._schemas.items():
+            class_type = getattr(schema, "class_type", None)
+            if (
+                not isinstance(mapping_key, str)
+                or not mapping_key
+                or not isinstance(class_type, str)
+                or not class_type
+                or class_type != mapping_key
+            ):
+                continue
+            source_provider = getattr(schema, "source_provider", None)
+            if source_provider not in _EVIDENCE_BACKED_PROVISIONAL_SOURCES:
+                continue
+            ignored = set(getattr(schema, "ignored_evidence", ()) or ())
+            required_evidence = {"not_runtime_validated"}
+            if source_provider == "comfy_registry_class_map":
+                required_evidence.update(
+                    {"class_only", "schema_backed_resolution_required"}
+                )
+            if not required_evidence.issubset(ignored):
+                continue
+            try:
+                schema_payload_from_node_schema(mapping_key, schema)
+            except Exception:  # noqa: BLE001 - unusable serialization is ineligible
+                continue
+            eligible[mapping_key] = schema
+        return eligible
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        return self._schemas.get(class_type)
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        return dict(self._schemas)
+
+
+class AuthoringSchemaProvider:
+    """Offline schema provider for schema-only authoring and CLI inspection.
+
+    Unlike ``ConversionSchemaProvider``, this provider intentionally prefers the
+    committed structured object_info cache before local/generated
+    ``node_index.json`` so schema-only commands are not shadowed by stale local
+    indexes.
+    """
+
+    def __init__(
+        self,
+        *,
+        object_info_index_root: str | Path | None = None,
+        object_info_cache_path: str | Path | None = None,
+        object_info_cache_dir: str | Path = "out/cache",
+        source_roots: list[str | Path] | None = None,
+        node_index_path: str | Path = "node_index.json",
+        on_demand_schemas: bool | None = None,
+    ) -> None:
+        self.object_info_index_root = Path(object_info_index_root) if object_info_index_root is not None else _default_object_info_index_root()
+        self.object_info_cache_path = Path(object_info_cache_path) if object_info_cache_path is not None else None
+        self.object_info_cache_dir = Path(object_info_cache_dir)
+        self.node_index_path = Path(node_index_path)
+        self.on_demand_schemas = on_demand_schemas
+        self._providers: tuple[SchemaProvider, ...] = self._build_providers(source_roots=source_roots, on_demand_schemas=on_demand_schemas)
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.get_schema(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        builtin = _builtin_schema(class_type)
+        if builtin is not None:
+            return builtin
+        for provider in self._providers:
+            try:
+                schema = provider.get_schema(class_type)
+            except SchemaIndexError:
+                continue
+            if schema is not None:
+                return schema
+        return None
+
+    @property
+    def listing_only(self) -> bool:
+        """Whether any authoring source is backed by a listing-only index."""
+        return any(bool(getattr(provider, "listing_only", False)) for provider in self._providers)
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        merged: dict[str, NodeSchema] = {}
+        for provider in reversed(self._providers):
+            schemas = schemas_for(provider)
+            if schemas is not None:
+                if bool(getattr(provider, "listing_only", False)):
+                    for key in schemas:
+                        if isinstance(key, str):
+                            merged.setdefault(key, None)  # type: ignore[arg-type]
+                else:
+                    merged.update(
+                        {str(key): value for key, value in schemas.items() if isinstance(value, NodeSchema)}
+                    )
+        return merged
+
+    def _build_providers(self, *, source_roots: list[str | Path] | None, on_demand_schemas: bool | None = None) -> tuple[SchemaProvider, ...]:
+        providers: list[SchemaProvider] = []
+        if self.object_info_cache_path is not None:
+            providers.append(ObjectInfoSchemaProvider(self.object_info_cache_path))
+        providers.append(ObjectInfoIndexSchemaProvider(self.object_info_index_root))
+        if self.object_info_cache_path is None:
+            providers.extend(ObjectInfoSchemaProvider(path) for path in object_info_cache_candidates(self.object_info_cache_dir))
+        providers.append(SourceSchemaProvider(source_roots))
+        # Last-resort: manufacture a schema for an uninstalled registry node by cloning
+        # its pack and statically parsing INPUT_TYPES (no execution). A miss triggers
+        # network + git against public third-party repos, so the sandbox is bounded (LRU,
+        # see OnDemandInstallSchemaProvider) and the toggle is controllable: an explicit
+        # flag wins; otherwise VIBECOMFY_ON_DEMAND_SCHEMAS applies, defaulting ON so the
+        # agent can author any public node pack out of the box (set ="0" to opt out).
+        import os
+        if on_demand_schemas is None:
+            on_demand_schemas = os.environ.get("VIBECOMFY_ON_DEMAND_SCHEMAS", "1") != "0"
+        if on_demand_schemas:
+            try:
+                from vibecomfy.schema.on_demand import OnDemandInstallSchemaProvider
+
+                providers.append(OnDemandInstallSchemaProvider())
+            except Exception:
+                pass
+        return tuple(providers)
+
+
+class ConversionSchemaProvider:
+    """Deterministic offline schema provider for port check/convert.
+
+    Precedence order (first hit wins):
+
+    1. **Committed node_index.json** - `LocalSchemaProvider` against the
+       pinned `node_index_path`.
+    2. **Provenance-matched object_info cache** - `ObjectInfoSchemaProvider`
+       loaded from `object_info_cache_path` only when its fingerprint
+       metadata matches the expected runtime identity.
+    3. **Source parser** - `SourceSchemaProvider` scanning installed
+       custom-node source trees under `source_roots`.
+    4. **Widget schema fallback** - positional `widget_N` -> named input
+       aliases from the local `WIDGET_SCHEMA` table (lowest priority).
+    5. **Runtime** - `RuntimeSchemaProvider` is consulted *only* when
+       `enable_runtime=True` (off by default).
+
+    Each `get_schema` hit records a `SchemaSourceInfo` provenance note
+    via `_logger.info` so callers can attribute emission decisions.
+
+    Returns `None` for unknown types - never silently falls through to
+    a live network call behind the `enable_runtime` flag.
+    """
+
+    def __init__(
+        self,
+        *,
+        node_index_path: str | Path = "node_index.json",
+        source_roots: list[str | Path] | None = None,
+        object_info_cache_path: str | Path | None = None,
+        object_info_index_root: str | Path | None = None,
+        widget_schema: dict[str, list[str | None]] | None = None,
+        runtime_server_url: str | None = None,
+        enable_runtime: bool = False,
+    ) -> None:
+        self._local = LocalSchemaProvider(node_index_path)
+        self._source = SourceSchemaProvider(source_roots)
+        self._expected_cache_fingerprint = runtime_fingerprint(runtime_server_url)
+        self._expected_cache_identity = self._object_info_cache_expected_identity(runtime_server_url)
+        self._rejected_object_info_cache: SchemaSourceInfo | None = None
+        self._object_info: ObjectInfoSchemaProvider | None = None
+        if object_info_cache_path is not None:
+            self._object_info = self._validated_object_info_provider(object_info_cache_path)
+        self._object_info_index: ObjectInfoIndexSchemaProvider | None = None
+        if object_info_index_root is not None:
+            self._object_info_index = ObjectInfoIndexSchemaProvider(object_info_index_root)
+        self._widget_schema: dict[str, list[str | None]] = widget_schema or {}
+        self._runtime: RuntimeSchemaProvider | None = None
+        if enable_runtime:
+            self._runtime = RuntimeSchemaProvider(server_url=runtime_server_url)
+        self._enable_runtime = enable_runtime
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        builtin = _builtin_schema(class_type)
+        if builtin is not None:
+            return builtin
+        # 1. Committed node_index.json
+        schema = self._local.get_schema(class_type)
+        if schema is not None:
+            _logger.info(
+                "schema hit: %s provider=node_index path=%s",
+                class_type,
+                self._local.index_path,
+            )
+            return self._with_provenance(
+                schema,
+                SchemaSourceInfo(
+                    provider_name="node_index",
+                    source_path=str(self._local.index_path),
+                    confidence=1.0,
+                ),
+            )
+
+        # 2. Provenance-matched object_info cache
+        if self._object_info is not None:
+            try:
+                schema = self._object_info.get_schema(class_type)
+            except SchemaIndexError:
+                schema = None
+            if schema is not None:
+                cache_info = self._object_info_cache_info()
+                _logger.info(
+                    "schema hit: %s provider=object_info_cache path=%s confidence=%s conflicts=%s",
+                    class_type,
+                    self._object_info.object_info_path,
+                    cache_info.confidence,
+                    cache_info.conflicts,
+                )
+                return self._with_provenance(schema, cache_info)
+            else:
+                _logger.info(
+                    "schema miss in object_info_cache: %s path=%s",
+                    class_type,
+                    self._object_info.object_info_path,
+                )
+
+        # 3. Source parser
+        if self._object_info_index is not None:
+            schema = self._object_info_index.get_schema(class_type)
+            if schema is not None:
+                cache_path = self._object_info_index.root / (self._object_info_index._load_index().get(class_type) or "")
+                _logger.info(
+                    "schema hit: %s provider=object_info_index root=%s",
+                    class_type,
+                    self._object_info_index.root,
+                )
+                return self._with_provenance(
+                    schema,
+                    self._object_info_index_cache_info(schema, cache_path),
+                )
+
+        # 3. Source parser
+        schema = self._source.get_schema(class_type)
+        if schema is not None:
+            source_info = self._source.provenance_for(class_type) or SchemaSourceInfo(
+                provider_name="source_parser",
+                source_path=schema.source_path,
+                package=schema.pack,
+                confidence=0.9,
+            )
+            _logger.info(
+                "schema hit: %s provider=source_parser roots=%s",
+                class_type,
+                self._source.roots,
+            )
+            return self._with_provenance(schema, source_info)
+
+        # 4. Widget schema fallback - build a minimal NodeSchema from aliases
+        widget_names = self._widget_schema.get(class_type)
+        if widget_names is not None:
+            _logger.info(
+                "schema hit: %s provider=widget_schema_fallback names=%s",
+                class_type,
+                widget_names,
+            )
+            fallback_schema = self._widget_names_to_schema(class_type, widget_names)
+            return self._with_provenance(
+                fallback_schema,
+                SchemaSourceInfo(
+                    provider_name="widget_schema",
+                    confidence=0.3,
+                ),
+            )
+
+        # 5. Runtime (only when explicitly enabled)
+        if self._runtime is not None:
+            schema = self._runtime.get_schema(class_type)
+            if schema is not None:
+                _logger.info(
+                    "schema hit: %s provider=runtime server=%s",
+                    class_type,
+                    self._runtime.server_url,
+                )
+                return self._with_provenance(
+                    schema,
+                    SchemaSourceInfo(
+                        provider_name="runtime",
+                        server_url=self._runtime.server_url,
+                        cache_path=str(self._runtime.cache_path) if self._runtime.cache_path else None,
+                        confidence=0.6,
+                    ),
+                )
+
+        _logger.info("schema miss: %s (no provider had it)", class_type)
+        return None
+
+    @staticmethod
+    def _widget_names_to_schema(class_type: str, names: list[str | None]) -> NodeSchema:
+        inputs: dict[str, InputSpec] = {}
+        outputs: list[OutputSpec] = []
+        for idx, name in enumerate(names):
+            if name is not None:
+                inputs[name] = InputSpec(type=None, required=False)
+        return NodeSchema(
+            class_type=class_type,
+            pack=None,
+            inputs=inputs,
+            outputs=outputs,
+            source_provider="widget_schema",
+            confidence=0.3,
+        )
+
+    def _object_info_cache_info(self) -> SchemaSourceInfo:
+        if self._object_info is None:
+            return SchemaSourceInfo(provider_name="object_info_cache", confidence=0.0)
+        path = self._object_info.object_info_path
+        data = load_object_info_cache(path) or {}
+        metadata = data.get("_cache_metadata")
+        info = SchemaSourceInfo(
+            provider_name="object_info_cache",
+            cache_path=str(path),
+            confidence=0.8,
+        )
+        metadata_fingerprint: str | None = None
+        if isinstance(metadata, dict):
+            for key in ("runtime_fingerprint", "fingerprint", "cache_fingerprint"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value:
+                    metadata_fingerprint = value
+                    break
+            info.hash = metadata_fingerprint
+            package = metadata.get("package")
+            version = metadata.get("version")
+            if isinstance(package, str):
+                info.package = package
+            if isinstance(version, str):
+                info.version = version
+        else:
+            info.confidence = 0.5
+            info.ignored_evidence.append("metadata_less_cache")
+
+        filename_fingerprint = _cache_fingerprint_for_path(path)
+        if metadata_fingerprint is None and filename_fingerprint is not None:
+            info.hash = filename_fingerprint
+
+        observed = metadata_fingerprint or filename_fingerprint
+        if observed is not None and observed != self._expected_cache_fingerprint:
+            info.confidence = min(info.confidence, 0.4)
+            info.conflicts.append(
+                f"stale_cache_fingerprint:{observed}!={self._expected_cache_fingerprint}"
+            )
+        elif observed is None:
+            info.confidence = min(info.confidence, 0.5)
+            info.ignored_evidence.append("missing_cache_fingerprint")
+        return info
+
+    def _validated_object_info_provider(self, path: str | Path) -> ObjectInfoSchemaProvider | None:
+        cache_path = Path(path)
+        data = load_object_info_cache(cache_path)
+        result = validate_object_info_cache(
+            data,
+            expected=self._expected_cache_identity,
+            policy="strict",
+            cache_path=cache_path,
+        )
+        if result.ok:
+            return ObjectInfoSchemaProvider(cache_path)
+        self._rejected_object_info_cache = self._object_info_cache_rejection_info(cache_path, result)
+        _logger.warning(
+            "rejected object_info cache: path=%s reason=%s expected=%s actual=%s conflicts=%s",
+            cache_path,
+            result.reason,
+            result.expected,
+            result.actual,
+            self._rejected_object_info_cache.conflicts,
+        )
+        return None
+
+    def _object_info_cache_rejection_info(self, path: Path, result: Any) -> SchemaSourceInfo:
+        info = SchemaSourceInfo(
+            provider_name="object_info_cache",
+            cache_path=str(path),
+            confidence=0.0,
+        )
+        reason = result.reason or "unknown"
+        conflict_prefix = (
+            "rejected_metadata_less_object_info_cache"
+            if reason == "cache_metadata_missing"
+            else "rejected_stale_object_info_cache"
+            if reason
+            in {
+                "cache_format_version_missing",
+                "cache_format_version_mismatch",
+                "cache_checksum_mismatch",
+                "cache_runtime_fingerprint_mismatch",
+                "cache_server_url_mismatch",
+                "cache_authored_pack_fingerprint_mismatch",
+                "cache_authored_index_fingerprint_mismatch",
+            }
+            else "rejected_invalid_object_info_cache"
+        )
+        info.conflicts.append(f"{conflict_prefix}:{reason}")
+        metadata_hash = result.actual.get("runtime_fingerprint") or result.actual.get("checksum")
+        if isinstance(metadata_hash, str):
+            info.hash = metadata_hash
+        return info
+
+    def _object_info_index_cache_info(self, schema: NodeSchema, cache_path: Path) -> SchemaSourceInfo:
+        info = SchemaSourceInfo(
+            provider_name="object_info_index",
+            cache_path=str(cache_path),
+            package=schema.pack,
+            confidence=0.7,
+        )
+        data = load_object_info_cache(cache_path) or {}
+        metadata = data.get(CACHE_METADATA_KEY)
+        if isinstance(metadata, dict):
+            authored_pack = metadata.get("authored_pack_fingerprint")
+            authored_index = metadata.get("authored_index_fingerprint")
+            checksum = metadata.get("checksum")
+            package = metadata.get("package")
+            version = metadata.get("version")
+            for value in (authored_pack, authored_index, checksum):
+                if isinstance(value, str) and value:
+                    info.hash = value
+                    break
+            if isinstance(package, str):
+                info.package = package
+            if isinstance(version, str):
+                info.version = version
+        return info
+
+    def _object_info_cache_expected_identity(self, runtime_server_url: str | None) -> dict[str, Any]:
+        return {"runtime_fingerprint": self._expected_cache_fingerprint}
+
+    @staticmethod
+    def _with_provenance(schema: NodeSchema, info: SchemaSourceInfo) -> NodeSchema:
+        return _with_schema_provenance(schema, info)
+
+
+def _with_schema_provenance(schema: NodeSchema, info: SchemaSourceInfo) -> NodeSchema:
+    """Return a frozen schema annotated with its evidence source."""
+    return NodeSchema(
+        class_type=schema.class_type,
+        pack=schema.pack,
+        inputs=schema.inputs,
+        outputs=schema.outputs,
+        output_is_list=schema.output_is_list,
+        widget_input_order=schema.widget_input_order,
+        source_provider=info.provider_name,
+        source_path=info.source_path,
+        source_cache_path=info.cache_path,
+        source_server_url=info.server_url,
+        source_package=info.package,
+        source_version=info.version,
+        source_hash=info.hash,
+        confidence=info.confidence,
+        conflicts=tuple(info.conflicts),
+        ignored_evidence=tuple(info.ignored_evidence),
+    )
+
+
+class RuntimeSchemaProvider:
+    def __init__(
+        self,
+        *,
+        server_url: str | None = None,
+        cache_dir: str | Path = "out/cache",
+        log_path: str | Path | None = None,
+    ) -> None:
+        self.server_url = server_url
+        self.cache_path = object_info_cache_path(server_url=server_url, cache_dir=cache_dir)
+        self.log_path = log_path
+        self._object_info: dict[str, Any] | None = None
+        self._active_server_url: str | None = None
+        self._object_info_digest: str | None = None
+        self._schemas: dict[str, NodeSchema] | None = None
+        self._schemas_fully_loaded = False
+        self._schema_misses: set[str] = set()
+
+    def get(self, class_type: str) -> NodeSchema | None:
+        return self.get_schema(class_type)
+
+    def get_schema(self, class_type: str) -> NodeSchema | None:
+        if self._schemas is not None:
+            schema = self._schemas.get(class_type)
+            if schema is not None or class_type in self._schema_misses:
+                return schema
+        info = self.object_info().get(class_type)
+        if self._schemas is None:
+            self._schemas = {}
+        if isinstance(info, dict):
+            schema = self._schema_from_loaded_object_info(class_type, info)
+            self._schemas[class_type] = schema
+            return schema
+        self._schema_misses.add(class_type)
+        return None
+
+    def schemas(self) -> dict[str, NodeSchema]:
+        if not self._schemas_fully_loaded:
+            self._schemas = {
+                class_type: self._schema_from_loaded_object_info(class_type, info)
+                for class_type, info in self.object_info().items()
+                if class_type != CACHE_METADATA_KEY and isinstance(info, dict)
+            }
+            self._schema_misses.clear()
+            self._schemas_fully_loaded = True
+        return self._schemas
+
+    def is_empty(self) -> bool:
+        """Check registry presence without parsing every node schema."""
+        return not any(
+            class_type != CACHE_METADATA_KEY and isinstance(info, dict)
+            for class_type, info in self.object_info().items()
+        )
+
+    def object_info(self) -> dict[str, Any]:
+        if self._object_info is None:
+            cached = self._load_valid_cached_object_info()
+            if cached is not None:
+                self._set_object_info(cached)
+            else:
+                self._set_object_info(_run_async(self.object_info_async()))
+        return self._object_info
+
+    def _schema_from_loaded_object_info(
+        self, class_type: str, info: dict[str, Any]
+    ) -> NodeSchema:
+        return _schema_from_object_info(class_type, info)
+
+    async def object_info_async(self) -> dict[str, Any]:
+        cached = self._load_valid_cached_object_info()
+        if cached is not None:
+            self._set_object_info(cached)
+            return self._object_info
+        async with comfy_server(server_url=self.server_url, log_path=self.log_path) as active_url:
+            data = await ComfyClient(active_url).object_info()
+        return await self._accept_live_object_info(data, active_url)
+
+    async def _accept_live_object_info(
+        self, data: Any, active_url: str
+    ) -> dict[str, Any]:
+        try:
+            validate_object_info_payload_shape(data)
+        except ValueError as exc:
+            raise SchemaProviderError(None, exc) from exc
+        write_object_info_cache(
+            self.cache_path,
+            data,
+            runtime_fingerprint=runtime_fingerprint(self.server_url),
+            server_url=active_url,
+        )
+        self._active_server_url = active_url
+        self._object_info_digest = object_info_payload_checksum(data)
+        self._set_object_info(data)
+        return self._object_info
+
+    def _load_valid_cached_object_info(self) -> dict[str, Any] | None:
+        cached = load_object_info_cache(self.cache_path)
+        result = validate_object_info_cache(
+            cached,
+            expected=self._cache_validation_expected(),
+            policy="strict",
+            cache_path=self.cache_path,
+        )
+        if result.ok:
+            return cached if isinstance(cached, dict) else None
+        if cached is not None:
+            _logger.warning(
+                "rejected runtime object_info cache: path=%s reason=%s expected=%s actual=%s",
+                self.cache_path,
+                result.reason,
+                result.expected,
+                result.actual,
+            )
+        return None
+
+    def _cache_validation_expected(self) -> dict[str, Any]:
+        return {"runtime_fingerprint": runtime_fingerprint(self.server_url)}
+
+    def _set_object_info(self, data: dict[str, Any]) -> None:
+        try:
+            validate_object_info_payload_shape(data)
+        except ValueError as exc:
+            raise SchemaProviderError(None, exc) from exc
+        if self._object_info != data:
+            self._schemas = None
+            self._schemas_fully_loaded = False
+            self._schema_misses.clear()
+        self._object_info = data
+
+
+class TargetSchemaProvider(RuntimeSchemaProvider):
+    """Fresh schema authority for one explicit ComfyUI target.
+
+    A target query is evidence about the server that will receive the prompt,
+    so a valid historical cache must never satisfy it.  The fetched payload is
+    still persisted for diagnostics and later authoring, but lookups on this
+    provider remain bound to the in-memory live capture.
+    """
+
+    requires_fresh_target = True
+    schema_authority = "live_target"
+
+    def __init__(
+        self,
+        *,
+        server_url: str,
+        cache_dir: str | Path = "out/cache",
+        log_path: str | Path | None = None,
+    ) -> None:
+        if not isinstance(server_url, str) or not server_url.strip():
+            raise ValueError("server_url must be a non-empty string")
+        super().__init__(server_url=server_url, cache_dir=cache_dir, log_path=log_path)
+
+    def object_info(self) -> dict[str, Any]:
+        if self._object_info is None:
+            self._set_object_info(_run_async(self.object_info_async()))
+        return self._object_info
+
+    def refresh(self) -> dict[str, Any]:
+        """Capture a new live generation for the same target.
+
+        Server sessions retain their provider between runs.  A node-pack
+        activation or Comfy restart can therefore make the cached in-memory
+        object_info stale even though the provider is still marked as a live
+        target.  The final reconciliation gate calls this explicit refresh
+        before admitting a projection.
+        """
+        self._object_info = None
+        self._active_server_url = None
+        self._object_info_digest = None
+        self._schemas = None
+        self._schemas_fully_loaded = False
+        self._schema_misses.clear()
+        self._set_object_info(_run_async(self.object_info_async()))
+        return self._object_info
+
+    async def object_info_async(self) -> dict[str, Any]:
+        async with comfy_server(server_url=self.server_url, log_path=self.log_path) as active_url:
+            data = await ComfyClient(active_url).object_info()
+        return await self._accept_live_object_info(data, active_url)
+
+    def _schema_from_loaded_object_info(
+        self, class_type: str, info: dict[str, Any]
+    ) -> NodeSchema:
+        schema = _schema_from_object_info(class_type, info)
+        return _with_schema_provenance(
+            schema,
+            SchemaSourceInfo(
+                provider_name="target_object_info",
+                server_url=self._active_server_url or self.server_url,
+                hash=self._object_info_digest or object_info_payload_checksum(self._object_info or {}),
+                confidence=1.0,
+            ),
+        )
+
+
+def get_schema_provider(
+    prefer: Literal["runtime", "local", "authoring", "auto"] = "auto",
+    *,
+    server_url: str | None = None,
+) -> RuntimeSchemaProvider | LocalSchemaProvider | AuthoringSchemaProvider | CompositeSchemaProvider:
+    if prefer == "runtime":
+        return TargetSchemaProvider(server_url=server_url) if server_url else RuntimeSchemaProvider()
+    if prefer == "local":
+        return LocalSchemaProvider()
+    if prefer == "authoring":
+        return get_authoring_schema_provider()
+    if prefer != "auto":
+        raise ValueError(f"Unknown schema provider preference: {prefer}")
+    if server_url:
+        return TargetSchemaProvider(server_url=server_url)
+    if Path("node_index.json").exists():
+        return LocalSchemaProvider()
+    if has_comfyui_runtime():
+        return RuntimeSchemaProvider(server_url=server_url)
+    return LocalSchemaProvider()
+
+
+def get_target_schema_provider(
+    server_url: str,
+    *,
+    cache_dir: str | Path = "out/cache",
+    log_path: str | Path | None = None,
+) -> TargetSchemaProvider:
+    """Build a fresh, target-bound schema provider for an explicit server."""
+    if not isinstance(server_url, str) or not server_url.strip():
+        raise ValueError("server_url must be a non-empty string")
+    return TargetSchemaProvider(
+        server_url=server_url,
+        cache_dir=cache_dir,
+        log_path=log_path,
+    )
+
+
+def get_authoring_schema_provider(
+    *,
+    object_info_cache_path: str | Path | None = None,
+    object_info_index_root: str | Path | None = None,
+    node_index_path: str | Path = "node_index.json",
+    on_demand_schemas: bool | None = None,
+) -> AuthoringSchemaProvider:
+    return AuthoringSchemaProvider(
+        object_info_cache_path=object_info_cache_path,
+        object_info_index_root=object_info_index_root,
+        node_index_path=node_index_path,
+        on_demand_schemas=on_demand_schemas,
+    )
+
+
+def _default_object_info_index_root() -> Path:
+    return Path(__file__).resolve().parents[1] / "porting" / "cache" / "object_info"
+
+
+def _schema_from_object_info(class_type: str, info: dict[str, Any]) -> NodeSchema:
+    parsed_inputs: dict[str, InputSpec] = {}
+    input_groups = info.get("input")
+    if not isinstance(input_groups, dict):
+        input_groups = info.get("inputs", {})
+    if isinstance(input_groups, dict):
+        for group_name, group in input_groups.items():
+            required = group_name == "required"
+            if isinstance(group, dict):
+                for name, spec in group.items():
+                    parsed_inputs[str(name)] = _parse_input_spec(spec, required=required, name=str(name))
+    inputs = _order_object_info_inputs(parsed_inputs, info)
+    outputs = _parse_outputs(info)
+    pack = _first_string(info, "pack", "package", "category")
+    # ``object_info_widget_order`` is emitted by the normalized object-info
+    # cache alongside its normalized ``inputs`` map. It is the only explicit
+    # widget/socket authority here: raw ComfyUI ``input`` rows do not carry an
+    # exact compact widgets_values domain, so leave the field empty for them
+    # instead of guessing from input type names.
+    widget_input_order: tuple[str | None, ...] = ()
+    if isinstance(info.get("object_info_widget_order"), list) and isinstance(
+        info.get("inputs"), Mapping
+    ):
+        from vibecomfy.porting.object_info.consume import compact_literal_widget_order
+
+        widget_input_order = tuple(compact_literal_widget_order(info))
+    return NodeSchema(
+        class_type=class_type,
+        pack=pack,
+        inputs=inputs,
+        outputs=outputs,
+        output_is_list=_parse_output_is_list(info, len(outputs)),
+        widget_input_order=widget_input_order,
+    )
+
+
+def _provisional_schemas_from_candidates(
+    candidates: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, NodeSchema]:
+    schemas: dict[str, NodeSchema] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        pack = candidate.get("pack") if isinstance(candidate.get("pack"), dict) else {}
+        pack_name = _first_string(pack, "slug", "name", "registry_id") if isinstance(pack, dict) else None
+        schema_payload = candidate.get("provisional_schema")
+        schema_nodes: Any = None
+        if isinstance(schema_payload, dict):
+            raw_schema = schema_payload.get("schema")
+            if isinstance(raw_schema, dict):
+                from vibecomfy.ingest.normalize import door_get_nodes
+
+                schema_nodes = door_get_nodes(raw_schema) or raw_schema.get("object_info") or raw_schema
+        if isinstance(schema_nodes, dict):
+            for class_type, info in schema_nodes.items():
+                if not isinstance(class_type, str) or not isinstance(info, dict):
+                    continue
+                schema = _schema_from_object_info(class_type, info)
+                source_provider = (
+                    "workflow_json_provisional"
+                    if candidate.get("validation_mode") == "workflow_json_provisional"
+                    else "comfy_registry_provisional"
+                )
+                schemas[class_type] = NodeSchema(
+                    class_type=schema.class_type,
+                    pack=schema.pack or pack_name,
+                    inputs=schema.inputs,
+                    outputs=schema.outputs,
+                    widget_input_order=schema.widget_input_order,
+                    source_provider=source_provider,
+                    source_package=pack_name,
+                    source_version=_first_string(schema_payload, "version") if isinstance(schema_payload, dict) else None,
+                    confidence=0.55,
+                    ignored_evidence=("not_installed", "not_runtime_validated"),
+                )
+        if _candidate_supports_class_only_placeholder(candidate):
+            expected = candidate.get("expected_classes")
+            if isinstance(expected, (list, tuple)):
+                for raw_class_type in expected:
+                    class_type = str(raw_class_type).strip()
+                    if class_type and class_type not in schemas:
+                        schemas[class_type] = NodeSchema(
+                            class_type=class_type,
+                            pack=pack_name,
+                            inputs={},
+                            outputs=[],
+                            source_provider="comfy_registry_class_map",
+                            source_package=pack_name,
+                            confidence=0.4,
+                            ignored_evidence=(
+                                "class_only",
+                                "schema_backed_resolution_required",
+                                "not_runtime_validated",
+                            ),
+                        )
+    return schemas
+
+
+def _candidate_supports_class_only_placeholder(candidate: dict[str, Any]) -> bool:
+    """Return true for registry evidence strong enough to place a draft node.
+
+    ComfyUI-Manager's custom-node-map is an exact class -> pack mapping, so it
+    can back a low-confidence schema placeholder. GitHub code/repository search
+    only proves that words appeared near a repo and must not create constructors.
+    """
+    if str(candidate.get("validation_mode") or "") != "class_validatable":
+        return False
+    evidence = candidate.get("evidence")
+    if not isinstance(evidence, list):
+        return False
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "")
+        tier = str(item.get("tier") or "")
+        if source == "custom-node-map" or tier == "comfy-manager":
+            return True
+    return False
+
+
+def _order_object_info_inputs(inputs: dict[str, InputSpec], info: dict[str, Any]) -> dict[str, InputSpec]:
+    ordered: dict[str, InputSpec] = {}
+    for name in _object_info_input_order(info):
+        if name in inputs and name not in ordered:
+            ordered[name] = inputs[name]
+    for name, spec in inputs.items():
+        if name not in ordered:
+            ordered[name] = spec
+    return ordered
+
+
+def _object_info_input_order(info: dict[str, Any]) -> list[str]:
+    widget_order = info.get("object_info_widget_order")
+    if isinstance(widget_order, list):
+        return [str(name) for name in widget_order if isinstance(name, str) and name]
+
+    input_order_all = info.get("input_order_all")
+    if isinstance(input_order_all, list):
+        return [str(name) for name in input_order_all if isinstance(name, str) and name]
+
+    input_order = info.get("input_order")
+    if isinstance(input_order, dict):
+        names: list[str] = []
+        for group in ("required", "optional", "hidden"):
+            values = input_order.get(group)
+            if isinstance(values, list):
+                names.extend(str(name) for name in values if isinstance(name, str) and name)
+        return names
+    return []
+
+
+def _cache_fingerprint_for_path(path: Path) -> str | None:
+    name = path.name
+    if not name.startswith("object_info.") or not name.endswith(".json"):
+        return None
+    middle = name[len("object_info.") : -len(".json")]
+    if not middle:
+        return None
+    return middle
+
+
+def _schema_from_index_row(row: dict[str, Any]) -> NodeSchema | None:
+    class_type = _first_string(row, "class_type", "class_name", "name", "id", "node", "display_name")
+    if not class_type:
+        return None
+    pack = _first_string(row, "pack", "package", "source", "category")
+    inputs: dict[str, InputSpec] = {}
+    raw_inputs = row.get("inputs") or row.get("input")
+    if isinstance(raw_inputs, dict):
+        if "required" in raw_inputs or "optional" in raw_inputs:
+            for group_name, group in raw_inputs.items():
+                if isinstance(group, dict):
+                    for name, spec in group.items():
+                        inputs[str(name)] = _parse_input_spec(spec, required=group_name == "required", name=str(name))
+        else:
+            for name, spec in raw_inputs.items():
+                inputs[str(name)] = _parse_input_spec(spec, required=False, name=str(name))
+    elif isinstance(raw_inputs, list):
+        for item in raw_inputs:
+            if isinstance(item, str):
+                inputs[item] = InputSpec(required=False)
+            elif isinstance(item, dict) and isinstance(item.get("name"), str):
+                inputs[item["name"]] = _parse_input_spec(item, required=bool(item.get("required", False)), name=item["name"])
+    outputs = _parse_index_outputs(row)
+    return NodeSchema(
+        class_type=class_type,
+        pack=pack,
+        inputs=inputs,
+        outputs=outputs,
+        output_is_list=_parse_output_is_list(row, len(outputs)),
+    )
+
+
+def _parse_index_outputs(row: dict[str, Any]) -> list[OutputSpec]:
+    output_types = row.get("output_types") or row.get("outputs") or row.get("output")
+    if isinstance(output_types, str):
+        parts = [part.strip() for part in output_types.split(",")]
+        return [OutputSpec(type=part) for part in parts if part]
+    if isinstance(output_types, list):
+        outputs: list[OutputSpec] = []
+        for item in output_types:
+            if isinstance(item, dict):
+                outputs.append(OutputSpec(
+                    type=_first_string(item, "type"),
+                    name=_first_string(item, "name"),
+                ))
+            elif item is not None:
+                outputs.append(OutputSpec(type=str(item)))
+        return outputs
+    return []
+
+
+DYNAMIC_COMBO_TYPE = "COMFY_DYNAMICCOMBO_V3"
+
+
+def _dynamic_combo_field_names(option_inputs: Any, prefix: str) -> list[str]:
+    """Every dotted input name an option can contribute, nested combos included."""
+    names: list[str] = []
+    if not isinstance(option_inputs, Mapping):
+        return names
+    for group in ("required", "optional"):
+        rows = option_inputs.get(group)
+        if not isinstance(rows, Mapping):
+            continue
+        for sub_name, sub_raw in rows.items():
+            full = f"{prefix}{sub_name}"
+            names.append(full)
+            sub_attrs = sub_raw[1] if isinstance(sub_raw, (list, tuple)) and len(sub_raw) > 1 else {}
+            if isinstance(sub_raw, (list, tuple)) and sub_raw and sub_raw[0] == DYNAMIC_COMBO_TYPE and isinstance(sub_attrs, Mapping):
+                for option in sub_attrs.get("options") or []:
+                    if isinstance(option, Mapping):
+                        names.extend(_dynamic_combo_field_names(option.get("inputs"), f"{full}."))
+    return names
+
+
+def _parse_input_spec(raw: Any, *, required: bool, name: str | None = None) -> InputSpec:
+    typ: Any = None
+    attrs: dict[str, Any] = {}
+    choices: list[Any] | None = None
+    if isinstance(raw, (list, tuple)) and raw:
+        typ = raw[0]
+        if isinstance(typ, list):
+            choices = list(typ)
+            typ = "CHOICE"
+        if len(raw) > 1 and isinstance(raw[1], dict):
+            attrs = raw[1]
+    elif isinstance(raw, dict):
+        typ = raw.get("type")
+        attrs = raw
+        if isinstance(raw.get("choices"), list):
+            choices = list(raw["choices"])
+    elif isinstance(raw, str):
+        typ = raw
+
+    # Object-info is an external, weakly typed boundary.  Keep only bounds
+    # whose JSON value already has the schema contract's numeric type.  In
+    # particular, ComfyUI's ``BIGMAX`` sentinel is not a number and must not
+    # be guessed/coerced into one: the producer should emit ``null`` so the
+    # admission validator can remain strict without rejecting the whole row.
+    def typed_bound(value: Any) -> int | float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value
+
+    dynamic_fields: dict[str, tuple[str, ...]] = {}
+    raw_formats = attrs.get("formats")
+    if isinstance(raw_formats, Mapping):
+        for controller_value, raw_rows in raw_formats.items():
+            if not isinstance(raw_rows, (list, tuple)):
+                continue
+            names: list[str] = []
+            for row in raw_rows:
+                if isinstance(row, (list, tuple)) and row and isinstance(row[0], str):
+                    names.append(row[0])
+            if names:
+                dynamic_fields[str(controller_value)] = tuple(dict.fromkeys(names))
+
+    dynamic_options: dict[str, Any] = {}
+    if typ == DYNAMIC_COMBO_TYPE and isinstance(attrs.get("options"), list):
+        for option in attrs["options"]:
+            if isinstance(option, Mapping) and isinstance(option.get("key"), str):
+                inputs = option.get("inputs")
+                dynamic_options[option["key"]] = dict(inputs) if isinstance(inputs, Mapping) else {}
+        if dynamic_options:
+            # The controller is a widget whose value picks an option.
+            choices = list(dynamic_options)
+            if name:
+                for key, option_inputs in dynamic_options.items():
+                    fields = _dynamic_combo_field_names(option_inputs, f"{name}.")
+                    if fields:
+                        dynamic_fields[key] = tuple(dict.fromkeys(fields))
+
+    return InputSpec(
+        type=str(typ) if typ is not None else None,
+        required=required,
+        default=attrs.get("default"),
+        choices=choices,
+        min=typed_bound(attrs.get("min")),
+        max=typed_bound(attrs.get("max")),
+        unresolved_choices=attrs.get("unresolved_choices") is True,
+        asset_kind="image" if attrs.get("image_upload") is True else None,
+        dynamic_fields=dynamic_fields,
+        dynamic_options=dynamic_options,
+        control_after_generate=bool(attrs.get("control_after_generate")),
+    )
+
+def _parse_outputs(info: dict[str, Any]) -> list[OutputSpec]:
+    normalized_outputs = info.get("outputs")
+    if isinstance(normalized_outputs, list):
+        outputs: list[OutputSpec] = []
+        for item in normalized_outputs:
+            if isinstance(item, dict):
+                outputs.append(
+                    OutputSpec(
+                        type=_first_string(item, "type"),
+                        name=_first_string(item, "name"),
+                    )
+                )
+            elif item is not None:
+                outputs.append(OutputSpec(type=str(item)))
+        return outputs
+
+    raw_outputs = info.get("output") or []
+    names = info.get("output_name") or info.get("output_names") or []
+    outputs: list[OutputSpec] = []
+    if isinstance(raw_outputs, (list, tuple)):
+        for index, raw in enumerate(raw_outputs):
+            name = names[index] if isinstance(names, (list, tuple)) and index < len(names) else None
+            outputs.append(OutputSpec(
+                type=str(raw) if raw is not None else None,
+                name=str(name) if name else None,
+            ))
+    return outputs
+
+
+def _parse_output_is_list(info: Mapping[str, Any], output_count: int) -> tuple[bool, ...]:
+    """Read provider list-output evidence without changing snapshot schema ABI."""
+    normalized = info.get("outputs")
+    if isinstance(normalized, list):
+        return tuple(
+            isinstance(item, Mapping) and item.get("is_list") is True
+            for item in normalized[:output_count]
+        ) + (False,) * max(0, output_count - len(normalized))
+    raw = info.get("output_is_list")
+    if isinstance(raw, (list, tuple)):
+        return tuple(raw[index] is True for index in range(min(output_count, len(raw)))) + (
+            False,
+        ) * max(0, output_count - len(raw))
+    return (False,) * output_count
+
+
+def _default_source_roots() -> list[Path]:
+    return [
+        Path("custom_nodes"),
+        Path("vendor") / "ComfyUI",
+    ]
+
+
+_SOURCE_SCAN_EXCLUDED_DIRS = frozenset({".git", "__pycache__", "venv", ".venv", "node_modules"})
+
+
+def _direct_python_files(roots: list[Path], class_type: str) -> list[Path]:
+    return [path for root in roots if (path := root / f"{class_type}.py").is_file()]
+
+
+def _candidate_python_files(
+    roots: list[Path],
+    class_type: str,
+    *,
+    warnings: list[SourceScanWarning] | None = None,
+    max_files_per_root: int = 2_000,
+    max_total_files: int = 5_000,
+) -> list[Path]:
+    candidates: list[Path] = []
+    total_scanned = 0
+    for root in roots:
+        if not root.exists():
+            continue
+        direct = root / f"{class_type}.py"
+        if direct.is_file():
+            candidates.append(direct)
+        try:
+            root_scanned = 0
+            for path in sorted(root.rglob("*.py")):
+                if path == direct:
+                    continue
+                if any(part in _SOURCE_SCAN_EXCLUDED_DIRS for part in path.parts):
+                    continue
+                if root_scanned >= max_files_per_root:
+                    if warnings is not None:
+                        warnings.append(
+                            SourceScanWarning(
+                                code="source_scan_file_cap_skipped",
+                                message=f"source scan file cap {max_files_per_root} reached under {root}",
+                                path=str(root),
+                            )
+                        )
+                    break
+                if total_scanned >= max_total_files:
+                    if warnings is not None:
+                        warnings.append(
+                            SourceScanWarning(
+                                code="source_scan_total_file_cap_skipped",
+                                message=f"source scan total file cap {max_total_files} reached before {path}",
+                                path=str(path),
+                            )
+                        )
+                    return sorted(dict.fromkeys(candidates))
+                root_scanned += 1
+                total_scanned += 1
+                try:
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if f"class {class_type}" in text or f'"{class_type}"' in text or f"'{class_type}'" in text:
+                    candidates.append(path)
+        except OSError:
+            continue
+    return sorted(dict.fromkeys(candidates))
+
+
+def _schema_from_python_source(path: Path, class_type: str) -> NodeSchema | None:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"), filename=str(path))
+    except (OSError, SyntaxError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_type:
+            class_values = _class_literal_values(node)
+            input_types = _input_types_return(node, class_values)
+            if not isinstance(input_types, dict):
+                return None
+            return _schema_from_object_info(
+                class_type,
+                {
+                    "pack": path.parent.name,
+                    "input": input_types,
+                    "output": _class_literal_attr(node, "RETURN_TYPES") or [],
+                    "output_name": _class_literal_attr(node, "RETURN_NAMES") or [],
+                },
+            )
+    return None
+
+
+def _source_contains_class(path: Path, class_type: str) -> bool:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"), filename=str(path))
+    except (OSError, SyntaxError):
+        return False
+    return any(isinstance(node, ast.ClassDef) and node.name == class_type for node in ast.walk(tree))
+
+
+def _class_literal_values(node: ast.ClassDef) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for stmt in node.body:
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(stmt, ast.Assign):
+            targets = list(stmt.targets)
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.target is not None:
+            targets = [stmt.target]
+            value = stmt.value
+        if value is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                parsed = _literal_eval_node(value, values)
+                if parsed is not _UNPARSEABLE:
+                    values[target.id] = parsed
+    return values
+
+
+def _class_literal_attr(node: ast.ClassDef, name: str) -> Any:
+    values = _class_literal_values(node)
+    return values.get(name)
+
+
+def _input_types_return(node: ast.ClassDef, class_values: dict[str, Any]) -> Any:
+    for stmt in node.body:
+        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) or stmt.name != "INPUT_TYPES":
+            continue
+        for child in ast.walk(stmt):
+            if isinstance(child, ast.Return) and child.value is not None:
+                # salvage=True keeps dynamic per-input entries (see
+                # _UNRESOLVED_COMBO_SPEC) instead of dropping them.
+                parsed = _literal_eval_node(child.value, class_values, salvage=True)
+                return None if parsed is _UNPARSEABLE else parsed
+    return None
+
+
+_UNPARSEABLE = object()
+
+# Placeholder for INPUT_TYPES entries whose value cannot be parsed statically
+# (typically combo choices computed at runtime). Emitted as a COMBO widget with
+# unresolved choices so the input stays authorable instead of vanishing.
+_UNRESOLVED_COMBO_SPEC = ["COMBO", {"unresolved_choices": True}]
+
+
+def _is_proven_dynamic_choice_node(node: ast.AST) -> bool:
+    """Return True for shapes that prove a combo's choices are computed at runtime."""
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return True
+    if isinstance(node, ast.Call):
+        return True
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple)):
+        if node.elts:
+            first = node.elts[0]
+            # Starred unpacking like (*models, {...}) still counts.
+            if isinstance(first, ast.Starred):
+                first = first.value
+            if isinstance(first, (ast.Name, ast.Attribute, ast.Call, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                return True
+            # Nested tuple/list wrapper (unlikely) — recurse one level.
+            if isinstance(first, (ast.List, ast.Tuple)) and first.elts and isinstance(first.elts[0], (ast.Name, ast.Attribute, ast.Call)):
+                return True
+        return False
+    return False
+
+def _literal_eval_node(node: ast.AST, class_values: dict[str, Any], *, salvage: bool = False) -> Any:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.List):
+        values: list[Any] = []
+        for idx, item in enumerate(node.elts):
+            salvage_for_item = salvage and not (idx == 1 and len(node.elts) == 2 and isinstance(item, ast.Dict))
+            v = _literal_eval_node(item, class_values, salvage=salvage_for_item)
+            if v is _UNPARSEABLE:
+                return _UNPARSEABLE
+            values.append(v)
+        return values
+    if isinstance(node, ast.Tuple):
+        values_tuple: list[Any] = []
+        for idx, item in enumerate(node.elts):
+            salvage_for_item = salvage and not (idx == 1 and len(node.elts) == 2 and isinstance(item, ast.Dict))
+            v = _literal_eval_node(item, class_values, salvage=salvage_for_item)
+            if v is _UNPARSEABLE:
+                return _UNPARSEABLE
+            values_tuple.append(v)
+        return tuple(values_tuple)
+    if isinstance(node, ast.Dict):
+        out: dict[Any, Any] = {}
+        for key_node, value_node in zip(node.keys, node.values, strict=False):
+            if key_node is None:
+                return _UNPARSEABLE
+            key = _literal_eval_node(key_node, class_values, salvage=salvage)
+            value = _literal_eval_node(value_node, class_values, salvage=salvage)
+            if key is _UNPARSEABLE:
+                return _UNPARSEABLE
+            if value is _UNPARSEABLE:
+                if salvage and isinstance(key, str) and _is_proven_dynamic_choice_node(value_node):
+                    # Dynamic INPUT_TYPES entry (e.g. combo choices computed at
+                    # runtime): keep the input as an unresolved COMBO widget
+                    # instead of silently dropping it -- dropping hides real
+                    # authorable fields (e.g. QwenEmotionNode.qwen_model) from
+                    # the authoring surface and admission.
+                    out[key] = list(_UNRESOLVED_COMBO_SPEC)
+                continue
+            out[key] = value
+        return out
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.attr in class_values:
+        return class_values[node.attr]
+    if isinstance(node, ast.Name):
+        return class_values.get(node.id, _UNPARSEABLE)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        value = _literal_eval_node(node.operand, class_values, salvage=salvage)
+        if isinstance(value, (int, float)):
+            return -value
+    return _UNPARSEABLE
+
+def _first_string(row: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _run_async(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    coro.close()
+    raise RuntimeError("RuntimeSchemaProvider synchronous access cannot run inside an active event loop; use object_info_async().")
