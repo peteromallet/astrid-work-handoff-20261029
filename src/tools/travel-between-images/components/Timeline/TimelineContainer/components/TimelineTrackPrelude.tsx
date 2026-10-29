@@ -1,0 +1,299 @@
+import React from 'react';
+import { GenerationRow } from '@/domains/generation/types';
+import { SegmentSlot } from '@/shared/hooks/segments';
+import {
+  useTimelineFps,
+  type TimelineMediaContextValue,
+} from '../../TimelineMediaContext';
+import { AudioStrip } from '../../AudioStrip';
+import { GuidanceVideoStrip } from '../../GuidanceVideoStrip';
+import { GuidanceVideoUploader } from '../../GuidanceVideoUploader';
+import { GuidanceVideosContainer } from '../../GuidanceVideosContainer';
+import { SegmentOutputStrip } from '../../SegmentOutputStrip';
+import { PENDING_POSITION_KEY, sortPositionEntries } from '../../utils/timeline-utils';
+import type { AuthoredVideoMetadata, VideoMetadata } from '@/shared/lib/media/videoMetadata';
+
+function toCompleteVideoMetadata(metadata: AuthoredVideoMetadata | null): VideoMetadata | null {
+  if (!metadata
+    || metadata.duration_seconds === undefined
+    || metadata.frame_rate === undefined
+    || metadata.total_frames === undefined
+    || metadata.width === undefined
+    || metadata.height === undefined
+    || metadata.file_size === undefined) {
+    return null;
+  }
+
+  return {
+    duration_seconds: metadata.duration_seconds,
+    frame_rate: metadata.frame_rate,
+    total_frames: metadata.total_frames,
+    width: metadata.width,
+    height: metadata.height,
+    file_size: metadata.file_size,
+  };
+}
+
+interface TimelinePairInfo {
+  index: number;
+  startId: string;
+  endId: string;
+  startFrame: number;
+  endFrame: number;
+  frames: number;
+  generationStart: number;
+  contextStart: number;
+  contextEnd: number;
+}
+
+interface TimelineTrackPreludeProps {
+  timeline: {
+    shotId: string;
+    projectId?: string;
+    readOnly: boolean;
+    images: GenerationRow[];
+    imagePositions: Map<string, number>;
+    activePendingFrame: number | null;
+    trailingEndFrame: number | undefined;
+    hasCallbackTrailingVideo: boolean;
+    hasLiveTrailingVideo: boolean;
+    projectAspectRatio?: string;
+    pairInfoWithPending: TimelinePairInfo[];
+    localShotGenPositions: Map<string, number>;
+    segmentSlots?: SegmentSlot[];
+    hasPendingTask?: (pairShotGenerationId: string | null | undefined) => boolean;
+    selectedOutputId?: string | null;
+    onPairClick?: (pairIndex: number) => void;
+    onOpenPairSettings?: (pairIndex: number) => void;
+    onTrailingVideoInfo: (videoUrl: string | null) => void;
+    onFileDrop?: (files: File[], targetFrame?: number, handles?: Array<FileSystemFileHandle | null>) => Promise<void>;
+    videoOutputs?: GenerationRow[];
+  };
+  guidance: Pick<
+    TimelineMediaContextValue,
+    | 'structureVideos'
+    | 'isStructureVideoLoading'
+    | 'cachedHasStructureVideo'
+    | 'onAddStructureVideo'
+    | 'onUpdateStructureVideo'
+    | 'onRemoveStructureVideo'
+    | 'primaryStructureVideo'
+    | 'onPrimaryStructureVideoInputChange'
+  >;
+  audio: {
+    audioUrl?: string | null;
+    audioMetadata?: { duration: number; name?: string } | null;
+    onAudioChange?: (
+      audioUrl: string | null,
+      metadata: { duration: number; name?: string } | null,
+    ) => void;
+  };
+  layout: {
+    fullMin: number;
+    fullMax: number;
+    fullRange: number;
+    containerWidth: number;
+    zoomLevel: number;
+    hasNoImages: boolean;
+  };
+  zoom: {
+    onZoomIn: () => void;
+    onZoomOut: () => void;
+    onZoomReset: () => void;
+    onZoomToStart: () => void;
+  };
+}
+
+export const TimelineTrackPrelude: React.FC<TimelineTrackPreludeProps> = ({
+  timeline,
+  guidance,
+  audio,
+  layout,
+  zoom,
+}) => {
+  const timelineFps = useTimelineFps();
+  const {
+    shotId,
+    projectId,
+    readOnly,
+    images,
+    imagePositions,
+    activePendingFrame,
+    trailingEndFrame,
+    hasCallbackTrailingVideo,
+    hasLiveTrailingVideo,
+    projectAspectRatio,
+    pairInfoWithPending,
+    localShotGenPositions,
+    segmentSlots,
+    hasPendingTask,
+    selectedOutputId,
+    onPairClick,
+    onOpenPairSettings,
+    onTrailingVideoInfo,
+    videoOutputs,
+  } = timeline;
+
+  return (
+    <>
+      {shotId && (projectId || (readOnly && videoOutputs)) && (() => {
+        const sortedEntries = imagePositions.size > 0
+          ? sortPositionEntries(imagePositions)
+          : [];
+        const lastEntry = sortedEntries[sortedEntries.length - 1];
+        const isMultiImage = images.length > 1;
+        const realLastFrame = lastEntry ? lastEntry[1] : undefined;
+        const pendingIsLast = activePendingFrame !== null
+          && realLastFrame !== undefined
+          && activePendingFrame > realLastFrame;
+        const resolvedSegmentSlots = segmentSlots ?? [];
+        const hasTrailingSegment =
+          Boolean(lastEntry)
+          && (trailingEndFrame !== undefined || hasCallbackTrailingVideo || hasLiveTrailingVideo);
+        // Hide the segment output strip when the shot has ≤2 timeline images.
+        // In that mode, the segment video IS the final video — showing
+        // the strip is redundant. When the user adds a 3rd image, images.length
+        // updates reactively and the strip reappears.
+        const shouldHideSegmentOutputStrip = images.length <= 2;
+
+        return (
+          shouldHideSegmentOutputStrip
+            ? <div className="h-8" />
+            : <SegmentOutputStrip
+              shotId={shotId}
+              projectId={projectId}
+              readOnly={readOnly}
+              projectAspectRatio={projectAspectRatio}
+              pairInfo={pairInfoWithPending}
+              fullMin={layout.fullMin}
+              fullMax={layout.fullMax}
+              fullRange={layout.fullRange}
+              containerWidth={layout.containerWidth}
+              zoomLevel={layout.zoomLevel}
+              segmentSlots={resolvedSegmentSlots}
+              localShotGenPositions={localShotGenPositions}
+              hasPendingTask={hasPendingTask}
+              onOpenPairSettings={onPairClick ? onOpenPairSettings : undefined}
+              selectedParentId={selectedOutputId}
+              trailingSegmentMode={hasTrailingSegment && lastEntry
+                ? (() => {
+                  const [imageId, imageFrame] = lastEntry;
+                  const resolvedEndFrame = trailingEndFrame ?? (imageFrame + (isMultiImage ? 17 : 49));
+                  const trailingDuration = resolvedEndFrame - imageFrame;
+                  const effectiveImageId = pendingIsLast ? PENDING_POSITION_KEY : imageId;
+                  const effectiveImageFrame = pendingIsLast ? activePendingFrame : imageFrame;
+                  const effectiveEndFrame = pendingIsLast
+                    ? (activePendingFrame ?? imageFrame) + trailingDuration
+                    : resolvedEndFrame;
+                  return {
+                    imageId: effectiveImageId,
+                    imageFrame: effectiveImageFrame,
+                    endFrame: effectiveEndFrame,
+                  };
+                })()
+                : undefined}
+              onTrailingVideoInfo={onTrailingVideoInfo}
+            />
+        );
+      })()}
+
+      {shotId && (projectId || readOnly) && (
+        guidance.structureVideos && guidance.onUpdateStructureVideo && guidance.onRemoveStructureVideo ? (
+          <GuidanceVideosContainer
+            structureVideos={guidance.structureVideos}
+            isLoading={guidance.isStructureVideoLoading}
+            cachedHasStructureVideo={guidance.cachedHasStructureVideo}
+            shotId={shotId}
+            onUpdateVideo={guidance.onUpdateStructureVideo}
+            onRemoveVideo={guidance.onRemoveStructureVideo}
+            fullMin={layout.fullMin}
+            fullMax={layout.fullMax}
+            fullRange={layout.fullRange}
+            containerWidth={layout.containerWidth}
+            zoomLevel={layout.zoomLevel}
+            timelineFrameCount={images.length}
+            readOnly={readOnly}
+          />
+        ) : guidance.onPrimaryStructureVideoInputChange && (
+          guidance.primaryStructureVideo.path ? (
+            <GuidanceVideoStrip
+              videoUrl={guidance.primaryStructureVideo.path}
+              videoMetadata={toCompleteVideoMetadata(guidance.primaryStructureVideo.metadata)}
+              treatment={guidance.primaryStructureVideo.treatment}
+              onTreatmentChange={(treatment) => guidance.onPrimaryStructureVideoInputChange?.({
+                videoPath: guidance.primaryStructureVideo.path,
+                metadata: toCompleteVideoMetadata(guidance.primaryStructureVideo.metadata),
+                treatment,
+                motionStrength: guidance.primaryStructureVideo.motionStrength,
+                structureType: guidance.primaryStructureVideo.structureType,
+              })}
+              onRemove={() => guidance.onPrimaryStructureVideoInputChange?.({
+                videoPath: null,
+                metadata: null,
+                treatment: 'adjust',
+                motionStrength: 1.0,
+                structureType: 'flow',
+              })}
+              onMetadataExtracted={(metadata) => guidance.onPrimaryStructureVideoInputChange?.({
+                videoPath: guidance.primaryStructureVideo.path,
+                metadata,
+                treatment: guidance.primaryStructureVideo.treatment,
+                motionStrength: guidance.primaryStructureVideo.motionStrength,
+                structureType: guidance.primaryStructureVideo.structureType,
+              })}
+              fullMin={layout.fullMin}
+              fullMax={layout.fullMax}
+              fullRange={layout.fullRange}
+              containerWidth={layout.containerWidth}
+              zoomLevel={layout.zoomLevel}
+              timelineFrameCount={images.length}
+              readOnly={readOnly}
+            />
+          ) : !readOnly ? (
+            <GuidanceVideoUploader
+              shotId={shotId}
+              projectId={projectId ?? ''}
+              onVideoUploaded={(videoUrl, metadata) => {
+                if (videoUrl && metadata) {
+                  guidance.onPrimaryStructureVideoInputChange?.({
+                    videoPath: videoUrl,
+                    metadata,
+                    treatment: guidance.primaryStructureVideo.treatment,
+                    motionStrength: guidance.primaryStructureVideo.motionStrength,
+                    structureType: guidance.primaryStructureVideo.structureType,
+                  });
+                }
+              }}
+              currentVideoUrl={guidance.primaryStructureVideo.path ?? null}
+              compact={false}
+              zoomLevel={layout.zoomLevel}
+              onZoomIn={zoom.onZoomIn}
+              onZoomOut={zoom.onZoomOut}
+              onZoomReset={zoom.onZoomReset}
+              onZoomToStart={zoom.onZoomToStart}
+              hasNoImages={layout.hasNoImages}
+            />
+          ) : null
+        )
+      )}
+
+      {audio.onAudioChange && audio.audioUrl && (
+        <div className="mt-1 mb-2">
+          <AudioStrip
+            audioUrl={audio.audioUrl}
+            audioMetadata={audio.audioMetadata || null}
+            onRemove={() => audio.onAudioChange?.(null, null)}
+            fullMin={layout.fullMin}
+            fullMax={layout.fullMax}
+            fullRange={layout.fullRange}
+            containerWidth={layout.containerWidth}
+            zoomLevel={layout.zoomLevel}
+            readOnly={readOnly}
+            compact={!!guidance.primaryStructureVideo.path}
+            timelineFps={timelineFps}
+          />
+        </div>
+      )}
+    </>
+  );
+};

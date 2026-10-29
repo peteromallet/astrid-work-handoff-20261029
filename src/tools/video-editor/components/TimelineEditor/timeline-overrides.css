@@ -1,0 +1,246 @@
+/* Left gutter — extends the track label bg-card below the tracks to fill the viewport */
+.timeline-canvas-edit-area::before {
+  content: '';
+  position: sticky;
+  left: 0;
+  top: 0;
+  float: left;
+  width: var(--label-width);
+  height: 100%;
+  margin-bottom: -100%;
+  background: hsl(var(--card));
+  border-right: 1px solid hsl(var(--border));
+  z-index: 6;
+  pointer-events: none;
+}
+
+/* Touch: no classic scrollbars or reserved gutter over the timeline; panning still scrolls. */
+.timeline-scroll:not([data-device-class='desktop']) {
+  scrollbar-width: none;
+  scrollbar-gutter: auto;
+}
+
+.timeline-scroll:not([data-device-class='desktop'])::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── Touch gesture ownership ──
+   A touch that starts on an element with `touch-action: auto` is claimed by the
+   browser for native panning, which cancels the pointer stream mid-drag;
+   preventDefault() on pointermove cannot stop it. Each mode hands the gesture to
+   the element that owns it and leaves the rest of the edit area pannable. */
+
+.timeline-canvas-edit-area[data-touch-gesture-mode='move'] .clip-action {
+  touch-action: none;
+}
+
+.timeline-canvas-edit-area[data-touch-gesture-mode='trim'] [data-resize-edge] {
+  touch-action: none;
+  /* Above the touch overflow-menu button, which otherwise covers the clip's right edge */
+  z-index: 30;
+  background: var(--video-editor-accent-bg);
+}
+
+/* Grip affordance so trim handles are discoverable without hover */
+.timeline-canvas-edit-area[data-touch-gesture-mode='trim'] [data-resize-edge]::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 40%;
+  transform: translate(-50%, -50%);
+  border-radius: 1px;
+  background: var(--video-editor-accent-border-strong);
+}
+
+/* Floating ghost clone shown during cross-track drag */
+.cross-track-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 99999;
+  opacity: 0.8;
+}
+
+/* ── Drop indicator classes (shared by internal clip drag and external HTML5 drag-drop) ── */
+
+.drop-indicator-row {
+  position: fixed;
+  background: var(--video-editor-accent-bg);
+  border: 1px solid var(--video-editor-accent-ring);
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.drop-indicator-row--reject {
+  background: var(--video-editor-reject-bg);
+  border: 1px solid var(--video-editor-reject-border);
+}
+
+.drop-indicator-line {
+  position: fixed;
+  width: 2px;
+  background: var(--video-editor-accent-border-strong);
+  pointer-events: none;
+  box-shadow: 0 0 6px var(--video-editor-accent-shadow);
+}
+
+.drop-indicator-ghost {
+  position: fixed;
+  background: color-mix(in srgb, var(--video-editor-accent-bg-strong) 86%, transparent);
+  border: 2px dashed var(--video-editor-accent-border-strong);
+  border-radius: 4px;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 0 1px var(--video-editor-accent-ring), 0 0 12px var(--video-editor-accent-shadow-soft);
+}
+
+.drop-indicator-ghost-label {
+  background: var(--video-editor-accent-border-strong);
+  border-radius: 3px;
+  padding: 2px 5px;
+  font-size: 9px;
+  font-weight: 600;
+  color: hsl(var(--background));
+}
+
+.drop-indicator-label {
+  position: fixed;
+  background: var(--video-editor-accent-border-strong);
+  color: hsl(var(--background));
+  font-size: 9px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.drop-indicator-new-track-edge {
+  position: fixed;
+  height: 2px;
+  background: var(--video-editor-accent-border-strong);
+  pointer-events: none;
+  box-shadow: 0 0 8px var(--video-editor-accent-border), 0 0 16px var(--video-editor-accent-ring);
+}
+
+/* External drag-over border glow (suppressed when new-track edge indicator is active) */
+.timeline-wrapper[data-drag-over='true']:not(.drop-target-new-track) {
+  box-shadow: inset 0 0 0 1px var(--video-editor-accent-ring);
+}
+
+.timeline-duration-remaining,
+.timeline-duration-expandable,
+.timeline-duration-blocked {
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.timeline-duration-remaining {
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--video-editor-success-bg) 22%, transparent));
+}
+
+.timeline-duration-content-end,
+.timeline-duration-proposed-end {
+  position: absolute;
+  width: 1px;
+  pointer-events: none;
+  z-index: 7;
+}
+
+.timeline-duration-content-end {
+  background: var(--video-editor-success-border);
+  opacity: 0.75;
+}
+
+.timeline-duration-proposed-end {
+  border-left: 2px dashed var(--video-editor-accent-border-strong);
+}
+
+.timeline-duration-proposed-end--overrun {
+  border-left-color: var(--video-editor-reject-border);
+}
+
+.timeline-duration-expandable {
+  background: repeating-linear-gradient(135deg, transparent 0 8px, color-mix(in srgb, var(--video-editor-accent-bg) 34%, transparent) 8px 10px);
+}
+
+.timeline-duration-blocked {
+  background: repeating-linear-gradient(135deg, transparent 0 8px, color-mix(in srgb, var(--video-editor-reject-bg) 32%, transparent) 8px 10px);
+}
+
+.timeline-duration-limit {
+  position: absolute;
+  width: 2px;
+  pointer-events: none;
+  z-index: 8;
+  background: var(--video-editor-accent-border-strong);
+  box-shadow: 0 0 8px var(--video-editor-accent-shadow), 0 0 16px var(--video-editor-accent-ring);
+}
+
+.timeline-duration-limit--overrun {
+  background: var(--video-editor-reject-border);
+  box-shadow: 0 0 8px var(--video-editor-reject-border), 0 0 16px var(--video-editor-reject-bg);
+}
+
+.timeline-duration-limit-label {
+  position: absolute;
+  top: 3px;
+  left: 5px;
+  white-space: nowrap;
+  border-radius: 3px;
+  background: var(--video-editor-accent-border-strong);
+  color: hsl(var(--background));
+  padding: 2px 5px;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.timeline-duration-limit--overrun .timeline-duration-limit-label {
+  background: var(--video-editor-reject-border);
+}
+
+.timeline-duration-overflow-reason {
+  position: absolute;
+  top: 4px;
+  left: 8px;
+  z-index: 10;
+  max-width: 240px;
+  pointer-events: none;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--video-editor-reject-bg) 88%, transparent);
+  color: var(--video-editor-reject-text);
+  padding: 2px 5px;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.timeline-duration-hard-limit {
+  position: absolute;
+  width: 3px;
+  pointer-events: none;
+  z-index: 9;
+  background: var(--video-editor-reject-border);
+  box-shadow: 0 0 8px var(--video-editor-reject-border), 0 0 16px var(--video-editor-reject-bg);
+}
+
+.timeline-duration-hard-limit--overrun {
+  background: var(--video-editor-reject-border);
+}
+
+.timeline-duration-hard-limit-label {
+  position: absolute;
+  top: 27px;
+  left: 5px;
+  white-space: nowrap;
+  border-radius: 3px;
+  background: var(--video-editor-reject-border);
+  color: hsl(var(--background));
+  padding: 2px 5px;
+  font-size: 9px;
+  font-weight: 600;
+}

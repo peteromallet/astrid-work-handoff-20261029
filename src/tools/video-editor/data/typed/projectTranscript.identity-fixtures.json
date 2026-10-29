@@ -1,0 +1,20 @@
+{
+  "algorithm": "sha256(utf8(compact-json([schema, projectId, mediaId, sourceId])))",
+  "schema": "media.transcript/v1",
+  "cases": [
+    {
+      "projectId": "project-transcript-fixture-01",
+      "mediaId": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceId": "default",
+      "canonicalJson": "[\"media.transcript/v1\",\"project-transcript-fixture-01\",\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"default\"]",
+      "documentId": "transcript:3b0ad9841f25e49668190adbda783615e0699599410e3ad74855f11854984714"
+    },
+    {
+      "projectId": "project-transcript-fixture-01",
+      "mediaId": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sourceId": "編集-🌿",
+      "canonicalJson": "[\"media.transcript/v1\",\"project-transcript-fixture-01\",\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"編集-🌿\"]",
+      "documentId": "transcript:ca644bea020a0b21a0680e489a9b363cefdbada79bc6a45c3e1951be80075964"
+    }
+  ]
+}

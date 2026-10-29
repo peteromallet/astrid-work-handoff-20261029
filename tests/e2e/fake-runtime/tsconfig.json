@@ -1,0 +1,21 @@
+{
+  "extends": "../../../tsconfig.app.json",
+  "compilerOptions": {
+    "baseUrl": "../../..",
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@astrid/editor-sdk": [
+        "./src/sdk/index.ts"
+      ],
+      "@workspace-animations/*": [
+        "./vendor/banodoco-animations/*"
+      ]
+    }
+  },
+  "include": [
+    "./*.ts"
+  ],
+  "exclude": []
+}

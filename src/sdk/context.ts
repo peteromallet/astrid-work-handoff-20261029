@@ -1,0 +1,378 @@
+/**
+ * Portable context contracts and safe helpers for the Astrid Editor SDK.
+ *
+ * Core extension context types, creative context stubs, command registration
+ * contracts, and disposal utilities.  This module is free of host wiring —
+ * no DOM, localStorage, console, React lifecycle, requestAnimationFrame,
+ * or provider-service imports.
+ *
+ * NOTE: createExtensionContext() is not in this module: it is deeply coupled to
+ * host wiring (DOM manipulation, localStorage, console I/O, provider services,
+ * and React lifecycle).
+ * context.ts remains host-wiring-free.
+ *
+ * @publicContract
+ */
+
+import type { ExtensionDiagnostic } from './diagnostics';
+import type { CommandHandler, CommandRegistrationOptions } from './commands';
+import type { DisposeHandle } from './dispose';
+import type { ExtensionId } from './ids';
+import type { ExtensionChromeService } from './chrome';
+import type { ExtensionUiService } from './ui';
+import type { ExtensionSettingsService } from './settings';
+import type { TimelineReader } from '@/sdk/video/timeline/reader.ts';
+import type { TimelineViewStore } from '@/sdk/video/timeline/viewState.ts';
+import type {
+  AssetReadSurface,
+  MaterialReadSurface,
+} from '@/sdk/video/assets/metadata.ts';
+import type { ExportService } from '@/sdk/video/exports/outputFormats.ts';
+import type { ProjectObjectStorage } from './video/assets/projectObjects';
+import type { LiveSceneAuthoringRegistration } from './video/liveSceneAuthoring';
+
+// Family types live in dedicated family modules.
+// import type is erased at compile time — zero runtime cost, no host wiring.
+import type { EffectRegistrationService } from './video/families/effects';
+import type { ClipTypeRegistrationService } from './video/families/clipTypeContributions';
+import type { ShaderRegistrationService } from './video/families/shaders';
+import type { LiveSessionsService } from './video/liveData';
+import type { ProposalRuntime } from './video/timeline/proposals';
+import type { TimelineOps } from './video/timeline/timelineOps';
+import type { TransitionRegistrationService } from './video/families/transitions';
+import type { ExtensionManifest } from './manifest';
+import type { AgentToolRegistrationService } from './video/families/agentTools';
+// dataKind V1: duration-neutral typed-data lanes (vocabularies)
+import type { DataKindRegistrationService } from './video/families/dataKind';
+
+// ---------------------------------------------------------------------------
+// Context service contracts (pure interfaces)
+// ---------------------------------------------------------------------------
+
+/** i18n service: minimal t() scaffolding with namespace fallback. */
+export interface ExtensionI18nService {
+  t(key: string, replacements?: Record<string, string | number>): string;
+}
+
+/** Diagnostics service: emit structured diagnostics from extension code. */
+export interface ExtensionDiagnosticsService {
+  /**
+   * Report a diagnostic.  `extensionId` and `source` are owned by the
+   * extension lifecycle — the host overwrites any caller-provided values
+   * with the authoritative extension ID and {@link DIAGNOSTIC_SOURCE_EXTENSION}.
+   */
+  report(diagnostic: Omit<ExtensionDiagnostic, 'extensionId' | 'source'>): void;
+  /** All diagnostics emitted by this extension (live snapshot). */
+  readonly diagnostics: readonly ExtensionDiagnostic[];
+}
+
+/** Pending extension work used by the editor when changing projects. */
+export interface ExtensionPendingWorkState {
+  /** A write is in flight and navigation must wait. */
+  writing: boolean;
+  /** Draft or conflict state requires confirmation before navigation. */
+  unsaved: boolean;
+}
+
+/** Host-owned signal for an extension's current pending work. */
+export interface ExtensionPendingWorkService {
+  /** Publish the extension's current pending work state. */
+  report(state: ExtensionPendingWorkState): void;
+}
+
+// ---------------------------------------------------------------------------
+// Creative context (reserved stubs)
+// ---------------------------------------------------------------------------
+/** Versioned Runtime project document. */
+export interface CreativeProjectDocument {
+  readonly document_id: string;
+  readonly project_id: string;
+  readonly kind: string;
+  readonly content: unknown;
+  readonly version: number;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface CreativeDocumentPage {
+  readonly items: readonly CreativeProjectDocument[];
+  readonly next_cursor: string | null;
+}
+
+/** Project document access available to editor extensions. */
+export interface ProjectDocumentSurface {
+  list(kind: string, page?: { cursor?: string; limit?: number }): Promise<CreativeDocumentPage>;
+  get(id: string): Promise<CreativeProjectDocument>;
+  create(kind: string, content: unknown, documentId?: string): Promise<CreativeProjectDocument>;
+  update(id: string, content: unknown, expectedVersion: number): Promise<CreativeProjectDocument>;
+  /** Fires after a successful create or update made through this surface. */
+  onChange(listener: () => void): () => void;
+}
+
+/** Registry identity fields plus the legacy asset profile read. */
+export interface CreativeAssetReadSurface extends AssetReadSurface {
+  get(assetKey: string): (Readonly<import('@/sdk/video/assets/metadata.ts').AssetMetadata> & {
+    readonly media_id?: string;
+    readonly content_sha256?: string;
+    readonly file?: string;
+    readonly kind?: string;
+  }) | undefined;
+  loadProfile(assetKey: string): Promise<Readonly<Record<string, unknown>> | null>;
+}
+
+/** Reserved creative context members — each becomes live in its owning milestone. */
+export interface CreativeContext {
+  readonly project: unknown;
+  /** Runtime project documents, scoped to the active project. */
+  readonly documents: ProjectDocumentSurface;
+  /** Public mutation surface for atomic timeline operations. */
+  readonly timeline: TimelineOps;
+  /** Read-only snapshot projection of the current timeline state. */
+  readonly reader: TimelineReader;
+  /** Report writing and unsaved work that affects project navigation. */
+  readonly pendingWork: ExtensionPendingWorkService;
+  /**
+   * Provider-owned live view of timeline UX state (playback, selection,
+   * viewport, geometry). Renderer-independent: available from commands,
+   * keybindings, and any contribution surface, with or without a mounted
+   * `timelineOverlay` renderer.
+   */
+  readonly timelineView: TimelineViewStore;
+  /** Provider-scoped proposal lifecycle manager. */
+  readonly proposals: ProposalRuntime;
+  /** Live registry asset identity and legacy profile reads. */
+  readonly assets: CreativeAssetReadSurface;
+  /** Read-only material metadata surface. */
+  readonly materials: MaterialReadSurface;
+  /** Live data sessions service for source/channel/bake/steering operations. */
+  readonly sessions: LiveSessionsService;
+  /** Export service for registering output format handlers. */
+  readonly export: ExportService;
+  /**
+   * Active-project immutable source/package object port (L2a).
+   * `undefined` means the host provider does not support project objects.
+   */
+  readonly projectObjects?: ProjectObjectStorage;
+  readonly stage: unknown;
+  readonly writing: unknown;
+}
+
+/** The milestone that activates each creative context member. */
+export const CREATIVE_MEMBER_MILESTONE: Record<keyof CreativeContext, string> = {
+  project: 'M2',
+  documents: 'M6',
+  timeline: 'M3',
+  reader: 'M3',
+  pendingWork: 'M2',
+  timelineView: 'M2',
+  proposals: 'M3',
+  assets: 'M6',
+  materials: 'M6',
+  sessions: 'M11',
+  export: 'M2',
+  projectObjects: 'L2a',
+  stage: 'M5',
+  writing: 'M2',
+};
+
+/**
+ * Error thrown when accessing a reserved creative context member
+ * that is not yet implemented in the current milestone.
+ */
+export class ExtensionNotImplementedError extends Error {
+  readonly feature: string;
+  readonly milestone: string;
+
+  constructor(feature: string, milestone: string) {
+    super(`ctx.creative.${feature} is not implemented until ${milestone}.`);
+    this.name = 'ExtensionNotImplementedError';
+    this.feature = feature;
+    this.milestone = milestone;
+  }
+}
+
+/** Create a creative context object with throwing stubs and unavailable project objects. */
+export function createCreativeContextStubs(): CreativeContext {
+  const members = Object.keys(CREATIVE_MEMBER_MILESTONE) as (keyof CreativeContext)[];
+
+  const stub: Record<string, unknown> = {};
+  for (const member of members) {
+    if (member === 'projectObjects') {
+      Object.defineProperty(stub, member, {
+        value: undefined,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+      continue;
+    }
+
+    const milestone = CREATIVE_MEMBER_MILESTONE[member];
+    Object.defineProperty(stub, member, {
+      get(): never {
+        throw new ExtensionNotImplementedError(member, milestone);
+      },
+      enumerable: true,
+      configurable: false,
+    });
+  }
+
+  return Object.freeze(stub) as unknown as CreativeContext;
+}
+
+/**
+ * Create a CreativeContext with optional live overrides.
+ *
+ * Members present in `overrides` are used directly. Unsupported project
+ * objects remain `undefined` when omitted; all other omitted members retain
+ * the default throwing-stub behavior from createCreativeContextStubs(). This
+ * lets host providers inject live timeline services for extensions running
+ * inside a mounted video-editor context while keeping stubs for unmounted or
+ * non-editor contexts.
+ */
+export function createCreativeContext(
+  overrides?: Partial<CreativeContext>,
+): CreativeContext {
+  if (!overrides) {
+    return createCreativeContextStubs();
+  }
+
+  const members = Object.keys(CREATIVE_MEMBER_MILESTONE) as (keyof CreativeContext)[];
+  const merged: Record<string, unknown> = {};
+
+  for (const member of members) {
+    if (member === 'projectObjects') {
+      Object.defineProperty(merged, member, {
+        value: member in overrides
+          ? (overrides as Record<string, unknown>)[member]
+          : undefined,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+    } else if (member in overrides) {
+      Object.defineProperty(merged, member, {
+        value: (overrides as Record<string, unknown>)[member],
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+    } else {
+      const milestone = CREATIVE_MEMBER_MILESTONE[member];
+      Object.defineProperty(merged, member, {
+        get(): never {
+          throw new ExtensionNotImplementedError(member, milestone);
+        },
+        enumerable: true,
+        configurable: false,
+      });
+    }
+  }
+
+  return Object.freeze(merged) as unknown as CreativeContext;
+}
+// ---------------------------------------------------------------------------
+// Command registration service
+// ---------------------------------------------------------------------------
+
+/**
+ * Command registration service available as `ctx.commands` during activate().
+ *
+ * Commands must have a matching `command` contribution in the extension
+ * manifest.  Handlers are registered imperatively via `registerCommand()`
+ * and the returned DisposeHandle unregisters them on dispose.
+ */
+export interface ExtensionCommandService {
+  /**
+   * Register a command handler imperatively during activate().
+   *
+   * The `commandId` must match the `command` field of a `CommandContribution`
+   * declared by this extension in its manifest.
+   *
+   * Returns a DisposeHandle that unregisters the handler when dispose() is
+   * called (safe to call multiple times; idempotent).
+   */
+  registerCommand(
+    commandId: string,
+    handler: CommandHandler,
+    options?: CommandRegistrationOptions,
+  ): DisposeHandle;
+}
+
+// ---------------------------------------------------------------------------
+// ExtensionContext
+// ---------------------------------------------------------------------------
+
+/**
+ * The context passed to an extension during activation.
+ * Exposes only approved members; no raw DataProvider, applyEdit,
+ * timeline store, or internal mutation escape hatch.
+ */
+export interface ExtensionContext {
+  /** Current API version. */
+  readonly apiVersion: number;
+  /** Readonly extension metadata. */
+  readonly extension: {
+    readonly id: ExtensionId;
+    readonly version: string;
+    readonly label: string;
+    readonly description?: string;
+    readonly manifest: Readonly<ExtensionManifest>;
+  };
+  /** Host chrome services. */
+  readonly chrome: ExtensionChromeService;
+  /** Scoped services. */
+  readonly services: {
+    readonly settings: ExtensionSettingsService;
+    readonly i18n: ExtensionI18nService;
+    readonly diagnostics: ExtensionDiagnosticsService;
+  };
+  /** Reserved creative context stubs — throw typed \"not implemented until Mx\". */
+  readonly creative: CreativeContext;
+  /** Command registration service for imperative handler binding. */
+  readonly commands: ExtensionCommandService;
+  /** UI renderer registration service for render-backed contributions. */
+  readonly ui: ExtensionUiService;
+  /** Effect registration service for trusted component effects. */
+  readonly effects: EffectRegistrationService;
+  /** Transition registration service for trusted component transitions. */
+  readonly transitions: TransitionRegistrationService;
+  /** Clip-type registration service for contributed clip types. */
+  readonly clipTypes: ClipTypeRegistrationService;
+  /** Shader registration service for dedicated WebGL shader passes. */
+  readonly shaders: ShaderRegistrationService;
+  /** Agent tool registration service for host-mediated agent tools. */
+  readonly agentTools: AgentToolRegistrationService;
+  /** Bounded rendering-pack ACP authoring port, when supported by the host. */
+  readonly liveSceneAuthoring?: LiveSceneAuthoringRegistration;
+  /** dataKind V1: single bind path for typed-data lanes (clipType analog). */
+  readonly dataKinds: DataKindRegistrationService;
+}
+
+// ---------------------------------------------------------------------------
+// Context disposal
+// ---------------------------------------------------------------------------
+
+/**
+ * Symbol key for host-service disposal attached to every ExtensionContext.
+ * The runtime lifecycle calls this during deactivation/disposal to clean up
+ * localStorage keys, chrome event subscribers, and any future host-owned
+ * service state scoped to this extension activation.
+ */
+export const CONTEXT_DISPOSE_SYMBOL: unique symbol = Symbol('astrid.extensionContext.dispose');
+
+/**
+ * Dispose host-owned services (settings localStorage, chrome subscriptions)
+ * attached to an ExtensionContext. Safe to call on contexts that lack the
+ * dispose function or on already-disposed contexts.
+ */
+export function disposeExtensionContextServices(ctx: ExtensionContext): void {
+  const dispose = (ctx as unknown as Record<string | symbol, unknown>)[CONTEXT_DISPOSE_SYMBOL];
+  if (typeof dispose === 'function') {
+    try {
+      (dispose as () => void)();
+    } catch {
+      // dispose functions are internally safe, but double-guard
+    }
+  }
+}

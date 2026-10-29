@@ -1,0 +1,103 @@
+import type { TimelineConfig, TrackDefinition } from '@/tools/video-editor/types/index.ts';
+import { resolveTimelineRenderTheme } from '@/tools/video-editor/compositions/installed-themes.ts';
+
+export const DEFAULT_VIDEO_TRACKS: TrackDefinition[] = [
+  {
+    id: 'V1',
+    kind: 'visual',
+    label: 'V1',
+    scale: 1,
+    fit: 'contain',
+    opacity: 1,
+    blendMode: 'normal',
+  },
+  {
+    id: 'A1',
+    kind: 'audio',
+    label: 'A1',
+    scale: 1,
+    fit: 'contain',
+    opacity: 1,
+    blendMode: 'normal',
+  },
+];
+
+export const DEFAULT_OUTPUT = {
+  resolution: '1280x720',
+  fps: 30,
+  file: 'output.mp4',
+  background: null as string | null,
+  background_scale: null as number | null,
+} as const;
+
+export function createDefaultTimelineConfig(): TimelineConfig {
+  // `theme`, `theme_overrides`, and `generation_defaults` are intentionally left absent here.
+  // New timelines start with no theme bound (the editor renders without a theme registry).
+  // They are populated once the user picks a theme.
+  // Keeping them undefined preserves byte-equivalence for every existing
+  // call site that snapshots a freshly-created config.
+  return {
+    output: { ...DEFAULT_OUTPUT },
+    clips: [],
+    tracks: DEFAULT_VIDEO_TRACKS.map((track) => ({ ...track })),
+  };
+}
+
+/**
+ * Fill missing or incomplete output fields on a timeline config while
+ * preserving all existing values and non-output fields (clips, tracks,
+ * theme, theme_overrides, generation_defaults, pinnedShotGroups, app, etc.).
+ *
+ * Only absent or null-ish output fields are filled. Existing output values —
+ * even empty strings or zero — are left untouched because they represent
+ * explicit user choices.
+ *
+ * Geometry precedence (mirrors Astrid's render contract — Remotion
+ * `getCanvas` in Root.tsx and the ffmpeg `_timeline_canvas` both prefer
+ * `theme_overrides.visual.canvas`, then the resolved theme canvas, then a
+ * hardcoded default):
+ *   1. explicit `output.resolution` / `output.fps` (persisted)
+ *   2. `theme_overrides.visual.canvas` (per-timeline declared geometry)
+ *   3. the installed theme's `visual.canvas` (via `resolveTimelineRenderTheme`)
+ *   4. `DEFAULT_OUTPUT` (1280x720@30) — unchanged for timelines that declare
+ *      no geometry, preserving current editor behavior byte-for-byte.
+ * The resolved theme canvas is consulted ONLY when the config binds a theme
+ * (slug or overrides); otherwise nothing changes.
+ */
+export function withDefaultTimelineOutput(
+  config: Partial<TimelineConfig> & { output?: Partial<TimelineConfig['output']> },
+): TimelineConfig {
+  const existingOutput = config.output ?? ({} as Partial<TimelineConfig['output']>);
+
+  const themeBound = config.theme !== undefined || config.theme_overrides !== undefined;
+  const themeCanvas = themeBound ? resolveTimelineRenderTheme(config as TimelineConfig).visual?.canvas : undefined;
+  const canvasResolution = (
+    themeCanvas
+    && typeof themeCanvas.width === 'number'
+    && typeof themeCanvas.height === 'number'
+  ) ? `${themeCanvas.width}x${themeCanvas.height}` : undefined;
+  const canvasFps = (
+    themeCanvas
+    && typeof themeCanvas.fps === 'number'
+  ) ? themeCanvas.fps : undefined;
+
+  const output: TimelineConfig['output'] = {
+    resolution: existingOutput.resolution ?? canvasResolution ?? DEFAULT_OUTPUT.resolution,
+    fps: existingOutput.fps ?? canvasFps ?? DEFAULT_OUTPUT.fps,
+    file: existingOutput.file ?? DEFAULT_OUTPUT.file,
+    background: existingOutput.background !== undefined ? existingOutput.background : DEFAULT_OUTPUT.background,
+    background_scale:
+      existingOutput.background_scale !== undefined ? existingOutput.background_scale : DEFAULT_OUTPUT.background_scale,
+  };
+
+  return {
+    output,
+    clips: config.clips ?? [],
+    tracks: config.tracks ?? DEFAULT_VIDEO_TRACKS.map((track) => ({ ...track })),
+    ...('theme' in config ? { theme: config.theme } : {}),
+    ...('theme_overrides' in config ? { theme_overrides: config.theme_overrides } : {}),
+    ...('generation_defaults' in config ? { generation_defaults: config.generation_defaults } : {}),
+    ...('pinnedShotGroups' in config ? { pinnedShotGroups: config.pinnedShotGroups } : {}),
+    ...('app' in config ? { app: config.app } : {}),
+  };
+}

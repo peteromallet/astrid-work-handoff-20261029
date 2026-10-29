@@ -1,0 +1,399 @@
+import { useCallback, useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { QUERY_PRESETS } from '@/shared/lib/query/queryDefaults';
+import { AstridRuntimeClient } from '@/integrations/runtime/client.ts';
+import { readyRuntimeTaskEvents, runtimeTaskQueryKey, useRuntimeTaskEvents } from './useRuntimeTaskEvents';
+import type {
+  ManagedOutput,
+  ManagedOutputExportReceipt,
+  MutationResult,
+  Task as RuntimeTask,
+} from '@/integrations/runtime/generated.ts';
+import { asRecord } from '@/shared/lib/typeCoercion';
+
+const RUNTIME_TASK_PAGE_LIMIT = 50;
+const RUNTIME_MEDIA_IMPORT_TASK_TYPE = 'runtime.media.import.v1';
+
+export { runtimeTaskQueryKey } from './useRuntimeTaskEvents';
+
+export type RuntimeTaskAction = 'cancel' | 'retry';
+
+export function runtimeTaskIsCancellable(task: Pick<RuntimeTask, 'state'>): boolean {
+  return task.state === 'queued'
+    || task.state === 'ready'
+    || task.state === 'running'
+    || task.state === 'cancel_requested'
+    || task.state === 'retrying';
+}
+
+export function runtimeTaskIsRetryable(task: Pick<RuntimeTask, 'state'>): boolean {
+  return task.state === 'failed' || task.state === 'cancelled';
+}
+
+export function runtimeTaskType(task: RuntimeTask): string {
+  const family = runtimeTaskSpec(task).family;
+  return typeof family === 'string' && family.trim().length > 0
+    ? family
+    : task.capability_id;
+}
+
+function isRuntimeMediaImportTask(task: RuntimeTask): boolean {
+  const family = runtimeTaskSpec(task).family;
+  return task.capability_id.trim() === RUNTIME_MEDIA_IMPORT_TASK_TYPE
+    || (typeof family === 'string' && family.trim() === RUNTIME_MEDIA_IMPORT_TASK_TYPE);
+}
+
+export function projectRuntimeTasksForTaskPane(tasks: readonly RuntimeTask[]): RuntimeTask[] {
+  return tasks.filter((task) => !isRuntimeMediaImportTask(task));
+}
+
+function runtimeTaskSpec(task: RuntimeTask): Record<string, unknown> {
+  const envelope = asRecord(task.spec);
+  return asRecord(envelope?.spec) ?? envelope ?? {};
+}
+
+function runtimeTaskFamily(task: RuntimeTask): string {
+  const family = runtimeTaskSpec(task).family ?? task.capability_id;
+  return typeof family === 'string' ? family : task.capability_id;
+}
+
+export function runtimeTaskTimelineRef(task: RuntimeTask): string | null {
+  const spec = runtimeTaskSpec(task);
+  const params = asRecord(spec.params) ?? asRecord(spec.inputs);
+  const timelineRef = params?.timeline_ref;
+  return typeof timelineRef === 'string' && timelineRef.length > 0 ? timelineRef : null;
+}
+
+export function runtimeTaskIsSelectedTimelineRender(
+  task: RuntimeTask,
+  timelineId: string | null,
+): boolean {
+  if (!timelineId || task.state !== 'succeeded') return false;
+  return runtimeTaskTimelineRef(task) === timelineId
+    && ['rendering.timeline_visualize', 'rendering.render', 'render_export'].includes(runtimeTaskFamily(task));
+}
+
+export function runtimeTaskStatusGroup(task: RuntimeTask): 'Processing' | 'Succeeded' | 'Failed' {
+  if (runtimeTaskIsCancellable(task)) return 'Processing';
+  if (task.state === 'succeeded') return 'Succeeded';
+  return 'Failed';
+}
+
+export async function listAllRuntimeTasks(
+  client: Pick<AstridRuntimeClient, 'listProjectTasks'>,
+  projectId: string,
+): Promise<RuntimeTask[]> {
+  const tasks: RuntimeTask[] = [];
+  let cursor: string | undefined;
+  const seenCursors = new Set<string>();
+
+  while (true) {
+    const page = await client.listProjectTasks(projectId, cursor, RUNTIME_TASK_PAGE_LIMIT);
+    tasks.push(...page.items);
+    if (page.next_cursor === null) return tasks;
+    if (seenCursors.has(page.next_cursor)) {
+      throw new Error('Workspace Runtime task pagination repeated a cursor');
+    }
+    seenCursors.add(page.next_cursor);
+    cursor = page.next_cursor;
+  }
+}
+
+/** A local admission requests an immediate authoritative list refresh. */
+export function refreshRuntimeTaskList(queryClient: QueryClient, projectId: string): void {
+  void queryClient.invalidateQueries({ queryKey: runtimeTaskQueryKey(projectId) });
+}
+
+/**
+ * Full-list safety read. Keep task updates that arrived from the event feed
+ * while this slower paginated request was in flight.
+ */
+export async function pollRuntimeTasks(
+  client: Pick<AstridRuntimeClient, 'listProjectTasks'>,
+  queryClient: QueryClient,
+  projectId: string,
+): Promise<RuntimeTask[]> {
+  const queryKey = runtimeTaskQueryKey(projectId);
+  const atStart = queryClient.getQueryData<RuntimeTask[]>(queryKey);
+  const tasks = await listAllRuntimeTasks(client, projectId);
+  const current = queryClient.getQueryData<RuntimeTask[]>(queryKey);
+  if (!current || current === atStart) return tasks;
+  const byId = new Map(tasks.map((task) => [task.task_id, task]));
+  for (const task of current) {
+    const listed = byId.get(task.task_id);
+    if (!listed || task.version >= listed.version) byId.set(task.task_id, task);
+  }
+  return [...byId.values()];
+}
+
+interface RuntimeTaskMutationInput {
+  taskId: string;
+  action: RuntimeTaskAction;
+}
+
+function idempotencyKey(
+  projectId: string,
+  taskId: string,
+  action: RuntimeTaskAction,
+  version: number,
+  updatedAt: string,
+): string {
+  const revision = updatedAt.replace(/[^A-Za-z0-9._~-]/g, '-');
+  return `astrid.runtime.task.${action}.${projectId}.${taskId}.v${version}.${revision}`;
+}
+
+export async function transitionRuntimeTask(
+  client: Pick<AstridRuntimeClient, 'getTask' | 'cancelTask' | 'retryTask'>,
+  projectId: string,
+  input: RuntimeTaskMutationInput,
+): Promise<MutationResult<RuntimeTask>> {
+  const current = await client.getTask(input.taskId);
+  if (current.project_id !== projectId) {
+    throw new Error(
+      'this task belongs to a different project',
+    );
+  }
+  if (!Number.isInteger(current.version) || current.version < 1) {
+    throw new Error('this task has no version to act on');
+  }
+
+  const key = idempotencyKey(
+    projectId,
+    current.task_id,
+    input.action,
+    current.version,
+    current.updated_at,
+  );
+  return input.action === 'cancel'
+    ? client.cancelTask(current.task_id, key, current.version)
+    : client.retryTask(current.task_id, key, current.version);
+}
+
+async function listAllRuntimeManagedOutputs(
+  client: Pick<AstridRuntimeClient, 'listManagedOutputs'>,
+  taskId: string,
+): Promise<ManagedOutput[]> {
+  const outputs: ManagedOutput[] = [];
+  let cursor: string | undefined;
+  const seenCursors = new Set<string>();
+
+  while (true) {
+    const page = await client.listManagedOutputs(taskId, cursor, 50);
+    outputs.push(...page.items);
+    if (page.next_cursor === null) return outputs;
+    if (seenCursors.has(page.next_cursor)) {
+      throw new Error('Workspace Runtime managed-output pagination repeated a cursor');
+    }
+    seenCursors.add(page.next_cursor);
+    cursor = page.next_cursor;
+  }
+}
+
+function isPlayableManagedOutput(output: ManagedOutput): boolean {
+  return output.state === 'available'
+    && output.object_id.startsWith('sha256:')
+    && (
+      output.output_port === 'video'
+      || output.role === 'render'
+      || output.media_type.startsWith('video/')
+    );
+}
+
+function managedOutputExpectedIdentity(output: ManagedOutput): Record<string, unknown> {
+  const expected: Record<string, unknown> = {
+    project_id: output.project_id,
+    run_id: output.run_id,
+    task_id: output.task_id,
+    attempt_id: output.attempt_id,
+    association_id: output.association_id,
+    output_port: output.output_port,
+    role: output.role,
+    object_id: output.object_id,
+    digest: output.digest,
+    size: output.size,
+    filename: output.filename,
+    media_type: output.media_type,
+  };
+  const provenance = asRecord(output.provenance);
+  for (const field of ['executor_id', 'lease_id'] as const) {
+    if (typeof provenance?.[field] === 'string') expected[field] = provenance[field];
+  }
+  for (const field of ['fence', 'runtime_epoch'] as const) {
+    if (typeof provenance?.[field] === 'number') expected[field] = provenance[field];
+  }
+  return expected;
+}
+
+export async function exportSelectedRuntimeTaskOutput(
+  client: Pick<AstridRuntimeClient, 'getTask' | 'listManagedOutputs' | 'exportManagedOutput'>,
+  projectId: string,
+  taskId: string,
+  timelineId: string,
+): Promise<MutationResult<ManagedOutputExportReceipt>> {
+  const current = await client.getTask(taskId);
+  if (current.project_id !== projectId) {
+    throw new Error(
+      'this task belongs to a different project',
+    );
+  }
+  if (!runtimeTaskIsSelectedTimelineRender(current, timelineId)) {
+    throw new Error('only renders of the open timeline can be exported');
+  }
+
+  const output = (await listAllRuntimeManagedOutputs(client, taskId)).find(isPlayableManagedOutput);
+  if (!output) {
+    throw new Error('this render has no video file to export');
+  }
+  return client.exportManagedOutput(
+    output.association_id,
+    output.filename,
+    managedOutputExpectedIdentity(output),
+  );
+}
+
+function mergeRuntimeTaskResults(
+  current: RuntimeTask[] | undefined,
+  updates: readonly RuntimeTask[],
+): RuntimeTask[] | undefined {
+  if (!current) return current;
+  const byId = new Map(updates.map((task) => [task.task_id, task]));
+  return current.map((task) => byId.get(task.task_id) ?? task);
+}
+
+export type RuntimeTaskActionKind = RuntimeTaskAction | 'export';
+
+/** Where an export landed: `<folder>/<file>` to show, the full location for a tooltip. */
+export function exportDestination(receipt: ManagedOutputExportReceipt): { label: string; title: string } {
+  const root = receipt.destination.root;
+  const folder = root.split(/[\\/]+/).filter(Boolean).pop();
+  const file = receipt.destination.filename || receipt.filename;
+  return { label: folder ? `${folder}/${file}` : file, title: `${root.replace(/[\\/]+$/, '')}/${file}` };
+}
+
+export interface RuntimeTaskActionFailure {
+  action: RuntimeTaskActionKind;
+  message: string;
+}
+
+export function useRuntimeTasks(projectId: string | null) {
+  const client = useMemo(() => new AstridRuntimeClient(), []);
+  const queryClient = useQueryClient();
+  const queryKey = runtimeTaskQueryKey(projectId);
+  useRuntimeTaskEvents(projectId);
+
+  const query = useQuery<RuntimeTask[], Error>({
+    queryKey,
+    queryFn: async () => {
+      await readyRuntimeTaskEvents(queryClient, projectId!);
+      return pollRuntimeTasks(client, queryClient, projectId!);
+    },
+    enabled: Boolean(projectId),
+    ...QUERY_PRESETS.realtimeBacked,
+  });
+  const [failures, setFailures] = useState<Record<string, RuntimeTaskActionFailure>>({});
+  const [exportedTo, setExportedTo] = useState<Record<string, { label: string; title: string }>>({});
+  const recordFailure = (taskIds: readonly string[], action: RuntimeTaskActionKind, error: Error) =>
+    setFailures((current) => ({
+      ...current,
+      ...Object.fromEntries(taskIds.map((id) => [id, { action, message: error.message }])),
+    }));
+  const clearFailure = (taskIds: readonly string[]) =>
+    setFailures((current) => {
+      if (!taskIds.some((id) => id in current)) return current;
+      const next = { ...current };
+      for (const id of taskIds) delete next[id];
+      return next;
+    });
+  const dismissActionError = useCallback((taskId: string) => clearFailure([taskId]), []);
+  const transitionMutation = useMutation<
+    MutationResult<RuntimeTask>,
+    Error,
+    RuntimeTaskMutationInput & { projectId: string | null }
+  >({
+    mutationFn: (input) => {
+      if (!input.projectId) {
+        throw new Error('no project is open');
+      }
+      return transitionRuntimeTask(client, input.projectId, input);
+    },
+    onSuccess: (updated, input) => {
+      clearFailure([input.taskId]);
+      queryClient.setQueryData<RuntimeTask[]>(runtimeTaskQueryKey(input.projectId), (current) =>
+        mergeRuntimeTaskResults(current, [updated]),
+      );
+    },
+    onError: (error, input) => recordFailure([input.taskId], input.action, error),
+  });
+
+  const cancelAllMutation = useMutation<
+    readonly MutationResult<RuntimeTask>[],
+    Error,
+    { projectId: string | null; pending: RuntimeTask[] }
+  >({
+    mutationFn: async ({ projectId: capturedProjectId, pending }) => {
+      if (!capturedProjectId) return [];
+      return Promise.all(pending.map((task) => transitionRuntimeTask(client, capturedProjectId, {
+        taskId: task.task_id,
+        action: 'cancel',
+      })));
+    },
+    onSuccess: (updated, input) => {
+      clearFailure(input.pending.map((task) => task.task_id));
+      queryClient.setQueryData<RuntimeTask[]>(runtimeTaskQueryKey(input.projectId), (current) =>
+        mergeRuntimeTaskResults(current, updated),
+      );
+    },
+    onError: (error, input) => recordFailure(input.pending.map((task) => task.task_id), 'cancel', error),
+  });
+
+  const exportMutation = useMutation<
+    MutationResult<ManagedOutputExportReceipt>,
+    Error,
+    { projectId: string | null; taskId: string; timelineId: string }
+  >({
+    mutationFn: ({ projectId: capturedProjectId, taskId, timelineId }) => {
+      if (!capturedProjectId) {
+        throw new Error('no project is open');
+      }
+      return exportSelectedRuntimeTaskOutput(client, capturedProjectId, taskId, timelineId);
+    },
+    onSuccess: (result, input) => {
+      clearFailure([input.taskId]);
+      setExportedTo((current) => ({ ...current, [input.taskId]: exportDestination(result) }));
+    },
+    onError: (error, input) => recordFailure([input.taskId], 'export', error),
+  });
+
+  const isTaskActionPending = (taskId: string, action: RuntimeTaskAction): boolean => (
+    transitionMutation.isPending
+    && transitionMutation.variables?.taskId === taskId
+    && transitionMutation.variables.action === action
+  );
+
+  const isExportTaskPending = (taskId: string): boolean => (
+    exportMutation.isPending && exportMutation.variables?.taskId === taskId
+  );
+
+  return {
+    ...query,
+    tasks: query.data ?? [],
+    cancelTask: (taskId: string) => transitionMutation.mutate({ projectId, taskId, action: 'cancel' }),
+    retryTask: (taskId: string) => transitionMutation.mutate({ projectId, taskId, action: 'retry' }),
+    exportManagedOutput: (taskId: string, timelineId: string) =>
+      exportMutation.mutate({ projectId, taskId, timelineId }),
+    isExportTaskPending,
+    cancelAllPending: (tasks: readonly RuntimeTask[]) => cancelAllMutation.mutate({
+      projectId,
+      pending: tasks.filter(runtimeTaskIsCancellable),
+    }),
+    isCancelAllPending: cancelAllMutation.isPending,
+    isTaskActionPending,
+    actionFailures: failures,
+    dismissActionError,
+    exportedTo,
+    actionError: Object.keys(failures).length > 0 ? new Error('Task action failed') : null,
+    isActionPending: transitionMutation.isPending || cancelAllMutation.isPending || exportMutation.isPending,
+    canCancel: runtimeTaskIsCancellable,
+    canRetry: runtimeTaskIsRetryable,
+  };
+}

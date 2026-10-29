@@ -1,0 +1,110 @@
+import { useState, useEffect, useMemo } from 'react';
+import { bridgeMediaUrl } from '@/shared/lib/media/bridgeMediaUrl';
+import { getProjectSelectionFallbackId } from '@/shared/contexts/projectSelectionStore';
+import { isProgressiveLoadingEnabled } from '@/shared/settings/progressiveLoading';
+import { useProgressiveImage } from '@/shared/hooks/ui-image/useProgressiveImage';
+import type { GeneratedImageWithMetadata } from '../types';
+import { isAudioMedia, isVideoMedia } from '@/shared/lib/media/mediaTypeFilters';
+
+interface UseStableMediaUrlsParams {
+  image: GeneratedImageWithMetadata;
+  isPriority: boolean;
+}
+
+/**
+ * Manages stable display URLs and video URLs for a gallery item.
+ *
+ * "Stable" means the browser-visible URL only changes when the underlying file
+ * changes (detected via `urlIdentity`), NOT when a signed-URL token refreshes.
+ * This prevents unnecessary image/video reloads on token rotation.
+ *
+ * Also handles progressive image loading (thumbnail → full crossfade).
+ */
+export function useStableMediaUrls({ image, isPriority }: UseStableMediaUrlsParams) {
+  // === Progressive loading (images only) ===
+  const isVideoContent = isVideoMedia(image);
+  const isAudioContent = isAudioMedia(image);
+
+  const progressiveEnabled = isProgressiveLoadingEnabled() && !isVideoContent && !isAudioContent;
+  const { src: progressiveSrc, isThumbShowing, isFullLoaded, ref: progressiveRef } = useProgressiveImage(
+    progressiveEnabled ? image.thumbUrl : null,
+    image.url,
+    {
+      priority: isPriority,
+      lazy: !isPriority,
+      enabled: progressiveEnabled,
+      crossfadeMs: 180,
+    }
+  );
+
+  const projectSlug = getProjectSelectionFallbackId();
+
+  const thumbnailSource = isVideoContent && image.thumbUrl === image.url
+    ? null
+    : image.thumbUrl;
+
+  // === Display URL (image thumbnail or progressive src) ===
+  // Stored refs become same-origin content-route addresses here.
+  const displayUrl = useMemo(() => {
+    if (isAudioContent) return '';
+    if (isVideoContent) {
+      return bridgeMediaUrl(projectSlug, thumbnailSource);
+    }
+    if (progressiveEnabled && progressiveSrc) {
+      return progressiveSrc;
+    }
+    return bridgeMediaUrl(projectSlug, image.thumbUrl || image.url);
+  }, [progressiveEnabled, progressiveSrc, image.thumbUrl, image.url, isVideoContent, isAudioContent, projectSlug, thumbnailSource]);
+
+  // Stable display URL (only changes when underlying file changes)
+  const displayUrlIdentity = image.urlIdentity || image.url || '';
+  const [stableDisplayUrl, setStableDisplayUrl] = useState<string>(displayUrl);
+  const [lastDisplayUrlIdentity, setLastDisplayUrlIdentity] = useState<string>(displayUrlIdentity);
+  const thumbnailIdentity = thumbnailSource ? (image.thumbUrlIdentity || thumbnailSource) : '';
+  const [lastThumbnailIdentity, setLastThumbnailIdentity] = useState<string>(thumbnailIdentity);
+
+  useEffect(() => {
+    if (displayUrlIdentity !== lastDisplayUrlIdentity) {
+      setStableDisplayUrl(displayUrl);
+      setLastDisplayUrlIdentity(displayUrlIdentity);
+    }
+  }, [displayUrl, displayUrlIdentity, lastDisplayUrlIdentity]);
+
+  useEffect(() => {
+    if (thumbnailIdentity !== lastThumbnailIdentity) {
+      setStableDisplayUrl(displayUrl);
+      setLastThumbnailIdentity(thumbnailIdentity);
+    }
+  }, [displayUrl, lastThumbnailIdentity, thumbnailIdentity]);
+
+  // === Video URL (only for video content) ===
+  const videoUrl = useMemo(() => (isVideoContent ? (image.url || null) : null), [isVideoContent, image.url]);
+
+  const videoUrlIdentity = image.urlIdentity || '';
+  const [stableVideoUrl, setStableVideoUrl] = useState<string | null>(videoUrl);
+  const [lastVideoUrlIdentity, setLastVideoUrlIdentity] = useState<string>(videoUrlIdentity);
+
+  useEffect(() => {
+    if (!videoUrl) {
+      setStableVideoUrl(null);
+      setLastVideoUrlIdentity('');
+      return;
+    }
+    if (videoUrlIdentity !== lastVideoUrlIdentity) {
+      setStableVideoUrl(videoUrl);
+      setLastVideoUrlIdentity(videoUrlIdentity);
+    }
+  }, [videoUrl, videoUrlIdentity, lastVideoUrlIdentity]);
+
+  return {
+    isVideoContent,
+    isAudioContent,
+    displayUrl,
+    stableDisplayUrl,
+    stableVideoUrl,
+    progressiveEnabled,
+    isThumbShowing,
+    isFullLoaded,
+    progressiveRef,
+  };
+}

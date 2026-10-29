@@ -1,0 +1,54 @@
+{
+  "fixture_version": "light-study-v1",
+  "source_manifest": "asset-manifest.json",
+  "assets": {
+    "first-light": {
+      "id": "first-light",
+      "path": "media/first-light.mp4",
+      "sha256": "f94618ccf47b76140e2aab240bacab98e330cf0e171fd68a7aac6783dbe346f1",
+      "duration_seconds": 8
+    },
+    "passing-shapes": {
+      "id": "passing-shapes",
+      "path": "media/passing-shapes.mp4",
+      "sha256": "a3b16d538c9a1a7648e55bd2889541373aa5774ae3c4386f63bc645933091347",
+      "duration_seconds": 12
+    },
+    "quiet-finish": {
+      "id": "quiet-finish",
+      "path": "media/quiet-finish.mp4",
+      "sha256": "56d87d4c752651f042e8d41f122ab038549ef6dfb601c4e026b5e52d1be52670",
+      "duration_seconds": 8
+    }
+  },
+  "clips": {
+    "light-study-01": {
+      "id": "light-study-01",
+      "asset_id": "first-light",
+      "at_seconds": 0,
+      "source_start_seconds": 0,
+      "source_end_seconds": 8
+    },
+    "light-study-02": {
+      "id": "light-study-02",
+      "asset_id": "passing-shapes",
+      "at_seconds": 8,
+      "source_start_seconds": 0,
+      "source_end_seconds": 12
+    },
+    "light-study-03": {
+      "id": "light-study-03",
+      "asset_id": "quiet-finish",
+      "at_seconds": 20,
+      "source_start_seconds": 0,
+      "source_end_seconds": 8
+    }
+  },
+  "script": {
+    "logical_key": "light-study-script-v1"
+  },
+  "result": {
+    "logical_key": "light-study-result-v1",
+    "state": "not-produced"
+  }
+}

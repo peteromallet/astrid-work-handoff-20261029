@@ -1,0 +1,80 @@
+import type { ComponentType, ReactNode } from 'react';
+import type { RuntimeTheme } from '@banodoco/timeline-composition/theme-api';
+import type { ResolvedTimelineClip } from '@/tools/video-editor/types/index.ts';
+import type { DynamicSequenceComponentEntry } from '@/tools/video-editor/sequences/registry.ts';
+
+export type AstridElementKind = 'effect' | 'animation' | 'transition';
+
+export type AstridElementComponentProps = {
+  clip: ResolvedTimelineClip;
+  params: Record<string, unknown>;
+  theme: RuntimeTheme;
+  fps: number;
+  assetEntry?: ResolvedTimelineClip['assetEntry'];
+  children?: ReactNode;
+};
+
+export type AstridElementDescriptor = {
+  id: string;
+  kind: AstridElementKind;
+  packId?: string;
+  /** Selected host schema only; public consumers never read an installed catalog. */
+  schema?: object;
+  revision: string;
+  componentPath: string;
+};
+
+export type AstridDynamicSequenceEntry = {
+  clipType: string;
+  component: DynamicSequenceComponentEntry['component'];
+  schemaJson?: object;
+  themeId?: string;
+};
+
+export type AstridSequenceRegistryEntry = {
+  component?: unknown;
+  themeId?: string;
+  source?: string;
+};
+
+export type AstridClipCapabilityDescriptor = {
+  clipType: string;
+  source: string;
+  capabilities: {
+    preview: 'browser' | 'placeholder';
+    previewFallbackReason?: 'worker_only' | 'unsupported';
+    browserRender: boolean;
+    workerRender: boolean;
+    externalRender: boolean;
+  };
+};
+
+export interface AstridElementHost {
+  /** Interactive hosts may await scoped pack verification before showing missing-pin diagnostics. */
+  isPreviewPreparing?(projectId: string, clips: readonly ResolvedTimelineClip[]): boolean;
+  readonly descriptors: readonly AstridElementDescriptor[];
+  readonly sequenceRegistry: Readonly<Record<string, AstridSequenceRegistryEntry | undefined>>;
+  resolveComponent(
+    elementId: string,
+    kind: AstridElementKind,
+    packId?: string,
+    revision?: string,
+  ): ComponentType<AstridElementComponentProps> | undefined;
+  resolveSequenceClipEntry(
+    clipType: string | undefined,
+    dynamicEntries: readonly AstridDynamicSequenceEntry[],
+  ): AstridDynamicSequenceEntry | undefined;
+  describeClipCapability(
+    clip: {clipType?: string} | null | undefined,
+    dynamicEntries: readonly AstridDynamicSequenceEntry[],
+  ): AstridClipCapabilityDescriptor | undefined;
+}
+
+export function requireAstridElementHost(
+  host: AstridElementHost | null | undefined,
+): AstridElementHost {
+  if (!host) {
+    throw new Error('TimelineRenderer requires an explicit AstridElementHost');
+  }
+  return host;
+}

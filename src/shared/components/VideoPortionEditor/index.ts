@@ -1,0 +1,1 @@
+export { VideoPortionEditor } from './VideoPortionEditor';

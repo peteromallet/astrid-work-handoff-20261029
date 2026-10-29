@@ -1,0 +1,112 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+# Vendored packages ship pre-built dist/ because Railway's build context can't
+# build them from source the way the workspace does. Whitelist them so the
+# top-level `dist` rule above doesn't strip them out of the deploy artifact.
+!vendor/**/dist
+!vendor/**/dist/**
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Decruftify generated files
+.decruftify/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# User uploaded files and images
+public/files/
+public/uploads/
+local.db
+
+# Temporary files
+temp/
+
+# Ignore all markdown files except structure.md, structure_detail/, tasks/, and CLAUDE.md
+*.md
+!structure.md
+!structure_detail/*.md
+!docs/structure_detail/*.md
+!docs/blog/*.md
+!docs/quality/*.md
+!docs/fully-local-update.md
+!docs/local-update-canary.md
+!vendor/astrid-browser/remotion/public/fonts/FONT_PROVENANCE.md
+!docs/state_management_context_audit.md
+!docs/design/*.md
+!docs/governance/contracts/astrid-plan-a.md
+!vendor/astrid-browser/remotion/public/fonts/FONT_PROVENANCE.md
+!docs/extensions/foundation-closure-assessment.md
+!docs/extensions/composition-spine/*.md
+!docs/video-editor/*.md
+!docs/extensions/*.md
+!scripts/quality/__fixtures__/**/*.md
+!docs/extensions/ship-evidence/releases/
+!docs/extensions/ship-evidence/releases/**
+/vendor/timeline-schema/python/build/
+!tasks/*.md
+!CLAUDE.md
+
+# TypeScript build output
+*.tsbuildinfo
+
+# Stray media files in root (should be in public/)
+/*.mp4
+/*.webm
+/*.mov
+/*.gif
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+
+# Archive files in root
+/*.zip
+/*.rar
+/*.7z
+
+# Python cache/venvs
+__pycache__/
+*.pyc
+.venv*/
+.ruff_cache/
+
+# Audit/review artifacts
+.desloppify/
+findings*.json
+perfile_findings.json
+type_safety_review*.json
+
+# Localhost dev logs (already covered by *.log but be explicit)
+localhost-*.log
+
+.claude/worktrees/
+
+this.env
+
+# Playwright output (screenshots, traces, last-run state) — generated, never source
+test-results/
+playwright-report/

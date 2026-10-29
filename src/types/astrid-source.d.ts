@@ -1,0 +1,231 @@
+declare module '@astrid/*' {
+  type AstridRenderingElementKind = 'effect' | 'animation' | 'transition';
+
+  type AstridRenderingElementParameter = {
+    name: string;
+    label: string;
+    description: string;
+    type: 'number' | 'select' | 'boolean' | 'color' | 'audio-binding';
+    default?: number | string | boolean;
+    min?: number;
+    max?: number;
+    step?: number;
+    options?: { label: string; value: string }[];
+  };
+
+  type AstridRenderingElementDescriptor = {
+    id: string;
+    kind: AstridRenderingElementKind;
+    label: string;
+    description: string;
+    shortDescription: string;
+    keywords: string[];
+    defaults: Record<string, unknown>;
+    schema: Record<string, unknown>;
+    parameters: AstridRenderingElementParameter[];
+    source: string;
+    packId: string;
+    componentPath: string;
+    revision: string;
+    runtime: Record<string, unknown>;
+    renderability: {
+      preview: 'supported' | 'blocked' | 'unknown';
+      browserExport: 'supported' | 'blocked' | 'unknown';
+      workerExport: 'supported' | 'blocked' | 'unknown';
+    };
+  };
+
+  export const ASTRID_RENDERING_ELEMENTS: readonly AstridRenderingElementDescriptor[];
+
+  const AstridSequenceComponent: (props: {
+    clip: unknown;
+    params?: Record<string, unknown>;
+    theme?: unknown;
+    fps: number;
+  }) => import('react').ReactElement | null;
+
+  export default AstridSequenceComponent;
+}
+
+declare module '@astrid/packs/rendering/editor/catalog' {
+  import type { AstridExtension } from '@astrid/editor-sdk';
+
+  export type AstridEditorExtensionDescriptor = {
+    readonly packId: string;
+    readonly entryPath: string;
+    readonly extension: AstridExtension;
+  };
+
+  export const ASTRID_EDITOR_EXTENSION_CATALOG: readonly AstridEditorExtensionDescriptor[];
+  export const ASTRID_EDITOR_EXTENSIONS: readonly AstridExtension[];
+}
+
+declare module '@astrid/packs/rendering/shared/readiness-image' {
+  export const ReadinessImage: (props: import('react').ComponentProps<typeof import('remotion').Img> & {
+    mediaId?: string;
+  }) => import('react').ReactElement;
+}
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/component.tsx' {
+  const EndSpanningLayer: (props: {
+    clip: unknown;
+    params?: Record<string, unknown>;
+    theme?: unknown;
+    fps: number;
+  }) => import('react').ReactElement | null;
+
+  export default EndSpanningLayer;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-0.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-1.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-2.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-3.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-4.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-5.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-0-canonical-mink.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-4-canonical-mink.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-5-canonical-mink.png?url' {
+  const cardUrl: string;
+  export default cardUrl;
+}
+
+declare module '@astrid/packs/local/rendering/elements/effects/frame-overlay/assets/frame.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+
+declare module '@astrid-public/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-0.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+declare module '@astrid-public/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-1.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+declare module '@astrid-public/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-2.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+declare module '@astrid-public/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-3.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+declare module '@astrid-public/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-4.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+declare module '@astrid-public/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-5.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+declare module '@astrid-public/packs/local/rendering/elements/effects/frame-overlay/assets/frame.png?url' {
+  const assetUrl: string;
+  export default assetUrl;
+}
+
+declare module '@astrid-public/*' {
+  type AstridRenderingElementDescriptor = {
+    id: string;
+    kind: 'effect' | 'animation' | 'transition';
+    label: string;
+    description: string;
+    shortDescription: string;
+    keywords: string[];
+    defaults: Record<string, unknown>;
+    schema: Record<string, unknown>;
+    parameters: Array<Record<string, unknown>>;
+    source: string;
+    packId: string;
+    componentPath: string;
+    revision: string;
+    runtime: Record<string, unknown>;
+    renderability: {
+      preview: 'supported' | 'blocked' | 'unknown';
+      browserExport: 'supported' | 'blocked' | 'unknown';
+      workerExport: 'supported' | 'blocked' | 'unknown';
+    };
+  };
+
+  export const ASTRID_RENDERING_ELEMENTS: readonly AstridRenderingElementDescriptor[];
+
+  const AstridSequenceComponent: (props: {
+    clip: unknown;
+    params?: Record<string, unknown>;
+    theme?: unknown;
+    fps: number;
+  }) => import('react').ReactElement | null;
+
+  export default AstridSequenceComponent;
+}
+
+// The integration-index producer emits this selected-source Tool contract.
+declare module '@astrid/tools/catalog.json' {
+  const catalog: import('@/shared/lib/tooling/toolCatalog').AstridToolCatalog;
+  export default catalog;
+}
+
+// The editor tour's Lantern Valley (lazy): only the pieces `tour/timeline` calls.
+declare module '@astrid/packs/rendering/ui/threejs-live-editor/explorer/worlds/sample' {
+  export const SAMPLE_WORLD: { readonly name: string; readonly packageJson: string };
+}
+
+declare module '@astrid/packs/rendering/ui/threejs-live-editor/authoring' {
+  export type LiveScenePackageInput = Readonly<Record<string, unknown>>;
+  export function parsePreparedScenePackage(bytes: Uint8Array): Promise<LiveScenePackageInput>;
+  export function ingestPreparedPackage(
+    storage: import('@/sdk/video/assets/projectObjects.ts').ProjectObjectStorage,
+    input: LiveScenePackageInput,
+  ): Promise<{ package: unknown; liveScene: Record<string, unknown> }>;
+}
+
+declare module '@astrid/packs/rendering/ui/threejs-live-editor/SceneSurface' {
+  export function SceneSurface(props: {
+    source: unknown;
+    sourceTime: number;
+    width: number;
+    height: number;
+    onReady?: (info: unknown) => void;
+  }): import('react').ReactElement | null;
+}
+
+declare module '@astrid/packs/rendering/shared/managed-media-policy' {
+  export function isManagedObjectUrl(src: string | null | undefined): boolean;
+}
+
+declare module '@astrid/packs/rendering/shared/managed-media' {
+  export const ManagedImg: typeof import('remotion').Img;
+  export const ManagedOffthreadVideo: typeof import('remotion').OffthreadVideo;
+  export const ManagedVideo: typeof import('@remotion/media').Video;
+}

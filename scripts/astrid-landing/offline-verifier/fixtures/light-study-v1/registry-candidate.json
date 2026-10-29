@@ -1,0 +1,22 @@
+{
+  "assets": {
+    "first-light": {
+      "file": "media/first-light.mp4",
+      "content_sha256": "f94618ccf47b76140e2aab240bacab98e330cf0e171fd68a7aac6783dbe346f1",
+      "duration": 8,
+      "type": "video/mp4"
+    },
+    "passing-shapes": {
+      "file": "media/passing-shapes.mp4",
+      "content_sha256": "a3b16d538c9a1a7648e55bd2889541373aa5774ae3c4386f63bc645933091347",
+      "duration": 12,
+      "type": "video/mp4"
+    },
+    "quiet-finish": {
+      "file": "media/quiet-finish.mp4",
+      "content_sha256": "56d87d4c752651f042e8d41f122ab038549ef6dfb601c4e026b5e52d1be52670",
+      "duration": 8,
+      "type": "video/mp4"
+    }
+  }
+}

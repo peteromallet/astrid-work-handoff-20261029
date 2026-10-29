@@ -1,0 +1,186 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createFakeRuntimeRouter } from '@/test/fakeRuntimeRouter.ts';
+
+// This census probes the workspace.v1 routes (/v1/health, /v1/projects,
+// /v1/objects).
+import { inspectAstridCapabilities } from './capabilityCensus.ts';
+
+const ORIGIN = 'http://bridge.fake';
+
+function installFetch(handler: (request: Request) => Promise<Response>) {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = input instanceof Request ? input.url : String(input);
+    const url = raw.startsWith(ORIGIN) ? raw : `${ORIGIN}${raw}`;
+    return handler(new Request(url, init));
+  }));
+}
+
+describe('Astrid capability inspection', () => {
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('separates healthy bridge status from supported task, gallery, and media routes', async () => {
+    const router = createFakeRuntimeRouter();
+    installFetch((request) => router.handle(request));
+
+    const result = await inspectAstridCapabilities();
+
+    expect(result).toMatchObject({
+      health: 'available',
+      readiness: 'ready',
+      capabilities: {
+        tasks: 'supported',
+        generations: 'supported',
+        media: 'supported',
+      },
+    });
+  });
+
+  it('accepts historical task identities during the GET capability probe', async () => {
+    const router = createFakeRuntimeRouter();
+    installFetch(async (request) => {
+      if (new URL(request.url).pathname.endsWith('/tasks')) {
+        return Response.json({
+          items: [{
+            task_id: 'historical-task', run_id: 'historical-run', project_id: 'demo',
+            state: 'succeeded', version: 1, capability_id: 'render_export',
+            capability_digest: 'a'.repeat(64), schema_version: '1',
+            input_object_ids: [`sha256:${'b'.repeat(64)}`], spec: {}, idempotency_key: 'historical-task',
+            created_at: '2026-09-24T10:00:00Z', updated_at: '2026-09-24T10:01:00Z',
+            attempt_id: null, runtime_epoch: 1,
+          }],
+          next_cursor: null,
+        });
+      }
+      return router.handle(request);
+    });
+
+    await expect(inspectAstridCapabilities()).resolves.toMatchObject({
+      health: 'available', readiness: 'ready', capabilities: { tasks: 'supported' },
+    });
+  });
+
+  it('reports a healthy older bridge as degraded and probes each absent route only once', async () => {
+    const router = createFakeRuntimeRouter();
+    installFetch(async (request) => {
+      const pathname = new URL(request.url).pathname;
+      if (/\/v1\/(?:projects\/[^/]+\/)?(?:tasks|generations)(?:\/|\?|$)/.test(pathname)
+        || /\/v1\/objects\//.test(pathname)) {
+        return Response.json(
+          { error: 'not_found', detail: `unknown route: ${pathname}` },
+          { status: 404 },
+        );
+      }
+      return router.handle(request);
+    });
+
+    const result = await inspectAstridCapabilities();
+
+    expect(result.health).toBe('available');
+    expect(result.readiness).toBe('degraded');
+    expect(result.capabilities).toEqual({
+      tasks: 'unavailable',
+      generations: 'unavailable',
+      media: 'unavailable',
+    });
+    // health + projects + tasks + generations + media HEAD + diagnostic GET
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(6);
+  });
+
+  it('probes the URL-selected bridge project by canonical ID', async () => {
+    window.history.replaceState({}, '', '/tools/video-editor?project=selected-id');
+    const router = createFakeRuntimeRouter();
+    const requests: string[] = [];
+    installFetch(async (request) => {
+      const url = new URL(request.url);
+      requests.push(url.pathname);
+      if (url.pathname.endsWith('/v1/projects')) {
+        return Response.json({
+          items: [
+            { project_id: 'first-id', slug: 'first-project', name: 'First Project', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false },
+            { project_id: 'selected-id', slug: 'selected-project', name: 'Selected Project', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false },
+          ],
+          next_cursor: null,
+        });
+      }
+      return router.handle(request);
+    });
+
+    const result = await inspectAstridCapabilities();
+
+    expect(result.projectSlug).toBe('selected-project');
+    expect(requests).toEqual(expect.arrayContaining([
+      '/api/astrid/v1/projects/selected-project/tasks',
+      '/api/astrid/v1/projects/selected-project/generations',
+    ]));
+    expect(requests.some((pathname) => pathname.startsWith('/api/astrid/v1/objects/'))).toBe(true);
+    expect(requests.every((pathname) => !pathname.includes('/v1/projects/first-project/'))).toBe(true);
+    expect(requests).not.toContain('/api/astrid/v1/projects/first-project/tasks');
+    expect(requests).not.toContain('/api/astrid/v1/projects/first-project/generations');
+  });
+
+  it('uses the first bridge project when there is no explicit selection', async () => {
+    const search = '';
+    window.history.replaceState({}, '', `/tools/video-editor${search}`);
+    const router = createFakeRuntimeRouter();
+    installFetch(async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith('/v1/projects')) {
+        return Response.json({
+          items: [
+            { project_id: 'first-id', slug: 'first-project', name: 'First Project', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false },
+            { project_id: 'second-id', slug: 'second-project', name: 'Second Project', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false },
+          ],
+          next_cursor: null,
+        });
+      }
+      return router.handle(request);
+    });
+
+    const result = await inspectAstridCapabilities();
+
+    expect(result.projectSlug).toBe('first-project');
+  });
+
+  it('does not fall back when an explicit project selector is malformed', async () => {
+    window.history.replaceState({}, '', '/tools/video-editor?project=%E0%A4%A');
+    const router = createFakeRuntimeRouter();
+    installFetch(async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith('/v1/projects')) {
+        return Response.json({
+          items: [
+            { project_id: 'first-id', slug: 'first-project', name: 'First Project', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false },
+            { project_id: 'second-id', slug: 'second-project', name: 'Second Project', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false },
+          ],
+          next_cursor: null,
+        });
+      }
+      return router.handle(request);
+    });
+
+    await expect(inspectAstridCapabilities()).resolves.toMatchObject({ projectSlug: null });
+  });
+
+  it('does not mistake transport uncertainty for permanent capability absence', async () => {
+    installFetch(async (request) => {
+      const pathname = new URL(request.url).pathname;
+      if (pathname.endsWith('/v1/health')) return Response.json({ status: 'ok' });
+      if (pathname.endsWith('/v1/projects')) {
+        return Response.json({ items: [{ project_id: 'p-id', slug: 'p', name: 'P', metadata: {}, version: 1, created_at: '2026-09-06T00:00:00Z', updated_at: '2026-09-06T00:00:00Z', archived: false }], next_cursor: null });
+      }
+      throw new Error('socket closed');
+    });
+
+    const result = await inspectAstridCapabilities();
+    expect(result.readiness).toBe('degraded');
+    expect(result.capabilities).toEqual({
+      tasks: 'unknown',
+      generations: 'unknown',
+      media: 'unknown',
+    });
+  });
+});

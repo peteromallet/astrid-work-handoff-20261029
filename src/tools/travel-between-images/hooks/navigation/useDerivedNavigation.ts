@@ -1,0 +1,97 @@
+import { useCallback, useMemo } from 'react';
+import { GenerationRow } from '@/domains/generation/types';
+import { DerivedNavContext } from '@/shared/components/ShotImageManager/types';
+import { navigateDerivedStep } from '@/shared/lib/navigation/derivedNavigation';
+
+interface UseDerivedNavigationProps {
+  derivedNavContext: DerivedNavContext | null;
+  lightboxIndex: number | null;
+  currentImages: GenerationRow[];
+  handleOpenExternalGeneration: (generationId: string, derivedContext?: string[]) => Promise<void>;
+  goNext: () => void;
+  goPrev: () => void;
+}
+
+/**
+ * Hook to add derived navigation mode support to any lightbox navigation
+ * 
+ * When derivedNavContext is set (user clicked "Based on this" thumbnail),
+ * navigation will only cycle through those specific derived generations
+ * instead of all images in the view. Also calculates hasNext/hasPrevious
+ * correctly based on the context mode.
+ * 
+ * @example
+ * const { wrappedGoNext, wrappedGoPrev, hasNext, hasPrevious } = useDerivedNavigation({
+ *   derivedNavContext: externalGens.derivedNavContext,
+ *   lightboxIndex,
+ *   currentImages,
+ *   handleOpenExternalGeneration: externalGens.handleOpenExternalGeneration,
+ *   goNext: originalGoNext,
+ *   goPrev: originalGoPrev
+ * });
+ */
+export function useDerivedNavigation({
+  derivedNavContext,
+  lightboxIndex,
+  currentImages,
+  handleOpenExternalGeneration,
+  goNext,
+  goPrev,
+}: UseDerivedNavigationProps) {
+  const wrappedGoNext = useCallback(() => {
+    const handledDerivedStep = navigateDerivedStep({
+      derivedNavContext,
+      lightboxIndex,
+      currentImages,
+      direction: 'next',
+      handleOpenExternalGeneration,
+    });
+    if (!handledDerivedStep) {
+      goNext();
+    }
+  }, [derivedNavContext, lightboxIndex, currentImages, handleOpenExternalGeneration, goNext]);
+  
+  const wrappedGoPrev = useCallback(() => {
+    const handledDerivedStep = navigateDerivedStep({
+      derivedNavContext,
+      lightboxIndex,
+      currentImages,
+      direction: 'prev',
+      handleOpenExternalGeneration,
+    });
+    if (!handledDerivedStep) {
+      goPrev();
+    }
+  }, [derivedNavContext, lightboxIndex, currentImages, handleOpenExternalGeneration, goPrev]);
+  
+  // Calculate hasNext/hasPrevious based on whether we're in derived navigation mode
+  const { hasNext, hasPrevious } = useMemo(() => {
+    if (lightboxIndex === null) {
+      return { hasNext: false, hasPrevious: false };
+    }
+    
+    if (derivedNavContext) {
+      // In derived navigation mode, check against derived generation IDs
+      const currentId = currentImages[lightboxIndex]?.id;
+      const currentDerivedIndex = derivedNavContext.derivedGenerationIds.indexOf(currentId);
+      
+      return {
+        hasNext: currentDerivedIndex !== -1 && currentDerivedIndex < derivedNavContext.derivedGenerationIds.length - 1,
+        hasPrevious: currentDerivedIndex !== -1 && currentDerivedIndex > 0
+      };
+    } else {
+      // Normal mode, check against all current images
+      return {
+        hasNext: lightboxIndex < currentImages.length - 1,
+        hasPrevious: lightboxIndex > 0
+      };
+    }
+  }, [derivedNavContext, lightboxIndex, currentImages]);
+  
+  return {
+    wrappedGoNext,
+    wrappedGoPrev,
+    hasNext,
+    hasPrevious
+  };
+}

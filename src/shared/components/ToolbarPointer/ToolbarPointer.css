@@ -1,0 +1,28 @@
+/* The hand-drawn arrow from a card to the browser's toolbar (install dialog, permission card). */
+.astrid-toolbar-pointer {
+  /* Portaled to the body so card transforms never offset the viewport coordinates. */
+  position: fixed;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+  color: #ff8a45;
+}
+.astrid-toolbar-pointer path { stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* The line draws itself up to the toolbar, the head lands. */
+.astrid-toolbar-pointer-line { stroke-dasharray: 1; animation: astrid-toolbar-pointer-draw 900ms cubic-bezier(.45,0,.2,1) 200ms backwards; }
+.astrid-toolbar-pointer-head { animation: astrid-toolbar-pointer-fade 200ms ease 1000ms backwards; }
+@keyframes astrid-toolbar-pointer-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes astrid-toolbar-pointer-fade { from { opacity: 0; } }
+.astrid-toolbar-pointer-label {
+  fill: #fffbf2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: .18em;
+}
+/* Over the page itself (no dimmed backdrop), the theme's own colours carry it in light and dark. */
+.astrid-toolbar-pointer[data-tone="page"] { color: hsl(var(--primary)); }
+.astrid-toolbar-pointer[data-tone="page"] .astrid-toolbar-pointer-label { fill: hsl(var(--foreground)); }
+@media (prefers-reduced-motion: reduce) {
+  .astrid-toolbar-pointer-line,
+  .astrid-toolbar-pointer-head { animation: none; }
+}

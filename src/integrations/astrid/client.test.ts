@@ -1,0 +1,335 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { AstridLocalClient } from '@/integrations/astrid/client.ts';
+import {
+  BridgeContractError,
+  BRIDGE_ERROR_CATEGORIES,
+  runtimeCapabilitySchema,
+  runtimeManagedObjectSchema,
+} from '@/tools/video-editor/data/bridgeContract.ts';
+import { BridgeRouteError, BridgeTransportFailure } from '@/integrations/astrid/transport.ts';
+import { createFakeRuntimeRouter, type FakeRuntimeRouter } from '@/test/fakeRuntimeRouter.ts';
+
+import { fixtureUlid } from '@/test/fakeRuntimeSeed.mjs';
+
+const FAKE_ORIGIN = 'http://bridge.fake';
+
+// These assertions cover the workspace.v1 routes (`/v1/projects`, `/v1/objects`).
+
+describe('AstridLocalClient', () => {
+  let router: FakeRuntimeRouter;
+
+  beforeEach(() => {
+    router = createFakeRuntimeRouter();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      return await router.handle(new Request(`${FAKE_ORIGIN}${url.pathname}${url.search}`, init));
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function makeClient(): AstridLocalClient {
+    return new AstridLocalClient({ projectSlug: 'demo-project', baseUrl: FAKE_ORIGIN });
+  }
+
+  function admissionRequest() {
+    return {
+      project: 'demo-project',
+      capability_id: 'astrid.image_generation',
+      capability_digest: `sha256:${'a'.repeat(64)}`,
+      schema_version: '1' as const,
+      input_object_ids: [`sha256:${'1'.repeat(64)}`],
+      spec: {
+        family: 'image_generation',
+        params: { prompt: 'a lighthouse' },
+        output_policy: {},
+      },
+      storage_estimate: {
+        scratch_bytes: 0,
+        output_bytes: 0,
+      },
+      settlement_effect: {},
+    };
+  }
+
+  it('discovers projects through the one shared transport', async () => {
+    const client = makeClient();
+    await expect(client.projects.list()).resolves.toEqual([
+      expect.objectContaining({ slug: 'demo-project' }),
+    ]);
+    expect(vi.mocked(globalThis.fetch).mock.calls[0]?.[0]).toContain('/v1/projects?limit=200');
+  });
+
+  // -- Admission ------------------------------------------------------------
+
+  it('ingests and pages project Runtime objects through exact /v1 paths', async () => {
+    const client = new AstridLocalClient({ projectSlug: 'demo/project', baseUrl: FAKE_ORIGIN });
+    const committed = await client.objects.ingest(
+      new Uint8Array([1, 2, 3]),
+      'image/png',
+      'cas:deterministic',
+      'frame.png',
+    );
+    expect(committed.data.object_id).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const [input, init] = vi.mocked(globalThis.fetch).mock.calls[0] as [string, RequestInit];
+    expect(new URL(input).pathname).toBe('/v1/projects/demo%2Fproject/objects');
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('image/png');
+    expect((init.headers as Record<string, string>)['Idempotency-Key']).toBe('cas:deterministic');
+
+    const first = await client.objects.list({ limit: 1 });
+    expect(first.items).toHaveLength(1);
+    expect(first.next_cursor).toBe('1');
+    const second = await client.objects.list({ cursor: first.next_cursor ?? undefined, limit: 1 });
+    expect(second.items[0].object_id).not.toBe(first.items[0].object_id);
+  });
+
+  it('accepts valid managed-object metadata and rejects malformed Runtime values', () => {
+    const valid = {
+      object_id: `sha256:${'a'.repeat(64)}`,
+      digest: `sha256:${'b'.repeat(64)}`,
+      media_type: 'video/mp4',
+      size: 0,
+      version: 1,
+      created_at: '2026-08-30T00:00:00Z',
+      filename: 'clip.mp4',
+      relation: 'source',
+    };
+
+    expect(runtimeManagedObjectSchema.safeParse(valid).success).toBe(true);
+    expect(runtimeManagedObjectSchema.safeParse({ ...valid, media_type: 'video' }).success).toBe(false);
+    expect(runtimeManagedObjectSchema.safeParse({ ...valid, version: 0 }).success).toBe(false);
+    expect(runtimeManagedObjectSchema.safeParse({ ...valid, created_at: 'not-a-date' }).success).toBe(false);
+    expect(runtimeManagedObjectSchema.safeParse({ ...valid, filename: '' }).success).toBe(false);
+    expect(runtimeManagedObjectSchema.safeParse({ ...valid, filename: 'x'.repeat(513) }).success).toBe(false);
+    expect(runtimeManagedObjectSchema.safeParse({ ...valid, relation: '' }).success).toBe(false);
+  });
+
+  it('accepts valid capability resources and rejects empty or duplicate keys', () => {
+    const valid = {
+      capability_id: 'astrid.image_generation',
+      definition_digest: `sha256:${'a'.repeat(64)}`,
+      status: 'ready' as const,
+      required_resource_keys: ['gpu', 'scratch'],
+      estimated_scratch_bytes: 0,
+      estimated_output_bytes: 0,
+    };
+
+    expect(runtimeCapabilitySchema.safeParse(valid).success).toBe(true);
+    expect(runtimeCapabilitySchema.safeParse({ ...valid, required_resource_keys: [''] }).success).toBe(false);
+    expect(runtimeCapabilitySchema.safeParse({ ...valid, required_resource_keys: ['gpu', 'gpu'] }).success).toBe(false);
+  });
+
+  it('binds only a ready catalog capability and returns its exact digest', async () => {
+    const client = makeClient();
+    await expect(client.catalog.bind('astrid.image_generation', `sha256:${'a'.repeat(64)}`))
+      .resolves.toBe(`sha256:${'a'.repeat(64)}`);
+    await expect(client.catalog.bind('missing.capability')).rejects.toThrow('not registered');
+  });
+
+  it('admits a task with the required Idempotency-Key header', async () => {
+    const client = makeClient();
+    const admitted = vi.fn();
+    window.addEventListener('runtime:task-admitted', admitted, { once: true });
+
+    const response = await client.tasks.admit(admissionRequest(), 'astrid.admit:test-1');
+
+    expect(response.task.id).toBeTruthy();
+    expect(response.task.status).toBe('queued');
+    expect(admitted).toHaveBeenCalledWith(expect.objectContaining({
+      detail: { projectId: 'demo-project' },
+    }));
+    const [, init] = vi.mocked(globalThis.fetch).mock.calls[0] as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    expect((init.headers as Record<string, string>)['Idempotency-Key']).toBe('astrid.admit:test-1');
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json');
+  });
+
+  it('replays the stored task on idempotent re-admission', async () => {
+    const client = makeClient();
+    const first = await client.tasks.admit(admissionRequest(), 'astrid.admit:same');
+
+    const replay = await client.tasks.admit(admissionRequest(), 'astrid.admit:same');
+    expect(replay.task.id).toBe(first.task.id);
+  });
+
+  it('rejects key reuse with different bytes as a conflict', async () => {
+    const client = makeClient();
+    await client.tasks.admit(admissionRequest(), 'astrid.admit:same');
+
+    const error = await client.tasks
+      .admit({ ...admissionRequest(), spec: {
+        ...admissionRequest().spec,
+        params: { prompt: 'changed' },
+      } }, 'astrid.admit:same')
+      .catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(BridgeRouteError);
+    expect((error as BridgeRouteError).status).toBe(409);
+    expect((error as BridgeRouteError).code).toBe('idempotency_mismatch');
+  });
+
+  it('maps an unavailable family to capability_unavailable', async () => {
+    const client = makeClient();
+
+    await expect(
+      client.tasks.admit({
+        ...admissionRequest(),
+        capability_id: 'astrid.image_generation_dead',
+        spec: { ...admissionRequest().spec, family: 'image_generation_dead', params: {} },
+      }, 'astrid.admit:x'),
+    ).rejects.toMatchObject({
+      status: 422,
+      code: 'capability_unavailable',
+    });
+  });
+
+  // -- Poll / cancel journey -------------------------------------------------
+
+  it('lists and reads admitted tasks through the polling shapes', async () => {
+    const client = makeClient();
+    const { task } = await client.tasks.admit(admissionRequest(), 'astrid.admit:list');
+
+    const list = await client.tasks.list();
+    expect(list.tasks.map((entry) => entry.task_id)).toContain(task.id);
+    expect(list.next_offset).toBeNull();
+
+    const detail = await client.tasks.get(task.id);
+    expect(detail.task_id).toBe(task.id);
+    expect(detail.attempts).toEqual([]);
+  });
+
+  it('keeps neutral task reads free of synthetic bridge diagnostics', async () => {
+    const client = makeClient();
+    const { task } = await client.tasks.admit(admissionRequest(), 'astrid.admit:diagnostics');
+    const summary = router.state.tasks.get(task.id);
+    if (!summary) throw new Error('fixture missing');
+    summary.status = 'running';
+
+    const detail = await client.tasks.get(task.id);
+    expect(detail.attempts).toEqual([]);
+
+    const error = await client.tasks.cancel(task.id).catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(BridgeRouteError);
+    expect((error as BridgeRouteError).envelope?.attempt).not.toHaveProperty('diagnostics');
+  });
+
+  it('cancels a queued task without a fence and replays terminal state', async () => {
+    const client = makeClient();
+    const { task } = await client.tasks.admit(admissionRequest(), 'astrid.admit:cancel');
+
+    const cancelled = await client.tasks.cancel(task.id);
+    expect(cancelled.task.status).toBe('cancelled');
+
+    const replay = await client.tasks.cancel(task.id);
+    expect(replay.task.status).toBe('cancelled');
+  });
+
+  it('refuses an unfenced cancel of a running task with the bounded attempt extra', async () => {
+    const client = makeClient();
+    const { task } = await client.tasks.admit(admissionRequest(), 'astrid.admit:running');
+    const summary = router.state.tasks.get(task.id);
+    if (!summary) throw new Error('fixture missing');
+    summary.status = 'running';
+
+    const error = await client.tasks.cancel(task.id).catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(BridgeRouteError);
+    const routeError = error as BridgeRouteError;
+    expect(routeError.status).toBe(409);
+    expect(routeError.category).toBe('conflict');
+    expect(routeError.envelope?.attempt?.status).toBe('running');
+  });
+
+  // -- Gallery ---------------------------------------------------------------
+
+  it('reads gallery pages and generation detail from the seeded fixtures', async () => {
+    const client = makeClient();
+
+    const page = await client.gallery.list();
+    expect(page.generations).toHaveLength(router.state.galleryPageRows.length);
+
+    const starred = await client.gallery.list({ starred: true });
+    expect(starred.generations.map((generation) => generation.generation_id)).toContain(fixtureUlid('genbbbbbb'));
+    expect(starred.generations.every((generation) => generation.starred)).toBe(true);
+
+    const detail = await client.gallery.get(page.generations[0].generation_id);
+    expect(detail.variants.some((variant) => variant.is_primary)).toBe(true);
+
+    await expect(client.gallery.get('01j8zcex4q7m4sjdy6g6missing')).rejects.toMatchObject({
+      status: 404,
+      category: 'not_found',
+    });
+  });
+
+  // -- Media content ---------------------------------------------------------
+
+  it('builds same-origin media content URLs serving Range/ETag bytes', async () => {
+    const client = makeClient();
+    const [media] = [...router.state.media.keys()];
+    const url = client.media.contentUrl(media);
+
+    const full = await fetch(url);
+    expect(full.status).toBe(200);
+    expect(full.headers.get('Accept-Ranges')).toBe('bytes');
+
+    const partial = await fetch(`${url}`, { headers: { Range: 'bytes=0-9' } });
+    expect(partial.status).toBe(206);
+    expect(partial.headers.get('Content-Range')).toMatch(/^bytes 0-9\//);
+
+    const conditional = await fetch(url, { headers: { 'If-None-Match': full.headers.get('ETag') ?? '' } });
+    expect(conditional.status).toBe(304);
+  });
+
+  // -- Failure posture -------------------------------------------------------
+
+  it('surfaces the reachable doc-27 §4.6 categories as typed route errors', async () => {
+    const client = makeClient();
+
+    // invalid_body: missing Idempotency-Key
+    await expect(fetch(
+      `${FAKE_ORIGIN}/projects/demo-project/tasks`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(admissionRequest()) },
+    ).then(async (response) => {
+      if (response.ok) throw new Error('expected failure');
+      return response.json();
+    })).resolves.toMatchObject({ error: 'invalid_body' });
+
+    // not_found
+    await expect(client.tasks.get('01j8zcex4q7m4sjdy6g6missing')).rejects.toMatchObject({
+      category: 'not_found',
+    });
+
+    // conflict via unfenced running-cancel
+    const { task } = await client.tasks.admit(admissionRequest(), 'astrid.admit:cat-conflict');
+    const summary = router.state.tasks.get(task.id);
+    if (summary) summary.status = 'running';
+    await expect(client.tasks.cancel(task.id)).rejects.toMatchObject({ category: 'conflict' });
+
+    // capability_unavailable
+    await expect(client.tasks.admit({
+      ...admissionRequest(),
+      spec: { ...admissionRequest().spec, family: 'dead_family', params: {} },
+    }, 'k')).rejects.toMatchObject({
+      category: 'capability_unavailable',
+    });
+
+    expect(BRIDGE_ERROR_CATEGORIES).toContain('payload_too_large');
+  });
+
+  it('throws contract violations on malformed payloads, never coercion', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"generations": "not-an-array"}', { status: 200 })));
+    const client = new AstridLocalClient({ projectSlug: 'demo-project', baseUrl: FAKE_ORIGIN });
+    await expect(client.gallery.list()).rejects.toBeInstanceOf(BridgeContractError);
+  });
+
+  it('wraps network failures in BridgeTransportFailure', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('ECONNREFUSED');
+    }));
+    const client = new AstridLocalClient({ projectSlug: 'demo-project', baseUrl: FAKE_ORIGIN });
+    await expect(client.gallery.list()).rejects.toBeInstanceOf(BridgeTransportFailure);
+  });
+});

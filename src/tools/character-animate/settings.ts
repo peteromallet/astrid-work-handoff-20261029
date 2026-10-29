@@ -1,0 +1,22 @@
+import { TOOL_IDS } from '@/shared/lib/tooling/toolIds';
+
+// Animate Characters Tool Settings
+export const characterAnimateSettings = {
+  id: TOOL_IDS.CHARACTER_ANIMATE,
+  scope: ['project', 'shot'] as const,
+  defaults: {
+    mode: 'animate' as 'replace' | 'animate',
+    resolution: '480p' as '480p' | '720p',
+    defaultPrompt: 'natural expression; preserve outfit details',
+    autoMatchAspectRatio: true,
+    randomSeed: true,
+    seed: undefined as number | undefined,
+    inputImageUrl: undefined as string | undefined,
+    inputVideoUrl: undefined as string | undefined,
+    inputVideoPosterUrl: undefined as string | undefined,
+  },
+};
+
+// TypeScript type for settings
+export type CharacterAnimateSettings = typeof characterAnimateSettings.defaults;
+

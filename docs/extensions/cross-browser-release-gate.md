@@ -1,0 +1,78 @@
+# Extension cross-browser release gate
+
+The opt-in release gate exercises a deliberately small set of ship-critical
+extension behaviors in the installed stable Chrome channel plus Playwright's
+Firefox and WebKit engines. It does not add three browsers to the ordinary test
+loop. The gate allocates isolated ports at runtime and refuses to reuse an
+existing server, so a stale acceptance server cannot produce a false pass.
+
+```sh
+npm run test:e2e:extension-cross-browser
+```
+
+The release environment is pinned to Node `20.19.4`. When the interactive shell
+does not already select it, run:
+
+```sh
+PATH=/Users/peteromalley/.nvm/versions/node/v20.19.4/bin:$PATH \
+  npm run test:e2e:extension-cross-browser
+```
+
+The gate covers:
+
+- Extension Manager inventory, activity, diagnostic and trust-state rendering
+  through the real browser DOM, including keyboard disclosure.
+- The combined editor with the production extensions and the Transcript data-kind
+  lane (render-matrix fixture) mounted together.
+- Keyboard navigation and pressed state on Transcript lane chips (at most 128
+  mounted).
+- Phone-width document and body overflow (marker pagination and the lane action
+  menu are held by `shell-responsive-overflow.spec.ts` and `DataLaneList.test.tsx`).
+- Browser/page errors collected as release failures.
+
+Each run allocates its editor and bridge ports at runtime, passes the selected
+origin through the browser support code, and uses strict-port/readiness checks;
+the old default port is not a valid release input. A stale server or a browser
+run pointed at another origin is a failure, not a passing shortcut. Playwright
+workers never receive the bridge bearer token.
+
+Captures are written to each test's Playwright artifact directory under
+`artifacts/extension-cross-browser/test-results/` by default. This keeps an
+ordinary or release-gate run from mutating tracked evidence. To retain a run
+under another untracked root, set `PLAYWRIGHT_EVIDENCE_ROOT=/tmp/...`. Refresh
+the committed evidence ledger only as an explicit action with
+`PLAYWRIGHT_REFRESH_TRACKED_EVIDENCE=1`; that opt-in writes the project-named
+captures under `docs/extensions/ship-evidence/cross-browser/`. Failure screenshots
+and traces remain in the Playwright artifact directory.
+
+## Browser contract
+
+| Project | Runtime | Default |
+| --- | --- | --- |
+| `chrome-stable` | Installed Google Chrome (`channel: chrome`) | Yes |
+| `firefox` | Playwright Firefox | Yes |
+| `webkit` | Playwright WebKit | Yes |
+
+There is no Microsoft Edge project: no job has an Edge binary, and a project nothing runs is not a gate.
+
+On 2026-08-23, `/Applications/Microsoft Edge.app` was not installed on the
+release-gate Mac, so Edge execution was blocked by missing browser availability,
+not by a skipped or passing product assertion.
+
+## 2026-08-23 release evidence
+
+Environment: Node `20.19.4`, npm `10.8.2`, Playwright `1.60.0`.
+
+| Project | Browser version | Result |
+| --- | --- | --- |
+| `chrome-stable` | Google Chrome `151.0.7922.170` | 3/3 passed |
+| `firefox` | Firefox `150.0.2` (Playwright cache revision `1522`) | 3/3 passed |
+| `webkit` | WebKit `26.4` (Playwright cache revision `2287`) | 3/3 passed |
+
+That run is historical browser evidence, not a frozen-RC receipt: it passed 9/9
+tests with one worker in 1.7 minutes and observed no unexpected browser/page
+errors. The passing screenshots are stored in the project-named evidence
+directories described above. The final candidate must rerun this gate from the
+fresh clean source snapshot computed after native-tool attestation. This
+cross-browser gate does not promote its structural marker checks into general
+caption semantics.

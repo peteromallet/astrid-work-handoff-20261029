@@ -1,0 +1,262 @@
+{
+  "desktop": {
+    "viewport": {
+      "w": 1600,
+      "h": 1000
+    },
+    "rects": {
+      "preview": {
+        "x": 12,
+        "y": 60,
+        "w": 1104,
+        "h": 512
+      },
+      "editArea": {
+        "x": 12,
+        "y": 656,
+        "w": 1104,
+        "h": 288
+      },
+      "createTools": {
+        "x": 164,
+        "y": 772,
+        "w": 84,
+        "h": 24
+      },
+      "trackLabelColumn": {
+        "x": 12,
+        "y": 656,
+        "w": 144,
+        "h": 36
+      },
+      "ruler": {
+        "x": 12,
+        "y": 624,
+        "w": 1104,
+        "h": 32
+      },
+      "firstClip": {
+        "x": 156,
+        "y": 660,
+        "w": 128,
+        "h": 28
+      }
+    },
+    "counts": {
+      "tracks": 3,
+      "modeUiElements": 0,
+      "paneTabOverlaps": 0,
+      "toolButtonOverlaps": 0
+    },
+    "flags": {
+      "armedBarPresent": false,
+      "gutterPadding": "144px",
+      "rightPanelOpen": true
+    }
+  },
+  "desktopFirstRun": {
+    "viewport": {
+      "w": 1600,
+      "h": 1000
+    },
+    "rects": {
+      "preview": {
+        "x": 12,
+        "y": 60,
+        "w": 804,
+        "h": 512
+      },
+      "editArea": {
+        "x": 12,
+        "y": 656,
+        "w": 804,
+        "h": 288
+      },
+      "createTools": {
+        "x": 164,
+        "y": 772,
+        "w": 84,
+        "h": 24
+      },
+      "trackLabelColumn": {
+        "x": 12,
+        "y": 656,
+        "w": 144,
+        "h": 36
+      },
+      "ruler": {
+        "x": 12,
+        "y": 624,
+        "w": 804,
+        "h": 32
+      },
+      "firstClip": {
+        "x": 156,
+        "y": 660,
+        "w": 128,
+        "h": 28
+      }
+    },
+    "counts": {
+      "tracks": 3,
+      "modeUiElements": 0,
+      "paneTabOverlaps": 0,
+      "toolButtonOverlaps": 0
+    },
+    "flags": {
+      "armedBarPresent": false,
+      "gutterPadding": "144px",
+      "rightPanelOpen": true
+    }
+  },
+  "phone": {
+    "viewport": {
+      "w": 420,
+      "h": 820
+    },
+    "rects": {
+      "preview": {
+        "x": 12,
+        "y": 156,
+        "w": 396,
+        "h": 220
+      },
+      "editArea": {
+        "x": 12,
+        "y": 472,
+        "w": 396,
+        "h": 280
+      },
+      "createTools": null,
+      "trackLabelColumn": {
+        "x": 12,
+        "y": 472,
+        "w": 56,
+        "h": 36
+      },
+      "ruler": {
+        "x": 12,
+        "y": 440,
+        "w": 396,
+        "h": 32
+      },
+      "firstClip": {
+        "x": 68,
+        "y": 476,
+        "w": 128,
+        "h": 28
+      }
+    },
+    "counts": {
+      "tracks": 3,
+      "modeUiElements": 0,
+      "paneTabOverlaps": 0,
+      "toolButtonOverlaps": 0
+    },
+    "flags": {
+      "armedBarPresent": false,
+      "gutterPadding": "56px",
+      "rightPanelOpen": false
+    }
+  },
+  "tabletPortrait": {
+    "viewport": {
+      "w": 834,
+      "h": 1194
+    },
+    "rects": {
+      "preview": {
+        "x": 12,
+        "y": 156,
+        "w": 808,
+        "h": 456
+      },
+      "editArea": {
+        "x": 12,
+        "y": 704,
+        "w": 808,
+        "h": 420
+      },
+      "createTools": null,
+      "trackLabelColumn": {
+        "x": 12,
+        "y": 704,
+        "w": 56,
+        "h": 36
+      },
+      "ruler": {
+        "x": 12,
+        "y": 676,
+        "w": 808,
+        "h": 32
+      },
+      "firstClip": {
+        "x": 68,
+        "y": 708,
+        "w": 128,
+        "h": 28
+      }
+    },
+    "counts": {
+      "tracks": 3,
+      "modeUiElements": 0,
+      "paneTabOverlaps": 0,
+      "toolButtonOverlaps": 0
+    },
+    "flags": {
+      "armedBarPresent": false,
+      "gutterPadding": "56px",
+      "rightPanelOpen": false
+    }
+  },
+  "tabletLandscape": {
+    "viewport": {
+      "w": 1180,
+      "h": 820
+    },
+    "rects": {
+      "preview": {
+        "x": 284,
+        "y": 156,
+        "w": 612,
+        "h": 344
+      },
+      "editArea": {
+        "x": 12,
+        "y": 592,
+        "w": 1156,
+        "h": 156
+      },
+      "createTools": null,
+      "trackLabelColumn": {
+        "x": 12,
+        "y": 592,
+        "w": 56,
+        "h": 36
+      },
+      "ruler": {
+        "x": 12,
+        "y": 564,
+        "w": 1156,
+        "h": 32
+      },
+      "firstClip": {
+        "x": 68,
+        "y": 596,
+        "w": 128,
+        "h": 28
+      }
+    },
+    "counts": {
+      "tracks": 3,
+      "modeUiElements": 0,
+      "paneTabOverlaps": 0,
+      "toolButtonOverlaps": 0
+    },
+    "flags": {
+      "armedBarPresent": false,
+      "gutterPadding": "56px",
+      "rightPanelOpen": false
+    }
+  }
+}

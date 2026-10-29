@@ -1,0 +1,462 @@
+/**
+ * Segment Settings Migration
+ *
+ * Format conversion between old/new/legacy metadata formats.
+ *
+ * Extracted from segmentSettingsUtils.ts to separate the migration/compatibility
+ * layer from the public API (presets, helpers, task params).
+ *
+ * Functions here handle:
+ * - Reading settings from variant/generation params (multiple legacy formats)
+ * - Building metadata updates (writing new format + cleaning old fields)
+ * - Converting between lora formats (legacy object, pair array, ActiveLora)
+ */
+
+import type { PhaseConfig } from '@/shared/types/phaseConfig';
+import type { ActiveLora } from '@/domains/lora/types/lora';
+import { writeSegmentOverrides, type SegmentOverrides, type LoraConfig } from '@/shared/lib/settingsMigration';
+import type { SegmentSettings } from './segmentSettingsUtils';
+import { stripModeFromPhaseConfig } from './segmentSettingsUtils';
+import {
+  normalizeTravelGuidance,
+  resolveTravelGuidanceControls,
+  type TravelGuidanceMode,
+} from '@/shared/lib/tasks/travelGuidance';
+import { resolveSelectedModelFromModelName } from '@/tools/travel-between-images/settings';
+
+// =============================================================================
+// PAIR METADATA TYPE
+// =============================================================================
+
+/**
+ * PairMetadata defines the shape of shot_generations.metadata.
+ *
+ * Only types the current format. Legacy fields (pair_*, user_overrides) may
+ * still exist in DB rows but are progressively cleaned up by
+ * cleanupLegacyPairMetadata/cleanupLegacyUserOverrides during saves.
+ */
+export interface PairMetadata {
+  segmentOverrides?: {
+    prompt?: string;
+    negativePrompt?: string;
+    motionMode?: 'basic' | 'advanced';
+    amountOfMotion?: number;
+    phaseConfig?: PhaseConfig;
+    selectedPhasePresetId?: string | null;
+    loras?: Array<{ path: string; strength: number; id?: string; name?: string }>;
+    numFrames?: number;
+    randomSeed?: boolean;
+    seed?: number;
+    selectedModel?: SegmentSettings['selectedModel'];
+    inferenceSteps?: number;
+    guidanceScale?: number;
+    guidanceMode?: TravelGuidanceMode;
+    guidanceStrength?: number;
+    guidanceTreatment?: 'adjust' | 'clip';
+    guidanceUni3cEndPercent?: number;
+    guidanceCannyIntensity?: number;
+    guidanceDepthContrast?: number;
+  };
+  enhanced_prompt?: string;
+  base_prompt_for_enhancement?: string;
+  enhance_prompt_enabled?: boolean;
+}
+
+// =============================================================================
+// LORA FORMAT CONVERTERS
+// =============================================================================
+
+interface NormalizedLoraPair {
+  path: string;
+  strength: number;
+}
+
+/** Convert pair_loras format (Array<{path, strength}>) to ActiveLora[] */
+function pairLorasToArray(pairLoras: NormalizedLoraPair[]): ActiveLora[] {
+  return pairLoras.map((lora) => {
+    const filename = lora.path.split('/').pop()?.replace('.safetensors', '') || lora.path;
+    return {
+      id: lora.path,
+      name: filename,
+      path: lora.path,
+      strength: lora.strength,
+    };
+  });
+}
+
+function normalizeLegacyLoraRecord(value: unknown): NormalizedLoraPair[] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  return entries.map(([path, strength]) => ({
+    path,
+    strength: typeof strength === 'number' ? strength : 1.0,
+  }));
+}
+
+function normalizeLoraPairArray(value: unknown): NormalizedLoraPair[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) {
+    return undefined;
+  }
+
+  const normalized = value
+    .filter((entry): entry is { path?: unknown; strength?: unknown } => !!entry && typeof entry === 'object')
+    .map((entry) => {
+      if (typeof entry.path !== 'string') {
+        return null;
+      }
+      return {
+        path: entry.path,
+        strength: typeof entry.strength === 'number' ? entry.strength : 1.0,
+      };
+    })
+    .filter((entry): entry is NormalizedLoraPair => entry !== null);
+
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+/**
+ * Normalize all supported legacy LoRA shapes to canonical `loras[]` pair format.
+ * Read-side only: write paths can migrate incrementally.
+ */
+function normalizeLoraParams(
+  params: Record<string, unknown>,
+  orchDetails: Record<string, unknown>,
+): NormalizedLoraPair[] | undefined {
+  return (
+    normalizeLoraPairArray(params.loras)
+    ?? normalizeLegacyLoraRecord(params.additional_loras)
+    ?? normalizeLoraPairArray(orchDetails.loras)
+    ?? normalizeLegacyLoraRecord(orchDetails.additional_loras)
+  );
+}
+
+// =============================================================================
+// EXTRACT SETTINGS FROM PARAMS
+// =============================================================================
+
+/**
+ * Extract SegmentSettings from variant/generation params.
+ * Used to populate the form with settings from an existing generation.
+ *
+ * Handles multiple legacy formats:
+ * - Top-level fields (base_prompt, amount_of_motion, etc.)
+ * - Nested orchestrator_details
+ * - Legacy additional_loras (object format)
+ * - New loras (array format)
+ */
+export function extractSettingsFromParams(
+  params: Record<string, unknown>,
+  defaults?: Partial<SegmentSettings>
+): SegmentSettings {
+
+  // Handle nested orchestrator_details (common in task params)
+  const orchDetails = (params.orchestrator_details || {}) as Record<string, unknown>;
+
+  // Extract prompt: base_prompt > prompt > orchestrator > default
+  const prompt = (params.base_prompt ?? params.prompt ?? orchDetails.base_prompt ?? defaults?.prompt ?? '') as string;
+
+  // Extract negative prompt
+  const negativePrompt = (params.negative_prompt ?? orchDetails.negative_prompt ?? defaults?.negativePrompt ?? '') as string;
+
+  // Extract num_frames
+  const numFrames = (params.num_frames ?? orchDetails.num_frames ?? defaults?.numFrames ?? 25) as number;
+
+  // Extract seed/randomSeed
+  const randomSeed = (params.random_seed ?? orchDetails.random_seed ?? defaults?.randomSeed ?? true) as boolean;
+  const seed = (params.seed ?? orchDetails.seed ?? defaults?.seed) as number | undefined;
+
+  // Extract motion settings
+  const motionMode = (params.motion_mode ?? orchDetails.motion_mode ?? defaults?.motionMode ?? 'basic') as 'basic' | 'advanced';
+  const amountOfMotion = params.amount_of_motion != null
+    ? Math.round((params.amount_of_motion as number) * 100) // Convert 0-1 to 0-100
+    : (orchDetails.amount_of_motion != null
+        ? Math.round((orchDetails.amount_of_motion as number) * 100)
+        : (defaults?.amountOfMotion ?? 50));
+
+  // Extract phase config (only if advanced mode)
+  let phaseConfig: PhaseConfig | undefined = undefined;
+  if (motionMode === 'advanced') {
+    phaseConfig = (params.phase_config ?? orchDetails.phase_config ?? defaults?.phaseConfig) as PhaseConfig | undefined;
+    if (phaseConfig) {
+      phaseConfig = stripModeFromPhaseConfig(phaseConfig);
+    }
+  }
+
+  // Extract selected preset ID
+  const selectedPhasePresetId = (params.selected_phase_preset_id ?? orchDetails.selected_phase_preset_id ?? defaults?.selectedPhasePresetId ?? null) as string | null;
+  const modelName = (params.model_name ?? orchDetails.model_name) as string | undefined;
+  const selectedModel = defaults?.selectedModel ?? resolveSelectedModelFromModelName(modelName);
+  const inferenceSteps = (params.num_inference_steps ?? orchDetails.num_inference_steps ?? defaults?.inferenceSteps) as number | undefined;
+  const guidanceScale = (params.guidance_scale ?? orchDetails.guidance_scale ?? defaults?.guidanceScale) as number | undefined;
+  const smoothContinuations = (
+    params.continuation_config !== undefined
+    || (
+      params.chain_segments === true
+      && ((params.frame_overlap_from_previous as number | undefined) ?? 0) > 0
+    )
+  )
+    ? true
+    : defaults?.smoothContinuations;
+
+  const normalizedLoraParams = normalizeLoraParams(params, orchDetails);
+  const loras = normalizedLoraParams
+    ? pairLorasToArray(normalizedLoraParams)
+    : (defaults?.loras ?? []);
+
+  const normalizedTravelGuidance = normalizeTravelGuidance({
+    modelName,
+    travelGuidance: params.travel_guidance ?? orchDetails.travel_guidance,
+    structureGuidance: params.structure_guidance ?? orchDetails.structure_guidance,
+    structureVideos: params.structure_videos ?? orchDetails.structure_videos,
+    defaultVideoTreatment: defaults?.guidanceTreatment ?? 'adjust',
+    defaultUni3cEndPercent: defaults?.guidanceUni3cEndPercent ?? 0.1,
+  });
+  const guidanceControls = resolveTravelGuidanceControls(
+    normalizedTravelGuidance,
+    {
+      defaultMode: defaults?.guidanceMode,
+      defaultStrength: defaults?.guidanceStrength,
+      defaultUni3cEndPercent: defaults?.guidanceUni3cEndPercent,
+    },
+    modelName,
+  );
+  const guidanceTreatment = normalizedTravelGuidance?.kind !== 'none'
+    ? normalizedTravelGuidance?.videos?.[0]?.treatment
+    : undefined;
+
+  const result = {
+    prompt,
+    negativePrompt,
+    motionMode,
+    amountOfMotion,
+    phaseConfig,
+    selectedPhasePresetId,
+    loras,
+    numFrames,
+    randomSeed,
+    seed,
+    makePrimaryVariant: defaults?.makePrimaryVariant ?? false,
+    selectedModel,
+    inferenceSteps,
+    guidanceScale,
+    guidanceMode: guidanceControls.mode,
+    guidanceStrength: guidanceControls.strength,
+    guidanceTreatment: guidanceTreatment ?? defaults?.guidanceTreatment,
+    guidanceUni3cEndPercent: guidanceControls.uni3cEndPercent,
+    guidanceCannyIntensity: guidanceControls.cannyIntensity,
+    guidanceDepthContrast: guidanceControls.depthContrast,
+    smoothContinuations,
+  };
+
+  return result;
+}
+
+// =============================================================================
+// BUILD METADATA UPDATE
+// =============================================================================
+
+/**
+ * Settings to save to pair metadata.
+ * Convention:
+ *   undefined = don't touch this field
+ *   null = explicitly clear (for nullable fields)
+ *   '' = explicitly clear override (for string fields)
+ *   value = set the override
+ */
+interface PairSettingsToSave {
+  prompt?: string;
+  negativePrompt?: string;
+  textBeforePrompts?: string;
+  textAfterPrompts?: string;
+  motionMode?: 'basic' | 'advanced';
+  amountOfMotion?: number;
+  phaseConfig?: PhaseConfig | null; // null means clear
+  loras?: ActiveLora[];
+  // Video settings
+  numFrames?: number;
+  randomSeed?: boolean;
+  seed?: number;
+  // UI state
+  selectedPhasePresetId?: string | null;
+  selectedModel?: SegmentSettings['selectedModel'];
+  inferenceSteps?: number;
+  guidanceScale?: number;
+  guidanceMode?: TravelGuidanceMode;
+  guidanceStrength?: number;
+  guidanceTreatment?: 'adjust' | 'clip';
+  guidanceUni3cEndPercent?: number;
+  guidanceCannyIntensity?: number;
+  guidanceDepthContrast?: number;
+  smoothContinuations?: boolean;
+}
+
+type TextOverrideKey = 'prompt' | 'negativePrompt' | 'textBeforePrompts' | 'textAfterPrompts';
+
+function setTextOverride(
+  overrides: SegmentOverrides,
+  fieldsToClear: (keyof SegmentOverrides)[],
+  key: TextOverrideKey,
+  value: string | undefined
+): void {
+  if (value === undefined) return;
+  if (value === '') {
+    fieldsToClear.push(key);
+    return;
+  }
+  overrides[key] = value;
+}
+
+function setNullableOverride<K extends keyof SegmentOverrides>(
+  overrides: SegmentOverrides,
+  fieldsToClear: K[],
+  key: K,
+  value: SegmentOverrides[K] | null | undefined
+): void {
+  if (value === undefined) return;
+  if (value === null) {
+    fieldsToClear.push(key);
+    return;
+  }
+  overrides[key] = value;
+}
+
+function applyPairSettingsToOverrides(
+  settings: PairSettingsToSave,
+  overrides: SegmentOverrides,
+  fieldsToClear: (keyof SegmentOverrides)[]
+): void {
+  setTextOverride(overrides, fieldsToClear, 'prompt', settings.prompt);
+  setTextOverride(overrides, fieldsToClear, 'negativePrompt', settings.negativePrompt);
+  setTextOverride(overrides, fieldsToClear, 'textBeforePrompts', settings.textBeforePrompts);
+  setTextOverride(overrides, fieldsToClear, 'textAfterPrompts', settings.textAfterPrompts);
+
+  setNullableOverride(overrides, fieldsToClear, 'motionMode', settings.motionMode);
+  setNullableOverride(overrides, fieldsToClear, 'amountOfMotion', settings.amountOfMotion);
+
+  if (settings.phaseConfig !== undefined) {
+    if (settings.phaseConfig === null) {
+      fieldsToClear.push('phaseConfig');
+    } else {
+      overrides.phaseConfig = stripModeFromPhaseConfig(settings.phaseConfig);
+    }
+  }
+
+  if (settings.loras !== undefined) {
+    if (settings.loras === null) {
+      fieldsToClear.push('loras');
+    } else {
+      overrides.loras = settings.loras.map((l): LoraConfig => ({
+        id: l.id,
+        name: l.name,
+        path: l.path,
+        strength: l.strength,
+      }));
+    }
+  }
+
+  if (settings.randomSeed !== undefined) {
+    overrides.randomSeed = settings.randomSeed;
+  }
+  if (settings.seed !== undefined) {
+    overrides.seed = settings.seed;
+  }
+
+  setNullableOverride(overrides, fieldsToClear, 'selectedPhasePresetId', settings.selectedPhasePresetId);
+  setNullableOverride(overrides, fieldsToClear, 'selectedModel', settings.selectedModel);
+  setNullableOverride(overrides, fieldsToClear, 'inferenceSteps', settings.inferenceSteps);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceScale', settings.guidanceScale);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceMode', settings.guidanceMode);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceStrength', settings.guidanceStrength);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceTreatment', settings.guidanceTreatment);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceUni3cEndPercent', settings.guidanceUni3cEndPercent);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceCannyIntensity', settings.guidanceCannyIntensity);
+  setNullableOverride(overrides, fieldsToClear, 'guidanceDepthContrast', settings.guidanceDepthContrast);
+  setNullableOverride(overrides, fieldsToClear, 'smoothContinuations', settings.smoothContinuations);
+}
+
+function clearFields(
+  target: Record<string, unknown>,
+  fields: string[]
+): void {
+  fields.forEach((field) => {
+    delete target[field];
+  });
+}
+
+function cleanupLegacyPairMetadata(
+  metadata: Record<string, unknown>,
+  settings: PairSettingsToSave
+): void {
+  if (settings.prompt !== undefined) delete metadata.pair_prompt;
+  if (settings.negativePrompt !== undefined) delete metadata.pair_negative_prompt;
+  if (settings.motionMode !== undefined || settings.amountOfMotion !== undefined) {
+    delete metadata.pair_motion_settings;
+  }
+  if (settings.phaseConfig !== undefined) delete metadata.pair_phase_config;
+  if (settings.loras !== undefined) delete metadata.pair_loras;
+  if (settings.randomSeed !== undefined) delete metadata.pair_random_seed;
+  if (settings.seed !== undefined) delete metadata.pair_seed;
+  if (settings.selectedPhasePresetId !== undefined) delete metadata.pair_selected_phase_preset_id;
+}
+
+function cleanupLegacyUserOverrides(
+  metadata: Record<string, unknown>,
+  settings: PairSettingsToSave
+): void {
+  const userOverrides = metadata.user_overrides as Record<string, unknown> | undefined;
+  if (!userOverrides) return;
+
+  if (settings.motionMode !== undefined) delete userOverrides.motion_mode;
+  if (settings.amountOfMotion !== undefined) delete userOverrides.amount_of_motion;
+  if (settings.phaseConfig !== undefined) delete userOverrides.phase_config;
+  if (settings.loras !== undefined) delete userOverrides.additional_loras;
+
+  if (Object.keys(userOverrides).length === 0) {
+    delete metadata.user_overrides;
+  }
+}
+
+/**
+ * Build metadata update payload for saving pair settings.
+ *
+ * Writes to the new segmentOverrides format and cleans up old pair_* and
+ * legacy user_overrides fields from the metadata.
+ */
+export function buildMetadataUpdate(
+  currentMetadata: Record<string, unknown>,
+  settings: PairSettingsToSave
+): Record<string, unknown> {
+  const overrides: SegmentOverrides = {};
+  const fieldsToClear: (keyof SegmentOverrides)[] = [];
+  applyPairSettingsToOverrides(settings, overrides, fieldsToClear);
+
+  // Use writeSegmentOverrides to write to new format
+  const newMetadata = writeSegmentOverrides(currentMetadata, overrides);
+
+  // Access segmentOverrides as a mutable record for cleanup operations
+  const segOverrides = newMetadata.segmentOverrides as Record<string, unknown> | undefined;
+
+  // Handle explicit clear of phaseConfig (when switching to basic mode)
+  if (settings.phaseConfig === null && segOverrides) {
+    delete segOverrides.phaseConfig;
+    // Note: selectedPhasePresetId is handled independently via fieldsToClear.
+    // Don't cascade-delete it here — basic mode presets need to persist.
+  }
+
+  // Handle explicitly cleared fields ('' or null means remove override, use shot default)
+  if (fieldsToClear.length > 0 && segOverrides) {
+    clearFields(segOverrides, fieldsToClear as string[]);
+  }
+
+  cleanupLegacyPairMetadata(newMetadata, settings);
+  cleanupLegacyUserOverrides(newMetadata, settings);
+
+  return newMetadata;
+}

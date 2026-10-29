@@ -1,0 +1,88 @@
+/**
+ * ShotImagesEditor - Main editor for shot images in travel-between-images tool.
+ *
+ * Architecture:
+ * - Thin orchestration component
+ * - Dedicated hooks for data, mode orchestration, and action callbacks
+ * - Dedicated render sections for header, content, and overlays
+ */
+
+import React from 'react';
+import { Card } from '@/shared/components/ui/card';
+import { ASPECT_RATIO_TO_RESOLUTION } from '@/shared/lib/media/aspectRatios';
+import { useShotImagesEditorModel } from './hooks/useShotImagesEditorModel';
+import { useShotImagesEditorCallbacks } from './hooks/useShotImagesEditorCallbacks';
+import { EditorHeader } from './ShotImagesEditorHeader';
+import { EditorContent } from './ShotImagesEditorContent';
+import { EditorOverlays } from './ShotImagesEditorOverlays';
+import {
+  resolveShotImagesEditorProps,
+  type ShotImagesEditorProps,
+  type ShotImagesEditorResolvedProps,
+} from './types';
+
+const ShotImagesEditor: React.FC<ShotImagesEditorProps> = (props) => {
+  const resolvedProps: ShotImagesEditorResolvedProps = resolveShotImagesEditorProps(props);
+  const {
+    isMobile,
+    generationMode,
+    projectAspectRatio,
+    settingsError,
+    readOnly = false,
+    onGenerationModeChange,
+  } = resolvedProps;
+
+  const effectiveGenerationMode = isMobile ? 'batch' : generationMode;
+  const resolvedProjectResolution = projectAspectRatio
+    ? ASPECT_RATIO_TO_RESOLUTION[projectAspectRatio]
+    : undefined;
+
+  const { data, mode, timelineMediaValue } = useShotImagesEditorModel(
+    resolvedProps,
+    effectiveGenerationMode,
+    resolvedProjectResolution,
+  );
+
+  const callbacks = useShotImagesEditorCallbacks({
+    selectedShotId: resolvedProps.selectedShotId,
+    onImageDelete: resolvedProps.onImageDelete,
+    onAddToShot: resolvedProps.onAddToShot,
+    onAddToShotWithoutPosition: resolvedProps.onAddToShotWithoutPosition,
+    onCreateShot: resolvedProps.onCreateShot,
+    onDragStateChange: resolvedProps.onDragStateChange,
+    data,
+  });
+
+  return (
+    <Card className="w-full">
+      <EditorHeader
+        settingsError={settingsError ?? undefined}
+        readOnly={readOnly}
+        hasVideosToPreview={mode.preview.hasVideosToPreview}
+        isDownloadingImages={mode.download.isDownloadingImages}
+        hasImages={Boolean(data.imagesWithBadges?.length)}
+        isMobile={isMobile}
+        generationMode={generationMode}
+        onGenerationModeChange={onGenerationModeChange}
+        onOpenPreview={() => mode.preview.setIsPreviewTogetherOpen(true)}
+        onDownloadAll={mode.download.handleDownloadAllImages}
+      />
+
+      <EditorContent
+        componentProps={resolvedProps}
+        data={data}
+        mode={mode}
+        callbacks={callbacks}
+        timelineMediaValue={timelineMediaValue}
+      />
+
+      <EditorOverlays
+        componentProps={resolvedProps}
+        mode={mode}
+      />
+    </Card>
+  );
+};
+
+const ShotImagesEditorMemo = React.memo(ShotImagesEditor);
+export { ShotImagesEditorMemo as ShotImagesEditor };

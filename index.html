@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Favicon: the Astrid mink as crisp pixel-art SVG, with a PNG fallback, on the public site and in the app. -->
+    <link rel="icon" href="/astrid-favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/astrid-favicon-32.png" type="image/png" sizes="32x32" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <!-- Web App Manifest for PWA -->
+    <link rel="manifest" href="/manifest.json" />
+    <!-- Chrome offers the install once, as the page loads; the run-mode choice asks after the tour. Keep the offer for signals.ts. -->
+    <script>
+      window.addEventListener('beforeinstallprompt', function (event) { event.preventDefault(); window.__astridInstallPrompt = event; });
+    </script>
+
+    <!-- PWA Meta Tags -->
+    <!-- The page paper; the public pages and the app then keep it in step with their own background. -->
+    <meta name="theme-color" content="#f7f4ed" />
+    <!-- Deprecated tag removed to avoid console warnings -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Astrid" />
+    <link rel="apple-touch-icon" href="/astrid-apple-touch-icon.png" />
+
+    <meta name="author" content="Astrid" />
+
+    <!-- Title, description and the link-preview card (Open Graph, X), filled per page by
+         config/vite/shareMeta.ts from src/pages/Home/publicAstridShare.ts. -->
+    <!-- share-meta:start --><!-- share-meta:end -->
+
+    <!-- Boot layer: the page paper and ink (the last applied theme, cached by applyAppTheme while it
+         is under an hour old, otherwise worked out from the time of day) with Astrid's running mink,
+         a static copy of MinkRunner (same sprite, frames and cycle), until the page's first real
+         frame has painted (src/app/bootLayer.ts).
+         In: the mink fades in over 400ms, only after 300ms, so fast loads never see it.
+         Every boot animation is transform or opacity (the body wipe moves a masked layer and
+         counter-moves its content), so the compositor keeps it moving on a busy main thread.
+         Out, with a logo to land on (.boot-flying): the mink runs home to the header logo
+         (600ms), slowing to a stop, while its body dissolves from the bottom up so only its
+         head arrives, on the logo's head; then the two trade places (180ms). The paper
+         dissolves meanwhile (360ms).
+         Out onto the connecting panel (its MinkRunner, drawn at this size and marked
+         data-boot-mink-continue): the panel's mink takes over this one's stride and the layer is
+         removed at once, so the mark never dims or jumps.
+         Out otherwise (.boot-done): it runs on and fades (120ms) as the paper dissolves (260ms). -->
+    <script>
+      /* The paper and ink: the last applied theme while it is fresh (cached by applyAppTheme with the time it was
+         written); otherwise, the time of day, by the rule the app itself follows (useAppTheme: the sky's darkness
+         for this time zone's place, light before the page's mid-twilight switch and dark after it). A first visit at
+         night, or a theme cached by day and opened at night, then opens on dark paper, not cream. Keep the table and
+         the sums in step with publicAstridLocation.ts and publicAstridSkyRender.ts (bootTheme.test.ts checks them). */
+      (function () {
+        var FRESH_MS = 36e5;
+        var PAPER = { light: ['hsl(40 33% 97%)', 'hsl(32 14% 14%)'], dark: ['hsl(30 11% 7%)', 'hsl(40 30% 93%)'] };
+        var ZONES = 'Europe/London|51.51|-0.13,Europe/Dublin|53.35|-6.26,Europe/Lisbon|38.72|-9.14,Europe/Madrid|40.42|-3.7,Europe/Paris|48.86|2.35,Europe/Brussels|50.85|4.35,Europe/Amsterdam|52.37|4.9,Europe/Berlin|52.52|13.4,Europe/Zurich|47.38|8.54,Europe/Rome|41.9|12.5,Europe/Vienna|48.21|16.37,Europe/Prague|50.08|14.44,Europe/Warsaw|52.23|21.01,Europe/Copenhagen|55.68|12.57,Europe/Stockholm|59.33|18.07,Europe/Oslo|59.91|10.75,Europe/Helsinki|60.17|24.94,Europe/Athens|37.98|23.73,Europe/Bucharest|44.43|26.1,Europe/Istanbul|41.01|28.98,Europe/Kyiv|50.45|30.52,Europe/Kiev|50.45|30.52,Europe/Moscow|55.76|37.62,Atlantic/Reykjavik|64.15|-21.94,America/New_York|40.71|-74.01,America/Toronto|43.65|-79.38,America/Chicago|41.88|-87.63,America/Denver|39.74|-104.99,America/Phoenix|33.45|-112.07,America/Los_Angeles|34.05|-118.24,America/Vancouver|49.28|-123.12,America/Anchorage|61.22|-149.9,Pacific/Honolulu|21.31|-157.86,America/Halifax|44.65|-63.57,America/St_Johns|47.56|-52.71,America/Mexico_City|19.43|-99.13,America/Bogota|4.71|-74.07,America/Lima|-12.05|-77.04,America/Santiago|-33.45|-70.67,America/Sao_Paulo|-23.55|-46.63,America/Argentina/Buenos_Aires|-34.6|-58.38,America/Buenos_Aires|-34.6|-58.38,America/Caracas|10.48|-66.9,Africa/Lagos|6.52|3.38,Africa/Cairo|30.04|31.24,Africa/Nairobi|-1.29|36.82,Africa/Johannesburg|-26.2|28.05,Africa/Casablanca|33.57|-7.59,Africa/Accra|5.6|-0.19,Asia/Dubai|25.2|55.27,Asia/Tehran|35.69|51.39,Asia/Karachi|24.86|67.0,Asia/Kolkata|19.08|72.88,Asia/Calcutta|19.08|72.88,Asia/Dhaka|23.81|90.41,Asia/Bangkok|13.76|100.5,Asia/Jakarta|-6.21|106.85,Asia/Singapore|1.35|103.82,Asia/Kuala_Lumpur|3.14|101.69,Asia/Ho_Chi_Minh|10.82|106.63,Asia/Manila|14.6|120.98,Asia/Hong_Kong|22.32|114.17,Asia/Shanghai|31.23|121.47,Asia/Taipei|25.03|121.57,Asia/Seoul|37.57|126.98,Asia/Tokyo|35.68|139.69,Asia/Jerusalem|31.77|35.21,Asia/Riyadh|24.71|46.68,Asia/Tashkent|41.3|69.24,Asia/Kathmandu|27.72|85.32,Australia/Perth|-31.95|115.86,Australia/Adelaide|-34.93|138.6,Australia/Darwin|-12.46|130.84,Australia/Brisbane|-27.47|153.03,Australia/Sydney|-33.87|151.21,Australia/Melbourne|-37.81|144.96,Australia/Hobart|-42.88|147.33,Pacific/Auckland|-36.85|174.76,Pacific/Fiji|-18.14|178.44';
+        var SOUTHERN = /^(Australia|Antarctica)\/|^Pacific\/(Auckland|Chatham|Fiji|Tongatapu|Apia|Noumea|Efate|Port_Moresby)|^America\/(Argentina|Santiago|Sao_Paulo|Montevideo|Asuncion|La_Paz|Lima)|^Africa\/(Johannesburg|Maputo|Harare|Lusaka|Windhoek|Gaborone|Maseru|Mbabane|Luanda|Kinshasa|Dar_es_Salaam)|^Indian\/(Mauritius|Reunion|Antananarivo)/;
+        var clamp01 = function (v) { return Math.max(0, Math.min(1, v)); };
+        var wrap = function (v) { return ((v % 24) + 24) % 24; };
+        function utcOffsetHours(at, timeZone) {
+          try {
+            var parts = new Intl.DateTimeFormat('en-US', { timeZone: timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }).formatToParts(at);
+            var get = function (type) { for (var i = 0; i < parts.length; i++) if (parts[i].type === type) return Number(parts[i].value); return 0; };
+            var wall = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+            return Math.round((wall - Math.floor(at.getTime() / 1000) * 1000) / 60000) / 60;
+          } catch (error) { return -at.getTimezoneOffset() / 60; }
+        }
+        function place(timeZone, at) {
+          var rows = ZONES.split(',');
+          for (var i = 0; i < rows.length; i++) {
+            var f = rows[i].split('|');
+            if (f[0] === timeZone) return { lat: Number(f[1]), lon: Number(f[2]) };
+          }
+          return { lat: SOUTHERN.test(timeZone) ? -30 : 40, lon: utcOffsetHours(at, timeZone) * 15 };
+        }
+        /* How dark the sky is at `at` where this visitor's time zone puts them: publicAstridSkyRender skyDarknessAt. */
+        function skyDarkness(at) {
+          var timeZone;
+          try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (error) { timeZone = 'UTC'; }
+          var where = place(timeZone, at);
+          var offset = utcOffsetHours(at, timeZone);
+          var utc = at.getUTCHours() + at.getUTCMinutes() / 60 + at.getUTCSeconds() / 3600;
+          var hours = wrap(utc + offset);
+          var dayOfYear = Math.floor((at.getTime() - Date.UTC(at.getUTCFullYear(), 0, 1)) / 864e5) + 1;
+          var g = (2 * Math.PI / 365) * (dayOfYear - 1);
+          var equationOfTime = 229.18 * (0.000075 + 0.001868 * Math.cos(g) - 0.032077 * Math.sin(g) - 0.014615 * Math.cos(2 * g) - 0.040849 * Math.sin(2 * g));
+          var declination = 0.006918 - 0.399912 * Math.cos(g) + 0.070257 * Math.sin(g) - 0.006758 * Math.cos(2 * g) + 0.000907 * Math.sin(2 * g) - 0.002697 * Math.cos(3 * g) + 0.00148 * Math.sin(3 * g);
+          var latitude = where.lat * Math.PI / 180;
+          var noon = (720 - 4 * where.lon - equationOfTime) / 60 + offset;
+          var cosHourAngle = Math.cos(90.833 * Math.PI / 180) / (Math.cos(latitude) * Math.cos(declination)) - Math.tan(latitude) * Math.tan(declination);
+          var sunrise, sunset;
+          if (cosHourAngle >= 1) { sunrise = noon; sunset = noon; }
+          else if (cosHourAngle <= -1) { sunrise = noon - 12.01; sunset = noon + 12.01; }
+          else { var halfDay = Math.acos(cosHourAngle) * 180 / Math.PI / 15; sunrise = noon - halfDay; sunset = noon + halfDay; }
+          var day = hours > sunrise && hours < sunset;
+          var intoDay = day ? Math.min(hours - sunrise, sunset - hours) : -Math.min(wrap(hours - sunset), wrap(sunrise - hours));
+          return clamp01((0.75 - intoDay) / (0.75 + 1.9));
+        }
+        /* useAppTheme: the sky now, or at the clock time the person fixed. Dark from the page's mid-twilight on. */
+        function timeOfDayTheme(now) {
+          var at = now;
+          try {
+            var fixed = JSON.parse(localStorage.getItem('theme-hour') || 'null');
+            if (typeof fixed === 'number') at = new Date(new Date(now).setHours(0, 0, 0, 0) + Math.min(24, Math.max(0, fixed)) * 36e5);
+          } catch (error) { /* storage blocked: follow the sky */ }
+          var paper = PAPER[skyDarkness(at) < 0.46 ? 'light' : 'dark'];
+          return { background: paper[0], ink: paper[1] };
+        }
+        var theme = null;
+        try {
+          var cached = JSON.parse(localStorage.getItem('astrid:boot-theme') || 'null');
+          if (cached && cached.background && cached.ink && typeof cached.at === 'number' && Date.now() - cached.at < FRESH_MS) theme = cached;
+        } catch (error) { /* storage blocked: work it out */ }
+        try { if (!theme) theme = timeOfDayTheme(new Date()); } catch (error) { /* keep the default paper */ }
+        if (theme) {
+          document.documentElement.style.setProperty('--boot-background', theme.background);
+          document.documentElement.style.setProperty('--boot-ink', theme.ink);
+        }
+      })();
+    </script>
+    <style>
+      /* Shared loading-mink frame width, in CSS pixels at every display density. */
+      :root { --astrid-loading-mink-width: 90; }
+      body { margin: 0; background-color: var(--boot-background, #faf8f5); }
+      #boot {
+        position: fixed; inset: 0; z-index: 2147483647; pointer-events: none;
+        display: flex; align-items: center; justify-content: center; color: var(--boot-ink, #2b2724);
+      }
+      .boot-paper {
+        position: absolute; inset: 0; background-color: var(--boot-background, #faf8f5);
+        transition: opacity 260ms cubic-bezier(0.45, 0, 0.55, 1);
+      }
+      #boot.boot-done .boot-paper, #boot.boot-flying .boot-paper { opacity: 0; }
+      #boot.boot-flying .boot-paper { transition-duration: 360ms; }
+      /* MinkRunner (src/shared/components/MinkRunner): 11 frames of 81x44 at 770ms a cycle.
+         Share its 90 CSS-pixel frame width so the boot-to-panel handoff never changes size. */
+      .boot-mink {
+        --s: calc(var(--astrid-loading-mink-width, 90) / 81); position: relative; display: grid; justify-items: center; gap: calc(1px * var(--s));
+        animation: boot-mink-in 400ms ease-out 300ms backwards;
+        transition: opacity 120ms ease-out, transform 120ms ease-out;
+      }
+      /* A mink still waiting out its delay stays hidden (the paused animation holds its first frame). */
+      #boot.boot-done .boot-mink { opacity: 0; transform: translateX(calc(6px * var(--s))); animation-play-state: paused; }
+      #boot.boot-landed .boot-mink { opacity: 0; transition: opacity 180ms ease-out; }
+      .boot-mink-flight-y, .boot-mink-wipe, .boot-mink-unwipe { display: block; will-change: transform; }
+      .boot-mink-flight-x {
+        display: block; position: relative; will-change: transform;
+        width: calc(81px * var(--s)); height: calc(44px * var(--s));
+      }
+      /* The body wipe: a feathered edge at 30deg (mostly bottom to top) fixed to this padded
+         layer. bootLayer.ts moves the layer up the gradient and its content back down by the
+         same distance, so the edge sweeps up the mink while the mink stays put. The layer reaches
+         60 frame px past the frame on every side, so the content stays inside the mask; the stops
+         sit 40-50 frame px before the line's midpoint (121.26 for this box), just below the
+         frame's lowest corner. */
+      .boot-mink-wipe {
+        position: absolute; inset: calc(-60px * var(--s));
+        -webkit-mask-image: linear-gradient(30deg, transparent calc(71.26px * var(--s)), #000 calc(81.26px * var(--s)));
+        mask-image: linear-gradient(30deg, transparent calc(71.26px * var(--s)), #000 calc(81.26px * var(--s)));
+      }
+      .boot-mink-unwipe { position: absolute; left: calc(60px * var(--s)); top: calc(60px * var(--s)); }
+      .boot-mink-window { display: block; overflow: hidden; width: calc(81px * var(--s)); height: calc(44px * var(--s)); }
+      /* Two cycles long, so the run can ease to a stop a few frames on from any frame. */
+      .boot-mink-strip {
+        display: block; width: calc(1782px * var(--s)); height: 100%; image-rendering: pixelated; will-change: transform;
+        background: url('data:image/png;base64,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') 0 0 / calc(891px * var(--s)) 100% repeat-x;
+        animation: boot-mink-run 770ms steps(11) infinite;
+      }
+      .boot-mink-ground {
+        display: block; overflow: hidden; width: calc(81px * var(--s) * 1.6); height: calc(1px * var(--s));
+        -webkit-mask-image: linear-gradient(90deg, transparent, #000 30%, #000 70%, transparent);
+        mask-image: linear-gradient(90deg, transparent, #000 30%, #000 70%, transparent);
+        transition: opacity 160ms ease-out;
+      }
+      #boot.boot-flying .boot-mink-ground { opacity: 0; }
+      .boot-mink-ground > span {
+        display: block; width: calc(100% + 12px * var(--s)); height: 100%;
+        background: repeating-linear-gradient(90deg, color-mix(in srgb, currentColor 28%, transparent) 0 calc(4px * var(--s)), transparent calc(4px * var(--s)) calc(12px * var(--s)));
+        animation: boot-mink-ground 257ms linear infinite;
+      }
+      @keyframes boot-mink-in { from { opacity: 0; } }
+      @keyframes boot-mink-run { to { transform: translateX(calc(891px * var(--s) * -1)); } }
+      @keyframes boot-mink-ground { to { transform: translateX(calc(-12px * var(--s))); } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-paper, .boot-mink { transition: none; }
+        .boot-mink { animation-duration: 0ms; }
+        .boot-mink-strip, .boot-mink-ground > span { animation: none; }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="boot" aria-hidden="true"><div class="boot-paper"></div><div class="boot-mink"><span class="boot-mink-flight-y"><span class="boot-mink-flight-x"><span class="boot-mink-wipe"><span class="boot-mink-unwipe"><span class="boot-mink-window"><span class="boot-mink-strip"></span></span></span></span></span></span><span class="boot-mink-ground"><span></span></span></div></div>
+    <div id="root"></div>
+    <script type="module" src="/src/app/main.tsx"></script>
+    <script>
+      // Vite strips attributes (an id) from the built entry tag, so match it by being the module script.
+      // Resource load errors do not bubble, hence the capture phase.
+      window.addEventListener('error', function (event) {
+        var target = event.target;
+        if (!target || target.tagName !== 'SCRIPT' || target.type !== 'module') return;
+        var root = document.getElementById('root');
+        var boot = document.getElementById('boot');
+        if (boot) boot.remove();
+        var message = document.createElement('main');
+        var content = document.createElement('div');
+        var icon = document.createElement('img');
+        var title = document.createElement('h1');
+        var detail = document.createElement('p');
+        var link = document.createElement('a');
+        // Shown before the app's CSS loads: keep in step with showFailureCard in src/app/main.tsx
+        message.setAttribute('role', 'alert');
+        message.style.cssText = 'min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;text-align:center;color:var(--boot-ink,#2b2724);font-family:Inter,system-ui,-apple-system,sans-serif';
+        content.style.maxWidth = '420px';
+        icon.src = '/astrid-app-icon-192.png';
+        icon.alt = '';
+        icon.width = 76;
+        icon.height = 76;
+        icon.style.cssText = 'display:block;margin:0 auto';
+        title.textContent = 'Astrid could not load';
+        title.style.cssText = "margin:10px 0 4px;font:400 25px/1.2 Georgia,'Times New Roman',serif";
+        detail.textContent = 'Check your connection, then reload.';
+        detail.style.cssText = 'margin:0 0 16px;font-size:14px;line-height:24px;opacity:.72';
+        link.textContent = 'Reload';
+        link.href = window.location.href;
+        link.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 28px;border-radius:12px;background:var(--boot-ink,#2b2724);color:var(--boot-background,#faf8f5);font-size:14px;font-weight:500;text-decoration:none';
+        content.append(icon, title, detail, link);
+        message.append(content);
+        root.replaceChildren(message);
+      }, true);
+
+      if ('serviceWorker' in navigator) {
+        var appWorkerUrl = new URL('/sw.js', window.location.href).href;
+        navigator.serviceWorker.getRegistrations().then(function (registrations) {
+          return Promise.all(registrations.filter(function (registration) {
+            return [registration.active, registration.waiting, registration.installing]
+              .some(function (worker) { return worker && worker.scriptURL === appWorkerUrl; });
+          }).map(function (registration) { return registration.unregister(); }));
+        }).catch(function () {});
+      }
+      if ('caches' in window) {
+        caches.keys().then(function (names) {
+          return Promise.all(names.filter(function (name) { return name.indexOf('astrid-') === 0; })
+            .map(function (name) { return caches.delete(name); }));
+        }).catch(function () {});
+      }
+    </script>
+  </body>
+</html>

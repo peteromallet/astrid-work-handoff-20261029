@@ -1,0 +1,1693 @@
+{
+  "schemaVersion": 1,
+  "kind": "astrid-contract-composition",
+  "revision": "C1",
+  "issuedOn": "2026-09-23",
+  "status": "frozen-semantics-pending-ack",
+  "digest": "sha256:e74a88b718861d100e64c1212f1caa7f36ded5d280e44f5cb6d9a424412a8559",
+  "scope": {
+    "owner": "CF",
+    "consumers": [
+      "SL",
+      "EW"
+    ],
+    "runtimeAuthority": "workspace.v1",
+    "contributorAuthority": "Hivemind",
+    "implementationClaim": false,
+    "installedAcceptanceClaim": false,
+    "releaseCandidateRef": "release-candidate",
+    "consumerAckRefs": [
+      "sl-ack",
+      "ew-ack"
+    ]
+  },
+  "workspace": {
+    "count": 1,
+    "selection": "Create-or-Attach-during-setup",
+    "identity": "existing-stable-workspace-UUID-and-registered-absolute-root",
+    "repeat": "reuse-selected-identity-and-preserve-disabled-choices",
+    "cwdFallback": false,
+    "implicitSecondWorkspace": false,
+    "expertOverride": "preservation-only-same-UUID-no-default-change",
+    "localDisplay": [
+      "workspace UUID",
+      "absolute root",
+      "selection source"
+    ],
+    "sharedDisplay": "redacted-root-reference",
+    "physicalInventoryRef": "workspace-inventory",
+    "preservationRef": "preservation-preflight",
+    "authorityEvidenceRefs": [
+      "storage-root",
+      "runtime-bootstrap",
+      "runtime-paths"
+    ],
+    "rootPolicy": "Fresh packaged Create defaults to the existing Astrid ${HOME}/.astrid-data support root. Attach preserves the catalog UUID and registered absolute realm root without copying; existing source checkout .astrid-data or explicit absolute ASTRID_RUNTIME_DATA_ROOT is resolved through storage_root and recorded once. Persist that sole support root and selected_realm_id/realm.data_root; workspace UUID is not project_id or local-user. Never fall through to neutral launcher Application Support default or cwd. Actual UUID/root inventory remains unresolved."
+  },
+  "auth": {
+    "contexts": [
+      {
+        "id": "local-app-local-workspace",
+        "session": "existing-local-bridge",
+        "discordRequired": false,
+        "contributorLoginRequired": false,
+        "actionGrants": [
+          "local-workspace-scopes"
+        ]
+      },
+      {
+        "id": "hosted-app-hosted-workspace",
+        "session": "backend-verified-discord",
+        "discordRequired": true,
+        "contributorLoginRequired": false,
+        "actionGrants": [
+          "workspace-membership-and-action"
+        ]
+      },
+      {
+        "id": "local-app-hosted-workspace",
+        "session": "backend-verified-discord",
+        "discordRequired": true,
+        "contributorLoginRequired": false,
+        "actionGrants": [
+          "workspace-membership-and-action",
+          "explicit-pairing-and-action"
+        ]
+      },
+      {
+        "id": "hosted-browser-local-connector",
+        "session": "backend-verified-discord",
+        "discordRequired": true,
+        "contributorLoginRequired": false,
+        "actionGrants": [
+          "explicit-pairing-and-action",
+          "local-workspace-scopes"
+        ]
+      }
+    ],
+    "contribution": {
+      "canonicalNamespace": "astrid auth",
+      "triggers": [
+        "explicit-knowledge-write",
+        "explicit-auth-management"
+      ],
+      "anonymousReads": [
+        "search",
+        "get-item",
+        "media-refresh"
+      ],
+      "writeConsent": "explicit-material-attribution-and-capability-consent",
+      "identity": "same-Hivemind-canonical-contributor-through-verified-link",
+      "rawKeySharing": false,
+      "localPresenceIsVerification": false,
+      "editorPermission": "existing-server-role-separate-from-write-consent",
+      "helperAcquisition": "explicit-login-only-disclosed-scoped-existing-helper",
+      "wireRef": "hosted-auth-protocol"
+    },
+    "independentAuthorities": [
+      "local-session",
+      "hosted-session",
+      "workspace-grant",
+      "connector-grant",
+      "contributor-write-consent",
+      "execution-provider-authorization"
+    ],
+    "nonImplications": [
+      "Discord login does not grant workspace membership, pairing, process control, Runtime secrets, contribution writes or spend.",
+      "Contributor identity/key grants no workspace access, generation, spend or local process authority.",
+      "Public knowledge reads are anonymous at Hivemind; accessing them inside the hosted app still requires its hosted session."
+    ],
+    "modeTransitions": {
+      "revalidateDestination": true,
+      "isolateSessionAndCaches": true,
+      "preserveLocalDefault": true,
+      "hostedFailureGatesLocal": false
+    },
+    "failurePolicy": [
+      "Absent, expired, revoked or stale hosted session denies protected requests and streams; exact lifetimes/freshness belong to hosted-auth-protocol.",
+      "Unverified, conflicting, legacy claim_pending or unavailable contributor mapping denies linked writes; never silently create, merge or rotate identities.",
+      "Contribution cancellation preserves ordinary local work and any valid hosted session.",
+      "Logout, local logout/revoke, hosted unlink/revoke, connector unpair and all-device revocation remain distinct scoped actions.",
+      "Session expiry/logout does not cancel admitted tasks or prove remote execution/billing stopped."
+    ],
+    "secretCustody": "no-contributor-key-Runtime-credential-or-OAuth-secret-in-browser-logs-prompts-URLs-or-diagnostics",
+    "evidenceRefs": [
+      "local-session",
+      "local-auth-gate",
+      "paired-registry",
+      "runtime-proxy",
+      "astrid-auth",
+      "hivemind-contract"
+    ]
+  },
+  "effects": [
+    "observe",
+    "configure-install",
+    "start-stop-local-service",
+    "interrupt-work",
+    "may-spend-money",
+    "write-relocate-change-data",
+    "share-diagnostics"
+  ],
+  "commands": [
+    {
+      "id": "agent",
+      "surface": "astrid | astrid agent",
+      "current": "Existing named agent; bare invocation must use the sole selected workspace after setup. Provider-backed agent interaction may spend under existing OMP authorization; tools retain their own scoped effects.",
+      "effects": [
+        "observe",
+        "may-spend-money"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "astrid-agent"
+      ]
+    },
+    {
+      "id": "setup-preview",
+      "surface": "astrid setup",
+      "current": "Compose existing python -m astrid.setup; default preview only, no agent prompt fallback.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "astrid-agent"
+      ]
+    },
+    {
+      "id": "setup-check",
+      "surface": "astrid setup --check [--offline]",
+      "current": "Read-only check of existing selection and readiness; offline forbids network.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "astrid-agent"
+      ]
+    },
+    {
+      "id": "setup-apply",
+      "surface": "astrid setup --apply [--offline]",
+      "current": "Apply reviewed Create/Attach and composition choices, then visibly start local Runtime. Interactive/noninteractive consume the same explicit input document.",
+      "effects": [
+        "configure-install",
+        "write-relocate-change-data",
+        "start-stop-local-service"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "astrid-agent"
+      ]
+    },
+    {
+      "id": "help",
+      "surface": "astrid --help | astrid help",
+      "current": "Wrapper help and gateway help currently differ; one command/effect census with family drill-down.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "astrid-agent"
+      ]
+    },
+    {
+      "id": "workspace-status",
+      "surface": "astrid status [--json]",
+      "current": "Currently contributor status alias; reassign only at atomic namespace transition.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "EW",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "astrid-agent"
+      ]
+    },
+    {
+      "id": "auth-status",
+      "surface": "astrid auth status",
+      "current": "Existing Hivemind helper status; no provisioning/start, redacted local presence separate from verification.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "astrid-auth"
+      ]
+    },
+    {
+      "id": "auth-login",
+      "surface": "astrid auth login",
+      "current": "Existing helper login; explicit auth-management request can disclose scoped helper acquisition. Current missing-helper acquisition may provision all configured sources; SL must narrow to disclosed helper acquisition.",
+      "effects": [
+        "configure-install",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "astrid-auth"
+      ]
+    },
+    {
+      "id": "auth-logout",
+      "surface": "astrid auth logout",
+      "current": "Delete only configured local key.",
+      "effects": [
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing",
+      "evidenceRefs": [
+        "astrid-auth"
+      ]
+    },
+    {
+      "id": "auth-revoke",
+      "surface": "astrid auth revoke",
+      "current": "Revoke configured key through Hivemind; not all devices or identity deletion.",
+      "effects": [
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing",
+      "evidenceRefs": [
+        "astrid-auth"
+      ]
+    },
+    {
+      "id": "runtime-up",
+      "surface": "astrid-runtime up",
+      "current": "Resolve sole selected support root; validate catalog selected_realm_id and registered realm.data_root before dispatch, then astrid-runtime up --profile astrid --data-root <absolute-support-root> --json; verify returned UUID/root. No expected-UUID CLI flag exists. Retry never reruns Create or retries a task.",
+      "effects": [
+        "start-stop-local-service",
+        "configure-install",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap",
+        "storage-root"
+      ]
+    },
+    {
+      "id": "runtime-status",
+      "surface": "astrid-runtime status",
+      "current": "Existing astrid-runtime status; selected identity only.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "runtime-cli",
+        "astrid-client",
+        "runtime-autobootstrap"
+      ]
+    },
+    {
+      "id": "doctor",
+      "surface": "astrid-runtime doctor [--json] | astrid doctor [--json]",
+      "current": "Compose existing astrid-runtime doctor and non-starting observer facts. Existing astrid doctor may auto-start Runtime; its non-starting replacement is an EW/SL obligation, not proof from start_pack_host=False.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "EW",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "runtime-cli",
+        "astrid-client",
+        "runtime-autobootstrap"
+      ]
+    },
+    {
+      "id": "runtime-restart",
+      "surface": "astrid-runtime restart",
+      "current": "Existing astrid-runtime restart; refuse active or unreconciled work unless scoped interruption is authorized.",
+      "effects": [
+        "start-stop-local-service",
+        "interrupt-work",
+        "configure-install",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "runtime-cli",
+        "astrid-client",
+        "runtime-autobootstrap"
+      ]
+    },
+    {
+      "id": "runtime-down",
+      "surface": "astrid-runtime down",
+      "current": "Reserved proposed stop spelling; no claim that public astrid-runtime down ships.",
+      "effects": [
+        "start-stop-local-service",
+        "interrupt-work"
+      ],
+      "owner": "SL",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "runtime-cli",
+        "astrid-client",
+        "runtime-autobootstrap"
+      ]
+    },
+    {
+      "id": "task-inspect",
+      "surface": "astrid tasks | astrid runs",
+      "current": "Reuse existing tasks/runs list/show/events/follow and run --evidence JSON. Current gateway can auto-start Runtime. Cursor/limit exposure, bounded logs and attempt history need EW work; preserve unavailable facts instead of inventing records.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "EW",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "tasks-cli",
+        "runs-cli",
+        "runtime-event",
+        "astrid-client"
+      ]
+    },
+    {
+      "id": "task-cancel",
+      "surface": "astrid tasks cancel <task_id> --project <project_id> --idempotency-key <key> --json",
+      "current": "Reuse existing Runtime cancel/fence/settlement; request is not proof of remote stop.",
+      "effects": [
+        "interrupt-work",
+        "write-relocate-change-data"
+      ],
+      "owner": "EW",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "tasks-cli",
+        "runtime-task"
+      ]
+    },
+    {
+      "id": "task-retry",
+      "surface": "astrid tasks retry <task_id> --project <project_id> --idempotency-key <key> --json",
+      "current": "Existing explicit retry with project and idempotency key; reconcile admission first, require scope for new attempt/spend. Never an observation alias.",
+      "effects": [
+        "may-spend-money",
+        "write-relocate-change-data"
+      ],
+      "owner": "EW",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "tasks-cli",
+        "runtime-task"
+      ]
+    },
+    {
+      "id": "diagnostic-bundle",
+      "surface": "astrid-runtime doctor --bundle <output-path>",
+      "current": "Explicit bounded redacted artifact collection; does not upload, repair, provision or start.",
+      "effects": [
+        "observe",
+        "write-relocate-change-data"
+      ],
+      "owner": "EW",
+      "implementation": "proposed",
+      "evidenceRefs": [
+        "runtime-cli",
+        "astrid-client",
+        "runtime-autobootstrap"
+      ]
+    },
+    {
+      "id": "run-retry",
+      "surface": "astrid runs retry <run_id> --project <project_id> [--task <task_id> ...] --idempotency-key <key> --json",
+      "current": "Existing explicit selected-task or run retry; distinguish same-key admission reconciliation from new execution.",
+      "effects": [
+        "may-spend-money",
+        "write-relocate-change-data"
+      ],
+      "owner": "EW",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "runs-cli",
+        "runtime-run"
+      ]
+    },
+    {
+      "id": "runtime-connect",
+      "surface": "astrid-runtime connect --profile astrid --data-root <absolute-support-root> --json",
+      "current": "Existing connect may provision a connection credential/select a realm; never classify as pure observation.",
+      "effects": [
+        "configure-install",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap"
+      ]
+    },
+    {
+      "id": "task-create",
+      "surface": "astrid tasks create --project <project_id> --capability <capability> --spec <json> --execution-request <json> --idempotency-key <key> --json",
+      "current": "Existing durable admission. Required selected execution binding and action/spend scope; same-key reconciliation never creates new work.",
+      "effects": [
+        "may-spend-money",
+        "write-relocate-change-data"
+      ],
+      "owner": "EW",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "tasks-cli"
+      ]
+    },
+    {
+      "id": "backup",
+      "surface": "astrid-runtime backup --data-root <absolute-support-root> --destination <backup-path> --json",
+      "current": "Existing explicit backup. Artifact creation is not verified restore or permission to move actual data.",
+      "effects": [
+        "observe",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap"
+      ]
+    },
+    {
+      "id": "restore",
+      "surface": "astrid-runtime restore <backup-path> --data-root <absolute-support-root> --destination <inactive-root> --json",
+      "current": "Existing restore to inactive destination; CF-reviewed preflight and scoped authorization required before actual workspace mutation.",
+      "effects": [
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap"
+      ]
+    },
+    {
+      "id": "relocate-preview",
+      "surface": "astrid-runtime relocate --profile astrid --data-root <absolute-support-root> --destination <destination-root> --plan --json",
+      "current": "Existing read-only relocation plan; no implicit root change.",
+      "effects": [
+        "observe"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap"
+      ]
+    },
+    {
+      "id": "relocate",
+      "surface": "astrid-runtime relocate --profile astrid --data-root <absolute-support-root> --destination <destination-root> --confirm \"RELOCATE <workspace-uuid>\" --json",
+      "current": "Existing explicit cutover path; preserve UUID, require preflight review and scoped authorization; record final disposition.",
+      "effects": [
+        "configure-install",
+        "start-stop-local-service",
+        "interrupt-work",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap"
+      ]
+    },
+    {
+      "id": "recovery",
+      "surface": "astrid-runtime recovery --data-root <absolute-support-root> --expected-realm-id <workspace-uuid> --expected-version <version> --confirm \"RECOVER <workspace-uuid>\" --json",
+      "current": "Existing selected-realm recovery; explicit identity/version and scoped authorization. Not a universal repair or paid/task retry.",
+      "effects": [
+        "interrupt-work",
+        "write-relocate-change-data"
+      ],
+      "owner": "SL",
+      "implementation": "existing-with-contract-gap",
+      "evidenceRefs": [
+        "runtime-cli",
+        "runtime-bootstrap"
+      ]
+    }
+  ],
+  "dispatch": {
+    "reservedBeforePromptAndPacks": [
+      "setup",
+      "status",
+      "auth",
+      "help",
+      "agent",
+      "login",
+      "logout",
+      "revoke",
+      "--help",
+      "--version"
+    ],
+    "profileNamespaces": {
+      "omp": "OMP provider/auth profile",
+      "runtime": "astrid-runtime --profile astrid bootstrap composition",
+      "execution": "explicit existing target/execution profile"
+    },
+    "dynamicCollisionPolicy": "reject-or-namespace-conflicts-before-dispatch-no-contextual-multiplexing",
+    "workerControlsRef": "worker-control-mapping"
+  },
+  "migrations": [
+    {
+      "id": "auth-aliases",
+      "old": "astrid login/logout/revoke",
+      "oldMeaning": "Hivemind contributor auth",
+      "new": "astrid auth login/logout/revoke",
+      "newMeaning": "Same contributor auth authority",
+      "compatibilityInterval": "Retain deprecated aliases through the first SL release consuming C1 and its next minor release.",
+      "removalCondition": "Remove only after two release notes and updated guides, agent notices, helper errors and help; never earlier than the following minor release.",
+      "implementation": "pending-SL"
+    },
+    {
+      "id": "status-namespace",
+      "old": "astrid status",
+      "oldMeaning": "Hivemind contributor status",
+      "new": "astrid auth status; astrid status",
+      "newMeaning": "Contributor status stays namespaced; top-level status always workspace/Runtime/readiness.",
+      "compatibilityInterval": "Before namespace transition top-level retains old meaning. At the first SL C1 release transition, no contributor alias remains on status.",
+      "removalCondition": "Switch parser, notices, errors, guides and help atomically; test all dispatch layers and link to astrid auth status.",
+      "implementation": "pending-SL"
+    },
+    {
+      "id": "setup-route",
+      "old": "python -m astrid.setup",
+      "oldMeaning": "Existing source/skill setup",
+      "new": "astrid setup",
+      "newMeaning": "Composed workspace/setup/lifecycle entry",
+      "compatibilityInterval": "Keep module entry as its existing lower-level interface; no removal in A-M1.",
+      "removalCondition": "None; composed entry must not silently replace lower-level semantics.",
+      "implementation": "pending-SL"
+    },
+    {
+      "id": "runtime-wrapper",
+      "old": "astrid-runtime up/connect/status/doctor/restart",
+      "oldMeaning": "Existing Runtime operator lifecycle",
+      "new": "astrid-runtime up/status/doctor/restart/down",
+      "newMeaning": "Selected-workspace facade; down is a new reserved contract",
+      "compatibilityInterval": "Keep existing astrid-runtime operator commands throughout A-M1; no removal planned.",
+      "removalCondition": "None; up maps existing profile/root, while new safety and down behavior require SL proof.",
+      "implementation": "pending-SL"
+    },
+    {
+      "id": "help-census",
+      "old": "astrid --help; astrid help",
+      "oldMeaning": "Separate wrapper/gateway help",
+      "new": "astrid --help; astrid help",
+      "newMeaning": "Coherent reserved command/effect census",
+      "compatibilityInterval": "Both spellings remain indefinitely.",
+      "removalCondition": "None; unify discovery without launching Runtime/agent.",
+      "implementation": "pending-SL"
+    },
+    {
+      "id": "doctor-observation",
+      "old": "astrid doctor",
+      "oldMeaning": "Existing product diagnosis via potentially auto-starting client",
+      "new": "astrid-runtime doctor; astrid doctor",
+      "newMeaning": "Same non-starting bounded diagnostic projection over existing Runtime facts",
+      "compatibilityInterval": "Retain astrid doctor as an alias through A-M1; both spellings must have the same non-starting effects at transition.",
+      "removalCondition": "No removal planned; EW composes public doctor and SL supplies the observer.",
+      "implementation": "pending-SL"
+    }
+  ],
+  "setup": {
+    "previewByDefault": true,
+    "checkStartsProcesses": false,
+    "offlineMeans": "no-network-acquisition-not-no-local-writes",
+    "applyStages": [
+      "inspect",
+      "Create-or-Attach",
+      "select-default",
+      "compose",
+      "Setup applied",
+      "Starting Astrid Runtime",
+      "Runtime ready"
+    ],
+    "automaticRuntimeStart": true,
+    "reconcileRunningRuntime": true,
+    "startupFailure": "workspace-configured-runtime-not-ready",
+    "retryCommandId": "runtime-up",
+    "resumePolicy": "reconcile-completed-stages-preserve-UUID-root-choices-no-silent-upgrade",
+    "inputRef": "setup-delivery"
+  },
+  "execution": {
+    "authority": "existing-Runtime-admission-attempt-event-settlement",
+    "wireEvidenceRef": "runtime-contract",
+    "sameKeyRetry": "reconcile-identical-authorized-request-no-new-attempt-or-target",
+    "newAttempt": "explicit-task-retry-after-reconciliation-with-action-and-spend-scope",
+    "dispatch": "selected-capability-target-credentials-and-spend-checked-at-admission-and-dispatch",
+    "engineReceivesRuntimeCredentials": false,
+    "activeTaskLifecycle": "refuse-active-or-unreconciled-work-unless-scoped-interruption-authorized",
+    "processOwnership": "verify-process-and-workspace-identity-never-port-only",
+    "remoteUncertaintySurvivesRestart": true,
+    "stopImpliesRemoteSettlement": false,
+    "workerRelaunchIsTaskRetry": false,
+    "replacementIsRelaunch": false,
+    "deliveryRef": "execution-delivery",
+    "wireFields": {
+      "taskStates": [
+        "queued",
+        "ready",
+        "running",
+        "succeeded",
+        "failed",
+        "cancel_requested",
+        "cancelled",
+        "retrying"
+      ],
+      "runStates": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "attemptFence": [
+        "attempt_id",
+        "task_id",
+        "project_id",
+        "lease_id",
+        "fence",
+        "lease_expires_at",
+        "runtime_epoch",
+        "input_object_ids"
+      ],
+      "events": [
+        "event_id",
+        "sequence",
+        "cursor",
+        "event_type",
+        "aggregate_type",
+        "aggregate_id",
+        "payload",
+        "occurred_at"
+      ],
+      "productEnvelope": [
+        "ok",
+        "data",
+        "error",
+        "receipt",
+        "idempotency_key"
+      ]
+    },
+    "wireRules": [
+      "Handshake before non-health operations; state-changing calls require idempotency keys and applicable version/CAS preconditions.",
+      "Changed request with same key conflicts. Preserve task succeeded versus run completed; cancel_requested is not terminal.",
+      "Runtime owns queue, fencing, reconnect, cancellation and settlement; no new drain subsystem. Stale attempt cannot settle; interrupted or lost contact remains uncertain until reconciled.",
+      "Remote target lifecycle terminate/keep_warm/leave_running is separate from local Runtime process lifecycle."
+    ]
+  },
+  "states": {
+    "independentFacts": {
+      "installed": "artifact present",
+      "enabled": "selected for use",
+      "connected": "identity-verified contact",
+      "ready": "selected capability prerequisites met",
+      "authorized": "action and cost scope permitted",
+      "queued": "durably admitted by Runtime",
+      "running": "current-attempt execution",
+      "contact": "last identity-verified observation and freshness",
+      "progress": "current attempt progress, not connectivity",
+      "terminal": "authoritative result/settlement",
+      "providerUncertainty": "remote execution or billing cannot yet be established"
+    },
+    "readinessDimensions": [
+      "workspace",
+      "runtime",
+      "compute-worker",
+      "selected-capability",
+      "optional-contribution-auth",
+      "hosted-session-and-grants"
+    ],
+    "contributorAuth": [
+      "helper-missing",
+      "no-local-key",
+      "local-present-unverified",
+      "verified-active",
+      "expired-or-revoked",
+      "unavailable"
+    ],
+    "problemCodes": [
+      "workspace_missing",
+      "workspace_ambiguous",
+      "workspace_identity_mismatch",
+      "workspace_configured_runtime_not_ready",
+      "runtime_unavailable",
+      "runtime_identity_mismatch",
+      "active_work_requires_authorization",
+      "capability_unavailable",
+      "authorization_required",
+      "provider_state_unknown",
+      "observation_stale",
+      "hosted_session_required",
+      "contributor_link_unavailable"
+    ],
+    "wireMapping": "Preserve existing Runtime raw task/run/attempt states and receipts; normalized facts never overwrite or infer terminal outcomes."
+  },
+  "observation": {
+    "nonMutating": true,
+    "provisioning": false,
+    "startsProcesses": false,
+    "defaultLimits": {
+      "timeoutMs": 5000,
+      "maxEvents": 200,
+      "maxLogBytes": 65536,
+      "maxBundleBytes": 1048576
+    },
+    "requiredFields": [
+      "schemaVersion",
+      "contractRevision",
+      "contractDigest",
+      "collectedAt",
+      "versions",
+      "workspaceRef",
+      "taskRef",
+      "runRef",
+      "attemptRef",
+      "targetRef",
+      "problemCode",
+      "failureBoundary",
+      "stillWorks",
+      "lastContactAt",
+      "progress",
+      "uncertainty",
+      "limits",
+      "truncated",
+      "nextActions",
+      "freshness",
+      "terminalResult",
+      "redacted",
+      "unavailableReasons",
+      "rawRuntimeCode"
+    ],
+    "referencePolicy": "Unavailable references are null with an explicit unavailable reason; never fabricate task/attempt IDs.",
+    "nextActionFields": [
+      "commandId",
+      "arguments",
+      "effects",
+      "authorizationRequired"
+    ],
+    "nextActionPolicy": "Effects must match command contract; read-only reconciliation cannot authorize new attempts, targets, spend or paid fallback.",
+    "sharedRedaction": [
+      "secrets",
+      "tokens",
+      "credential-values",
+      "private-absolute-paths",
+      "environment-values",
+      "prompt-content",
+      "signed-media-URLs"
+    ],
+    "localPaths": "available-only-in-local-inspection",
+    "bundlePolicy": "explicit artifact writes only; sharing is separately authorized, never automatic",
+    "observerRef": "observer-delivery",
+    "nonStartingProofCases": [
+      "uninstalled",
+      "no-catalog",
+      "stopped-runtime",
+      "stale-or-mismatched-process",
+      "wrong-workspace-UUID",
+      "no-GPU",
+      "denied-scope",
+      "offline",
+      "active-or-uncertain-task"
+    ],
+    "problemCodePolicy": "These normalized diagnostic codes do not replace Runtime error codes; retain raw Runtime code and failure boundary. Unknown progress/terminal/freshness stays unknown.",
+    "schemaPath": "scripts/quality/lib/astrid-contract-schema.mjs#diagnosticSchema",
+    "processPolicy": "No Runtime, Worker, engine or provider starts. Bounded read-only observer/helper subprocesses are permitted; no bootstrap, provisioning or state writes."
+  },
+  "composition": {
+    "selection": {
+      "capability": "vibecomfy.run",
+      "engine": "VibeComfy/ComfyUI",
+      "engineProfile": "pip_embedded",
+      "localPlatform": "macOS",
+      "workerPlatform": "Linux/CUDA",
+      "targetKind": "runpod",
+      "capabilityProfile": "astrid-beta-current-mac",
+      "runtimeProfile": "astrid",
+      "executionTargetRef": "execution-target",
+      "workerArtifactRef": "execution-delivery",
+      "dependencyClosureRef": "dependency-closure",
+      "evidenceRefs": [
+        "pack-vibecomfy",
+        "engine-profile",
+        "execution-request",
+        "capability-profile",
+        "generic-pack-host"
+      ],
+      "qualification": "not-executed",
+      "rationale": "Choose an existing GPU execution path through GenericPackHost. pip_embedded is the run executor path without a checkout-server session; EW must prove profile enforcement. Concrete worker architecture/image/models and pod/account binding are unresolved, never personal sample defaults."
+    },
+    "declaredEngineRevision": {
+      "revision": "a6a0cdb493c2f8bea4115740b96ec4c118af7ad1",
+      "evidenceRefs": [
+        "engine-dependency",
+        "engine-requirements"
+      ],
+      "publicationRef": "engine-publication"
+    },
+    "shippedPacks": [
+      {
+        "id": "blender",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/blender/skill/SKILL.md",
+        "evidenceRef": "pack-blender"
+      },
+      {
+        "id": "comfy_wrap",
+        "status": "active",
+        "stability": "experimental",
+        "support": "core",
+        "skillPath": "astrid/packs/comfy_wrap/skill/SKILL.md",
+        "evidenceRef": "pack-comfy_wrap"
+      },
+      {
+        "id": "editorial",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/editorial/skill/SKILL.md",
+        "evidenceRef": "pack-editorial"
+      },
+      {
+        "id": "fal",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/fal/skill/SKILL.md",
+        "evidenceRef": "pack-fal"
+      },
+      {
+        "id": "foley",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/foley/skill/SKILL.md",
+        "evidenceRef": "pack-foley"
+      },
+      {
+        "id": "generation",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/generation/skill/SKILL.md",
+        "evidenceRef": "pack-generation"
+      },
+      {
+        "id": "iteration",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/iteration/skill/SKILL.md",
+        "evidenceRef": "pack-iteration"
+      },
+      {
+        "id": "media",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/media/skill/SKILL.md",
+        "evidenceRef": "pack-media"
+      },
+      {
+        "id": "moirae",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/moirae/skill/SKILL.md",
+        "evidenceRef": "pack-moirae"
+      },
+      {
+        "id": "rendering",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/rendering/skill/SKILL.md",
+        "evidenceRef": "pack-rendering"
+      },
+      {
+        "id": "runpod",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/runpod/skill/SKILL.md",
+        "evidenceRef": "pack-runpod"
+      },
+      {
+        "id": "stream_content",
+        "status": "active",
+        "stability": "experimental",
+        "support": "core",
+        "skillPath": "astrid/packs/stream_content/skill/SKILL.md",
+        "evidenceRef": "pack-stream_content"
+      },
+      {
+        "id": "training",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/training/skill/SKILL.md",
+        "evidenceRef": "pack-training"
+      },
+      {
+        "id": "typed_timeline",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/typed_timeline/skill/SKILL.md",
+        "evidenceRef": "pack-typed_timeline"
+      },
+      {
+        "id": "understanding",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/understanding/skill/SKILL.md",
+        "evidenceRef": "pack-understanding"
+      },
+      {
+        "id": "vibecomfy",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/vibecomfy/skill/SKILL.md",
+        "evidenceRef": "pack-vibecomfy"
+      },
+      {
+        "id": "video_editing",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/video_editing/skill/SKILL.md",
+        "evidenceRef": "pack-video_editing"
+      },
+      {
+        "id": "wan2gp",
+        "status": "active",
+        "stability": "experimental",
+        "support": "core",
+        "skillPath": "astrid/packs/wan2gp/skill/SKILL.md",
+        "evidenceRef": "pack-wan2gp"
+      },
+      {
+        "id": "youtube",
+        "status": "active",
+        "stability": "stable",
+        "support": "core",
+        "skillPath": "astrid/packs/youtube/skill/SKILL.md",
+        "evidenceRef": "pack-youtube"
+      }
+    ],
+    "defaultSkills": [
+      "_core",
+      "hivemind",
+      "vibecomfy",
+      "rendering",
+      "typed_timeline",
+      "video_editing"
+    ],
+    "defaultSkillPolicy": "C1 explicitly selects existing core, sole managed default source, chosen execution and shipped stable timeline skill views subject to candidate compatibility qualification through existing setup selection. Shipped availability is broader than this harness skill list. Hivemind is enabled only after admitted acquisition; no new pack manager or manifest install_tier field.",
+    "externalSources": [
+      {
+        "id": "hivemind",
+        "default": true,
+        "revision": "a4c6610cba1032adb3b4bec541ccf821afba6ba8",
+        "evidenceRefs": [
+          "default-sources",
+          "hivemind-contract"
+        ],
+        "publicationRef": "hivemind-publication"
+      }
+    ],
+    "reconciliation": [
+      {
+        "id": "availability-vs-skills",
+        "decision": "Preserve all nineteen shipped packs as available initially; availability does not assert harness enablement or runtime readiness. Preserve existing defaults and explicit later disable/deselect. Explicit C1 skill selection bridges legacy install_tier-based defaults; do not claim current harness already selects these.",
+        "evidenceRefs": [
+          "pack-discovery",
+          "skill-defaults",
+          "capability-profile"
+        ]
+      },
+      {
+        "id": "stale-hivemind-pin",
+        "decision": "Current source_setup and machine contract win over old default-packs plan pin 50ff509240c5582a7335dc71920533b59be7792c; publication remains unproved.",
+        "evidenceRefs": [
+          "default-sources",
+          "hivemind-contract"
+        ]
+      },
+      {
+        "id": "target-wire",
+        "decision": "Use existing execution_request runpod kind with pod_id and provider_account_ref. Do not add proposed worker_release_digest or target.provision fields to the current accepted wire shape; future worker release contract reconciliation remains EW input.",
+        "evidenceRefs": [
+          "execution-request"
+        ]
+      }
+    ],
+    "preserveDisabledChoices": true,
+    "silentPrerequisiteAcquisition": false,
+    "prerequisitePolicy": "List missing credentials, providers, paid models, external source, dependency or compatibility as unavailable; listing/default selection never authorizes fetch, enable or spend. No installed/ready inference from manifest status.",
+    "excludedDefaults": [
+      "local",
+      "discord_local",
+      "seedance_local"
+    ],
+    "observedHeads": [
+      {
+        "repository": "astrid-app",
+        "revision": "f486e1c6fbb110354dd7cc82234c8eb1d9ab4d2c",
+        "custodyPin": false
+      },
+      {
+        "repository": "astrid-agent",
+        "revision": "bac8bdcb4a07f3980a3a992eb0853c361c897f55",
+        "custodyPin": false
+      }
+    ]
+  },
+  "sourceEvidence": [
+    {
+      "id": "local-session",
+      "repository": "astrid-app",
+      "path": "src/shared/auth/bridgeSession.ts",
+      "sha256": "ed6ac6472acefb536a1a971faaf8786a77364bb63a3ddf0fc92d2c575095d151",
+      "summary": "Healthy local bridge is login-free session; failure remains degraded."
+    },
+    {
+      "id": "local-auth-gate",
+      "repository": "astrid-app",
+      "path": "src/shared/auth/components/AuthGate.tsx",
+      "sha256": "fe906f9359ced0e9168457891931548fde093bde8130e8b55801b2f3f9a66078",
+      "summary": "Loading-only local gate; does not implement hosted Discord enforcement."
+    },
+    {
+      "id": "paired-registry",
+      "repository": "astrid-app",
+      "path": "config/vite/pairedRegistry.ts",
+      "sha256": "43f4e36608f96ccea4d01c9fadf8c292f0b99eb945b3c0b792963e3467ba0dd8",
+      "summary": "Existing volatile expiring connector pairing; not hosted account binding."
+    },
+    {
+      "id": "runtime-proxy",
+      "repository": "astrid-app",
+      "path": "config/vite/runtimeProxy.ts",
+      "sha256": "7e1c4258ee4c0c2a93a319d90a336cf666767000a925ef7736d9d1e8c17fff62",
+      "summary": "Existing server-side Runtime bearer forwarding."
+    },
+    {
+      "id": "local-launcher",
+      "repository": "astrid-app",
+      "path": "scripts/dev-local-workspace.mjs",
+      "sha256": "bb31d7342d90abe16cb8fe970db3672dd027f37d9cd0dd1a68d24226561b01b4",
+      "summary": "Existing workspace.v1 discovery/profile bridge; not stable selection implementation."
+    },
+    {
+      "id": "astrid-auth",
+      "repository": "astrid-agent",
+      "path": "astrid/core/auth.py",
+      "sha256": "ca887d6814dc164eb25f179de41cf458df3a953d002eff8517ef903da5043d81",
+      "summary": "Existing optional Hivemind CLI delegation, local key presence only."
+    },
+    {
+      "id": "astrid-agent",
+      "repository": "astrid-agent",
+      "path": "astrid/omp_agent.py",
+      "sha256": "21bba74b5fb2105349bd2d611dee6d681b7dc8927cbc2739eba13d5986971e6d",
+      "summary": "Existing auth aliases, top-level contributor status and prompt fallback."
+    },
+    {
+      "id": "hivemind-contract",
+      "repository": "astrid-agent",
+      "path": "config/hivemind-pack-contract.json",
+      "sha256": "f91501ff68042b657274c00689c61cb987d5455e86474293dd19383f1f3f19ac",
+      "summary": "Canonical external Hivemind source/pin and anonymous read/write split."
+    },
+    {
+      "id": "capability-profile",
+      "repository": "astrid-agent",
+      "path": "config/astrid-beta-capabilities.json",
+      "sha256": "41d219eae7cad6e564d02bf20c211d989763a514f306d154e7b5aa951e9e3fea",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "default-sources",
+      "repository": "astrid-agent",
+      "path": "astrid/core/pack/source_setup.py",
+      "sha256": "5254361dc877385fcee1f4fa58e094cd8566a9fe1dc68d1f4d9fb2106d9fbbf2",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "pack-discovery",
+      "repository": "astrid-agent",
+      "path": "astrid/core/pack/discovery.py",
+      "sha256": "076bd6ba127b9c49c0c4432fef806d20f7509e6ef2200e4612c38e3c816ab52f",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "skill-defaults",
+      "repository": "astrid-agent",
+      "path": "astrid/skills/__init__.py",
+      "sha256": "439f644abc824f4467a619ac7c33c482489ed51afe3f40e66e03f53c74ab7b82",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "generic-pack-host",
+      "repository": "astrid-agent",
+      "path": "astrid/core/execution/generic_host.py",
+      "sha256": "387788fb010f54dcdad3756bb26beb45f9775b6f64722d38fda8c364a2f6dd1e",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "engine-dependency",
+      "repository": "astrid-agent",
+      "path": "astrid/core/generation/vibecomfy_dependency.py",
+      "sha256": "7deb357d6ce6c8dc7f3bb82e46342f3974eed69fd05c48cf24e25434b6ddb747",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "engine-profile",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/vibecomfy/actions/run/run.py",
+      "sha256": "a6ea2a57f23f1e61f92f5a70b18243ae47a1513219977a2308361798b4d18694",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "engine-requirements",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/vibecomfy/actions/run/requirements.txt",
+      "sha256": "358af9332230b9b080ad5ff38f3b48c54aa1d731916ccb7c4072ee3a5ef55a1a",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "execution-request",
+      "repository": "astrid-agent",
+      "path": "astrid/sdk/execution_request.py",
+      "sha256": "b01c4702bc22f94d87b9b11b91a395be91668aa78e9e1e581a977bef1e8b401f",
+      "summary": "Read-only existing declaration; observed bytes are not release custody or installed proof."
+    },
+    {
+      "id": "gateway-dispatch",
+      "repository": "astrid-agent",
+      "path": "astrid/core/gateway/dispatch.py",
+      "sha256": "3ce0eb8fbc14712c5402493ebe8aa7998f2f4e64d33defa54bc7703b34074f11",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "tasks-cli",
+      "repository": "astrid-agent",
+      "path": "astrid/core/cli/domain_tasks.py",
+      "sha256": "3fec878aaa9f40b71b65a1981db077eb62a860b4417420a9f48689026c462593",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runs-cli",
+      "repository": "astrid-agent",
+      "path": "astrid/core/cli/domain_runs.py",
+      "sha256": "984a52dae0373c4e531cc04d89f59d97c7b3e5ca41301a55a10f88a1447417ae",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "storage-root",
+      "repository": "astrid-agent",
+      "path": "astrid/sdk/storage_root.py",
+      "sha256": "85a028341e795cc034479c3fb291915fb497ad49f3f3bb0d454223b45db192b9",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "astrid-client",
+      "repository": "astrid-agent",
+      "path": "astrid/sdk/client.py",
+      "sha256": "cd2fab5c17787568f44fd0a28dff06ca1167a738dba1d83eeab2326cba02f4df",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-autobootstrap",
+      "repository": "astrid-agent",
+      "path": "astrid/sdk/autobootstrap.py",
+      "sha256": "215589edd971dd87ebf18d776834dc342af164aa2ef9173509545771f83556b0",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-cli",
+      "repository": "astrid-runtime",
+      "path": "astrid_runtime/cli.py",
+      "sha256": "3cee603c3092695497d34a568498590a1b6e25946f2642dfa2d931488ceb607d",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-paths",
+      "repository": "astrid-runtime",
+      "path": "astrid_runtime/paths.py",
+      "sha256": "3b3cb93d614154a062a7348aca4cb7c41657ba1487ed8b125473c06b7e2aeb09",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-bootstrap",
+      "repository": "astrid-runtime",
+      "path": "astrid_runtime/bootstrap.py",
+      "sha256": "33443061e86c5f9eeb55ba933b5d4fb085b61258f7bdd7e3ab36b058721d9468",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-contract",
+      "repository": "astrid-runtime",
+      "path": "contract/openapi/workspace-v1.yaml",
+      "sha256": "2794fe6a43e26876b7c8f374da94b5fde279762c107411fc4a13d8e0996a113c",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-task",
+      "repository": "astrid-runtime",
+      "path": "contract/schemas/task.json",
+      "sha256": "89204c7c23199eff9a28c16500aa534b9b1f9a659d4de4f61859748087c083e7",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-run",
+      "repository": "astrid-runtime",
+      "path": "contract/schemas/run.json",
+      "sha256": "07613763162af9d11571093e7aac7f43694ca5dd2a26171d51dcd08508e46c3f",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-event",
+      "repository": "astrid-runtime",
+      "path": "contract/schemas/event.json",
+      "sha256": "61c478fcffb5f68da0f8b6247094a3f0f4c6a6a622f0a91fa7726702d64d1c7a",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-worker",
+      "repository": "astrid-runtime",
+      "path": "contract/schemas/worker.json",
+      "sha256": "ce9046dd139b5c3368dfbb523ad9f8c1fc17a58749cd2fc8265a5e77a49bfc2b",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "runtime-errors",
+      "repository": "astrid-runtime",
+      "path": "contract/schemas/common.json",
+      "sha256": "65e0196e36a0565f3a2f69e489e4c1fa6114df039eb25666c60591f266e06f19",
+      "summary": "Read-only existing declaration; Runtime remains wire/state authority."
+    },
+    {
+      "id": "pack-blender",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/blender/pack.yaml",
+      "sha256": "3c2765dfee3ad0930cb2d791087001af980a809abc7fbef2f777b3c08ea80804",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-comfy_wrap",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/comfy_wrap/pack.yaml",
+      "sha256": "59a50f6c63baf51e6a3ff7a7c9f1884eb61de8c318dd733badaa99a32c7a2116",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-editorial",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/editorial/pack.yaml",
+      "sha256": "1f6b77de490f5307563d1dd22870e34ea4486c2d8f96fb4057d70454b7ea6052",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-fal",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/fal/pack.yaml",
+      "sha256": "aee140a84833b2bc7d322fe5096d5e93bf2f0e8729c47bc2904990ea21796b1d",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-foley",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/foley/pack.yaml",
+      "sha256": "02bc7661b431ca2d85b2a69f760a376996f18291f5e19991129c2874c4aeca8b",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-generation",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/generation/pack.yaml",
+      "sha256": "00a166528fbcf403ae69037ef4cc20152edbcb32bcaf0d5e3e987fb0bd84df2a",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-iteration",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/iteration/pack.yaml",
+      "sha256": "4c0f77eb26aaca3e6a2b0e5985587e82a70315aef835da92e63ad0afbb478b00",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-media",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/media/pack.yaml",
+      "sha256": "6026981380d1174a827fac9d5b3b72581eb68195dea85429396ddd4c059d78c1",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-moirae",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/moirae/pack.yaml",
+      "sha256": "7f846503f60aab0db45d8bba345e7d086757010c884a8fc2ef8420546b824f1a",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-rendering",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/rendering/pack.yaml",
+      "sha256": "c2765aa4c2485702e6b0b92999d9364e0973a95eaad0110199163276c6e26d78",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-runpod",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/runpod/pack.yaml",
+      "sha256": "1d40e426e70e99f3d3d9902af878df4110c17124f41d067ae69e410dfa957e65",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-stream_content",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/stream_content/pack.yaml",
+      "sha256": "47bdbbae50ba336a311ddd8b2969a7fb8562dadddaa83d1e2dbe64ad10a09d0f",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-training",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/training/pack.yaml",
+      "sha256": "980f8a310c65b22b40685f24f33e700e82530c94c45e0ea10473996f7af53e6f",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-typed_timeline",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/typed_timeline/pack.yaml",
+      "sha256": "422ba31767aeb70ffc6ea8a53fc7c05cf8a05c70e0c7b0586fb67b0741029357",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-understanding",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/understanding/pack.yaml",
+      "sha256": "ac24a734c5ddaa603942b07bb6e23f6f05b13970a0b4a22bfba159c85ca874d2",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-vibecomfy",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/vibecomfy/pack.yaml",
+      "sha256": "c1a684cd2df3a705ecb994b698a593d3e0a22e60d94eb5615317397e8279b5f7",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-video_editing",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/video_editing/pack.yaml",
+      "sha256": "53ad0207af00cd880a3e8261c03f9caab69cc59b471064d141b4e8c36c125216",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-wan2gp",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/wan2gp/pack.yaml",
+      "sha256": "e8802ebbe56ab04554b3f6d9aad5577df94eced660a462e8e1571fce7b21a4e3",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    },
+    {
+      "id": "pack-youtube",
+      "repository": "astrid-agent",
+      "path": "astrid/packs/youtube/pack.yaml",
+      "sha256": "c4e36b291fdfa0b4f98eedfe178a2676cfc53b3238ea0b24bbb1ce24c5a01f0a",
+      "summary": "Shipped v2 pack manifest; availability is not installed readiness."
+    }
+  ],
+  "unresolved": [
+    {
+      "id": "workspace-inventory",
+      "kind": "physical-inventory",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "CF-M1",
+      "reason": "Actual UUID/root/catalog/references/media inventory and dirty-source custody receipt; no workspace inspected or copied by this artifact."
+    },
+    {
+      "id": "preservation-preflight",
+      "kind": "preservation-receipt",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "actual-workspace-mutation",
+      "reason": "Separate-copy restore/recovery receipt plus CF review and scoped authorization before actual-root mutation."
+    },
+    {
+      "id": "preservation-final",
+      "kind": "preservation-receipt",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "CF-CLOSE",
+      "reason": "Actual-root attach/cutover disposition and destination-write/old-root receipts if moved; parent accepts A-10."
+    },
+    {
+      "id": "setup-delivery",
+      "kind": "implementation-artifact",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "A-CANDIDATE",
+      "reason": "Exact installable setup/lifecycle output, shared preview/apply input schema, selected root/UUID binding and preservation-safe runtime adapter."
+    },
+    {
+      "id": "observer-delivery",
+      "kind": "implementation-artifact",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "A-CANDIDATE",
+      "reason": "Non-starting bounded observer and redaction proof; EW consumes facts."
+    },
+    {
+      "id": "execution-delivery",
+      "kind": "implementation-artifact",
+      "status": "unresolved",
+      "owner": "EW",
+      "requiredBefore": "A-CANDIDATE",
+      "reason": "Runtime/Worker/client compatible artifacts, attempts/status/doctor integration and selected route qualification."
+    },
+    {
+      "id": "worker-control-mapping",
+      "kind": "operator-contract",
+      "status": "unresolved",
+      "owner": "EW",
+      "requiredBefore": "EW-integration",
+      "reason": "Freeze exact existing Worker relaunch/GPU replacement operator spellings with CF; distinct effects and reconcile-first policy."
+    },
+    {
+      "id": "hosted-auth-protocol",
+      "kind": "hosted-wire-input",
+      "status": "unresolved",
+      "owner": "CF",
+      "requiredBefore": "affected-B-integration",
+      "reason": "Issuer/principal mapping, link/exchange endpoints, storage custody, consent schema, lifetimes/freshness/revocation fan-out, in-flight rules and deployment trust boundaries; no raw-key sharing fallback."
+    },
+    {
+      "id": "dependency-closure",
+      "kind": "artifact-closure",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "A-CANDIDATE",
+      "reason": "Exact compatible Python/Node/OMP/Runtime/Worker/engine/model versions, wheels/locks, hashes, acquisition recipe and owned dirty deltas; historical HEADs are not release pins."
+    },
+    {
+      "id": "hivemind-publication",
+      "kind": "publication-proof",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "source-acquisition",
+      "reason": "Verify exact declared Hivemind object is remotely published/acquirable before remote install; no network acquisition is implied by default status."
+    },
+    {
+      "id": "runtime-reconciliation",
+      "kind": "source-custody",
+      "status": "unresolved",
+      "owner": "CF",
+      "requiredBefore": "EW-integration",
+      "reason": "Refresh imported-media-catalog contract_metadata/generated-client merge and ownership state before EW changes; do not absorb another worktree."
+    },
+    {
+      "id": "sl-ack",
+      "kind": "consumer-ack",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "CF-M1",
+      "reason": "Acknowledge exact C1 revision/digest, command migration and seam ownership."
+    },
+    {
+      "id": "ew-ack",
+      "kind": "consumer-ack",
+      "status": "unresolved",
+      "owner": "EW",
+      "requiredBefore": "CF-M1",
+      "reason": "Acknowledge same C1 revision/digest, execution/observation and seam ownership."
+    },
+    {
+      "id": "release-candidate",
+      "kind": "release-candidate",
+      "status": "unresolved",
+      "owner": "CF",
+      "requiredBefore": "installed-acceptance",
+      "reason": "Seal Rn with Cn digest and real immutable delivered outputs, dependencies, acquisition and owned deltas; no unresolved required inputs."
+    },
+    {
+      "id": "execution-target",
+      "kind": "execution-binding",
+      "status": "unresolved",
+      "owner": "EW",
+      "requiredBefore": "A-CANDIDATE",
+      "reason": "Exact authorized RunPod pod/account, limits, lifecycle, workflow/model assets and placement binding; no provisioning or personal example adoption."
+    },
+    {
+      "id": "engine-publication",
+      "kind": "publication-proof",
+      "status": "unresolved",
+      "owner": "SL",
+      "requiredBefore": "source-acquisition",
+      "reason": "Verify VibeComfy declared object and compatible engine dependencies are acquirable before install."
+    }
+  ],
+  "evidencePolicy": {
+    "sourceObservationsAreReleasePins": false,
+    "historicalReceiptsAreAcceptance": false,
+    "changedSemantics": "issue-successor-Cn-and-both-consumer-ACKs",
+    "changedArtifactPins": "parent-invalidates-affected-installed-route-evidence",
+    "a10": "rerun-for-exact-current-tuple",
+    "receiptFields": [
+      "contractRevision",
+      "contractDigest",
+      "sourceSnapshot",
+      "scenario",
+      "expected",
+      "observed",
+      "taskRef",
+      "runRef",
+      "attemptRef",
+      "targetRef",
+      "fixtureOrLiveLimits",
+      "redactedReceipt"
+    ],
+    "gatesClaimed": []
+  },
+  "proofRequirements": [
+    {
+      "id": "CF-WS",
+      "owner": "SL",
+      "scenarios": [
+        "A-UX-01",
+        "A-UX-02",
+        "A-UX-03",
+        "A-UX-04",
+        "A-UX-12",
+        "A-UX-14",
+        "A-UX-15",
+        "A-UX-16"
+      ],
+      "acceptance": [
+        "A-AT-01",
+        "A-AT-02",
+        "A-AT-03",
+        "A-AT-04"
+      ],
+      "status": "not-executed"
+    },
+    {
+      "id": "CF-EXEC-OBS",
+      "owner": "EW",
+      "scenarios": [
+        "A-UX-05",
+        "A-UX-06",
+        "A-UX-07",
+        "A-UX-08",
+        "A-UX-09",
+        "A-UX-10"
+      ],
+      "acceptance": [
+        "A-AT-05",
+        "A-AT-06",
+        "A-AT-07",
+        "A-AT-08",
+        "A-AT-09",
+        "A-AT-10"
+      ],
+      "status": "not-executed"
+    },
+    {
+      "id": "CF-AUTH",
+      "owner": "CF",
+      "scenarios": [
+        "CF-AUTH-01",
+        "CF-AUTH-02",
+        "CF-AUTH-03",
+        "CF-AUTH-04",
+        "CF-AUTH-05",
+        "CF-AUTH-06",
+        "CF-AUTH-07",
+        "A-UX-13",
+        "A-UX-17"
+      ],
+      "acceptance": [
+        "A-AT-02",
+        "A-AT-03",
+        "A-AT-09",
+        "B-AT-01",
+        "B-AT-02",
+        "B-AT-03",
+        "B-AT-18",
+        "B-AT-21",
+        "B-AT-22"
+      ],
+      "status": "not-executed"
+    },
+    {
+      "id": "visual-handoff",
+      "owner": "B",
+      "scenarios": [
+        "A-UX-11"
+      ],
+      "acceptance": [
+        "A-M1-before-B-end-to-end-acceptance"
+      ],
+      "status": "not-executed"
+    }
+  ],
+  "deferred": [
+    "multi-workspace-concurrency",
+    "per-session-workspace-selection",
+    "general-workspace-switcher",
+    "OS-login-service-startup",
+    "idle-shutdown-policy",
+    "broad-cost-UX",
+    "Plan-B-implementation"
+  ]
+}

@@ -1,0 +1,119 @@
+import { describe, it, expect } from 'vitest';
+import { cropFilename, truncateText } from '../stringFormatting';
+import { CENTISECOND_TIME_OPTIONS, formatClockTime, formatTime } from '../timeFormatting';
+
+describe('cropFilename', () => {
+  it('returns short filenames unchanged', () => {
+    expect(cropFilename('photo.jpg')).toBe('photo.jpg');
+  });
+
+  it('returns filenames at exactly maxLength unchanged', () => {
+    // "a".repeat(20) + ".jpg" = 24 chars
+    const name = 'a'.repeat(20) + '.jpg';
+    expect(cropFilename(name, 24)).toBe(name);
+  });
+
+  it('crops long filenames with ellipsis', () => {
+    const name = 'a_very_long_filename_that_exceeds_limit.jpg';
+    const result = cropFilename(name, 24);
+    expect(result).toContain('...');
+    expect(result).toContain('jpg');
+    expect(result.length).toBeLessThanOrEqual(24);
+  });
+
+  it('handles edge case when cropped length would be <= 0', () => {
+    // Very short maxLength with long extension — result is truncated to maxLength
+    expect(cropFilename('file.extension', 5)).toBe('....e');
+  });
+
+  it('uses default maxLength of 24', () => {
+    const shortName = 'short.txt';
+    expect(cropFilename(shortName)).toBe(shortName);
+  });
+});
+
+describe('truncateText', () => {
+  it('returns short text unchanged', () => {
+    expect(truncateText('hello', 10)).toBe('hello');
+  });
+
+  it('returns text at exactly maxLength unchanged', () => {
+    expect(truncateText('abcde', 5)).toBe('abcde');
+  });
+
+  it('truncates long text with ellipsis', () => {
+    expect(truncateText('hello world', 5)).toBe('he...');
+  });
+
+  it('handles empty string', () => {
+    expect(truncateText('', 10)).toBe('');
+  });
+
+  it('keeps output within max length for very small limits', () => {
+    expect(truncateText('hello world', 3)).toBe('...');
+    expect(truncateText('hello world', 2)).toBe('..');
+    expect(truncateText('hello world', 1)).toBe('.');
+  });
+});
+
+describe('formatTime', () => {
+  it('formats whole seconds', () => {
+    expect(formatTime(0)).toBe('0:00');
+    expect(formatTime(5)).toBe('0:05');
+    expect(formatTime(60)).toBe('1:00');
+    expect(formatTime(125)).toBe('2:05');
+  });
+
+  it('handles negative numbers', () => {
+    expect(formatTime(-5)).toBe('0:00');
+  });
+
+  it('handles NaN', () => {
+    expect(formatTime(NaN)).toBe('0:00');
+  });
+
+  it('handles Infinity', () => {
+    expect(formatTime(Infinity)).toBe('0:00');
+  });
+
+  it('shows milliseconds when requested', () => {
+    expect(formatTime(1.5, { showMilliseconds: true })).toBe('0:01.5');
+    expect(formatTime(0, { showMilliseconds: true })).toBe('0:00.0');
+  });
+
+  it('handles NaN with showMilliseconds', () => {
+    expect(formatTime(NaN, { showMilliseconds: true })).toBe('0:00.0');
+  });
+
+  it('supports different millisecond digit counts', () => {
+    expect(formatTime(1.123, { showMilliseconds: true, millisecondsDigits: 1 })).toBe('0:01.1');
+    expect(formatTime(1.123, { showMilliseconds: true, millisecondsDigits: 2 })).toBe('0:01.12');
+    expect(formatTime(1.123, { showMilliseconds: true, millisecondsDigits: 3 })).toBe('0:01.123');
+  });
+});
+
+describe('formatTime centisecond timecodes', () => {
+  it('matches the ruler and playback m:ss.cc format', () => {
+    expect(formatTime(0, CENTISECOND_TIME_OPTIONS)).toBe('0:00.00');
+    expect(formatTime(5, CENTISECOND_TIME_OPTIONS)).toBe('0:05.00');
+    expect(formatTime(65.5, CENTISECOND_TIME_OPTIONS)).toBe('1:05.50');
+    expect(formatTime(1.239, CENTISECOND_TIME_OPTIONS)).toBe('0:01.23');
+  });
+
+  it('pads the invalid-input zero to the requested digit count', () => {
+    expect(formatTime(NaN, CENTISECOND_TIME_OPTIONS)).toBe('0:00.00');
+  });
+});
+
+describe('formatClockTime', () => {
+  const options = { hour: '2-digit', minute: '2-digit', second: '2-digit' } as const;
+
+  it('returns "never" for the unset timestamp 0', () => {
+    expect(formatClockTime(0)).toBe('never');
+  });
+
+  it('formats an epoch timestamp as a clock time', () => {
+    const epochMs = Date.UTC(2026, 9, 19, 12, 30, 15);
+    expect(formatClockTime(epochMs)).toBe(new Date(epochMs).toLocaleTimeString(undefined, options));
+  });
+});

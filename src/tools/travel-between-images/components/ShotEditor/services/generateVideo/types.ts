@@ -1,0 +1,140 @@
+import type { QueryClient } from '@tanstack/react-query';
+import type { PhaseConfig } from '@/shared/types/phaseConfig';
+import type {
+  MotionConfig,
+  ModelConfig as TaskModelConfig,
+  PromptConfig,
+  StructureGuidanceConfig,
+  StitchConfig,
+  StructureVideoConfigWithMetadata,
+  TravelGuidance,
+} from '@/shared/lib/tasks/travelBetweenImages';
+import type { SegmentOverrides } from '@/shared/lib/settingsMigration';
+import type { Shot } from '@/domains/generation/types';
+import type { OperationResult } from '@/shared/lib/operationResult';
+import type { ResolvedGenerationPolicy, SelectedModel } from '@/tools/travel-between-images/settings';
+
+export interface ModelConfig extends TaskModelConfig {
+  selectedModel: SelectedModel;
+  num_inference_steps?: number;
+  guidance_scale?: number;
+  smoothContinuations?: boolean;
+  ltxHdResolution?: boolean;
+}
+
+export type GenerateVideoPromptConfig = PromptConfig & {
+  onEnhancementProgress?: (completed: number, total: number) => void;
+  enhancementAbortSignal?: AbortSignal;
+};
+
+export interface GenerateVideoParams {
+  projectId: string;
+  selectedShotId: string;
+  selectedShot: Shot;
+  queryClient: QueryClient;
+  effectiveAspectRatio: string | null;
+  generationMode: 'timeline' | 'batch' | 'by-pair';
+  promptConfig: GenerateVideoPromptConfig;
+  motionConfig: MotionConfig;
+  modelConfig: ModelConfig;
+  travelGuidance?: TravelGuidance;
+  structureGuidance?: StructureGuidanceConfig;
+  structureVideos?: StructureVideoConfigWithMetadata[];
+  batchVideoFrames: number;
+  selectedLoras: Array<{ id: string; path: string; strength: number; name: string }>;
+  variantNameParam: string;
+  clearAllEnhancedPrompts: () => Promise<void>;
+  parentGenerationId?: string;
+  stitchConfig?: StitchConfig;
+}
+
+interface GenerateVideoSuccessValue {
+  taskId: string;
+  taskIds: string[];
+  parentGenerationId?: string;
+}
+
+export type GenerateVideoResult = OperationResult<GenerateVideoSuccessValue>;
+
+export interface ShotGenRow {
+  id: string;
+  generation_id: string | null;
+  timeline_frame: number | null;
+  metadata: Record<string, unknown> | null;
+  generation: {
+    id: string;
+    location: string | null;
+    type: string | null;
+    primary_variant_id?: string | null;
+  } | null;
+}
+
+export interface ImagePayload {
+  absoluteImageUrls: string[];
+  imageGenerationIds: string[];
+  imageVariantIds: string[];
+  pairShotGenerationIds: string[];
+}
+
+export interface PairConfigPayload {
+  basePrompts: string[];
+  segmentFrames: number[];
+  frameOverlap: number[];
+  negativePrompts: string[];
+  enhancedPromptsArray: Array<string | null>;
+  pairPhaseConfigsArray: Array<PhaseConfig | null>;
+  pairLorasArray: Array<Array<{ path: string; strength: number }> | null>;
+  pairMotionSettingsArray: Array<Record<string, unknown> | null>;
+}
+
+export interface ModelPhaseSelection {
+  actualModelName: string;
+  effectivePhaseConfig?: PhaseConfig;
+  useAdvancedMode: boolean;
+}
+
+interface PairOverridesExtraction {
+  overrides: SegmentOverrides;
+  enhancedPrompt: string | undefined;
+}
+
+interface MotionParams {
+  amountOfMotion: number;
+  motionMode: MotionConfig['motion_mode'];
+  useAdvancedMode: boolean;
+  effectivePhaseConfig?: PhaseConfig;
+  selectedPhasePresetId: string | null | undefined;
+  numInferenceSteps?: number;
+  guidanceScale?: number;
+}
+
+export interface GenerationParams {
+  generationMode: GenerateVideoParams['generationMode'];
+  batchVideoPrompt: string;
+  enhancePrompt: boolean;
+  variantNameParam: string;
+  textBeforePrompts: string | undefined;
+  textAfterPrompts: string | undefined;
+}
+
+interface SeedParams {
+  seed: number;
+  randomSeed: boolean | undefined;
+  turboMode: boolean | undefined;
+  debug: boolean | undefined;
+}
+
+export interface BuildTravelRequestBodyParams {
+  projectId: string;
+  selectedShot: Shot;
+  imagePayload: ImagePayload;
+  pairConfig: PairConfigPayload;
+  parentGenerationId?: string;
+  actualModelName: string;
+  selectedModel?: SelectedModel;
+  policy?: ResolvedGenerationPolicy;
+  generationTypeMode: ModelConfig['generation_type_mode'];
+  motionParams: MotionParams;
+  generationParams: GenerationParams;
+  seedParams: SeedParams;
+}

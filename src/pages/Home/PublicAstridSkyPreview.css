@@ -1,0 +1,52 @@
+/* Fixed glass in its own dark ink, so it reads on both the day and the night sky. */
+.astrid-sky-preview {
+  position: fixed;
+  left: max(16px, env(safe-area-inset-left));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(340px, calc(100vw - 32px));
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  border-radius: 999px;
+  background: rgba(24, 26, 38, .82);
+  color: #f3eee4;
+  box-shadow: 0 6px 24px rgba(10, 12, 24, .28);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  font: 500 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.astrid-sky-preview-time {
+  min-width: 4.4ch;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+  font-size: 14px;
+}
+.astrid-sky-preview[data-pinned] .astrid-sky-preview-time { color: #ffb27a; }
+.astrid-sky-preview-button {
+  flex: none;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.astrid-sky-preview-button:hover:not(:disabled) { background: rgba(255, 255, 255, .12); }
+.astrid-sky-preview-button:disabled { opacity: .4; cursor: default; }
+.astrid-sky-preview-button:focus-visible,
+.astrid-sky-preview-slider:focus-visible { outline: 2px solid #ffb27a; outline-offset: 2px; }
+.astrid-sky-preview-slider {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  margin: 0;
+  background: transparent;
+  accent-color: #ffb27a;
+  cursor: pointer;
+}

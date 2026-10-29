@@ -1,0 +1,126 @@
+import { AlertCircle, AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Info } from 'lucide-react';
+import type {
+  ReconciliationResult,
+  ReconciliationState,
+} from '@/tools/video-editor/runtime/extensionSettings';
+import { DIAG_SEVERITY_COLOR, DIAG_SEVERITY_ICON } from './diagnosticSeverityStyles';
+
+/** Human-readable label for the reconciliation state badge. */
+function reconciliationBadgeLabel(state: ReconciliationState): string {
+  switch (state) {
+    case 'clean':
+      return 'Settings OK';
+    case 'repaired':
+      return 'Auto-repaired';
+    case 'needs-review':
+      return 'Needs review';
+    case 'blocked':
+      return 'Settings blocked';
+  }
+}
+
+/** Severity-driven color classes for the reconciliation row. */
+function reconciliationRowStyle(state: ReconciliationState): string {
+  switch (state) {
+    case 'clean':
+      return 'bg-wes-forest/10 border-wes-forest/30 text-wes-forest';
+    case 'repaired':
+      return 'bg-ink-info/10 border-ink-info/30 text-ink-info';
+    case 'needs-review':
+      return 'bg-ink-warning/10 border-ink-warning/30 text-ink-warning';
+    case 'blocked':
+      return 'bg-ink-danger/10 border-ink-danger/30 text-ink-danger';
+  }
+}
+
+/** Icon component per reconciliation state. */
+function ReconciliationIcon({ state }: { state: ReconciliationState }) {
+  switch (state) {
+    case 'clean':
+      return <CheckCircle className="h-3 w-3 shrink-0" />;
+    case 'repaired':
+      return <Info className="h-3 w-3 shrink-0" />;
+    case 'needs-review':
+      return <AlertTriangle className="h-3 w-3 shrink-0" />;
+    case 'blocked':
+      return <AlertCircle className="h-3 w-3 shrink-0" />;
+  }
+}
+
+/** Reconciliation diagnostic row. */
+export function SettingsReconciliationRow({
+  extensionId,
+  reconciliationResult,
+  reconciliationExpanded,
+  setReconciliationExpanded,
+}: {
+  extensionId: string;
+  reconciliationResult: ReconciliationResult;
+  reconciliationExpanded: boolean;
+  setReconciliationExpanded: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
+  /** Count of reconciliation diagnostics that are not schema-adapter noise. */
+  const reconciliationDiagCount =
+    reconciliationResult.diagnostics.filter(
+      (d) => !d.code?.startsWith('settings/unsupported-schema'),
+    ).length;
+
+  return (
+    <div
+      className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${reconciliationRowStyle(reconciliationResult.state)}`}
+      data-video-editor-extension-settings-reconciliation={extensionId}
+      data-video-editor-extension-settings-reconciliation-state={reconciliationResult.state}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 font-medium">
+          <ReconciliationIcon state={reconciliationResult.state} />
+          {reconciliationBadgeLabel(reconciliationResult.state)}
+        </span>
+        {reconciliationDiagCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setReconciliationExpanded((prev) => !prev)}
+            className="inline-flex min-h-6 items-center gap-0.5 rounded text-[10px] underline transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+            aria-expanded={reconciliationExpanded}
+            aria-label={`${reconciliationExpanded ? 'Hide' : 'Show'} reconciliation details`}
+            data-video-editor-extension-settings-reconciliation-toggle={extensionId}
+          >
+            {reconciliationDiagCount} detail{reconciliationDiagCount !== 1 ? 's' : ''}
+            {reconciliationExpanded ? (
+              <ChevronDown className="h-2.5 w-2.5" />
+            ) : (
+              <ChevronRight className="h-2.5 w-2.5" />
+            )}
+          </button>
+        )}
+      </div>
+      {reconciliationExpanded && reconciliationDiagCount > 0 && (
+        <div className="mt-1 flex flex-col gap-0.5 max-h-32 overflow-y-auto">
+          {reconciliationResult.diagnostics
+            .filter((d) => !d.code?.startsWith('settings/unsupported-schema'))
+            .map((diag, idx) => {
+              const SevIcon = DIAG_SEVERITY_ICON[diag.severity];
+              return (
+                <div
+                  key={`${diag.code ?? 'diag'}-${idx}`}
+                  className="flex items-start gap-1 text-[10px] text-foreground/80"
+                >
+                  <SevIcon
+                    className={`mt-0.5 h-2.5 w-2.5 shrink-0 ${DIAG_SEVERITY_COLOR[diag.severity]}`}
+                    aria-hidden="true"
+                  />
+                  <span>{diag.message}</span>
+                </div>
+              );
+            })}
+          {reconciliationResult.droppedUnknownFields.length > 0 && (
+            <div className="text-[10px] text-muted-foreground/70 mt-0.5">
+              Dropped unknown fields:{' '}
+              {reconciliationResult.droppedUnknownFields.join(', ')}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

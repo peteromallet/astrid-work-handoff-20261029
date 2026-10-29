@@ -1,0 +1,2590 @@
+import { __resetSelectionStoreForTests, userSelectTimelineItems, getSelectedTimelineDataItems, type TimelineDataItemRef } from '@/shared/state/selectionStore';
+// @vitest-environment jsdom
+import React, { useMemo, useState } from 'react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { TimelineCanvas } from '@/tools/video-editor/components/TimelineEditor/TimelineCanvas';
+import { AI_GENERATION_DRAFT, EFFECT_OR_ANIMATION_DRAFT, EXTENSION_DRAFT } from '@/tools/video-editor/components/TimelineEditor/TimelineCreateTools';
+import { VideoEditorRuntimeProvider, type VideoEditorRuntimeContextValue } from '@/tools/video-editor/contexts/VideoEditorRuntimeContext';
+import { createInteractionState, onInteractionEnd } from '@/tools/video-editor/lib/interaction-state';
+import { requestCenterTimelineClip } from '@/tools/video-editor/lib/timeline-viewport-events';
+import { resolveArmedTouchGesture } from '@/tools/video-editor/lib/mobile-interaction-model';
+import {
+  CLIP_ID_ATTR,
+  CLIP_BODY_SELECTOR,
+  EDIT_AREA_SELECTOR,
+  RESIZE_EDGE_ATTR,
+  ROW_ID_ATTR,
+  TOUCH_GESTURE_MODE_ATTR,
+  TRACK_ID_ATTR,
+} from '@/tools/video-editor/lib/timeline-dom';
+import { createCommandRegistry, type CommandRegistry } from '@/tools/video-editor/runtime/commandRegistry';
+import type { TimelinePostprocessShaderMetadata, TrackDefinition } from '@/tools/video-editor/types';
+import type { CanonicalShotOccurrence } from '@/tools/video-editor/data/shotCompositionAdapter';
+import type { TimelineAction, TimelineRow } from '@/tools/video-editor/types/timeline-canvas';
+import type {
+  AstridExtension,
+  ResolvedTimelineOverlayDescriptor,
+  TimelineOverlayRenderProps,
+} from '@astrid/editor-sdk';
+
+const useTimelineMutableAdaptersMock = vi.fn();
+let __rowPlacement: Record<string, unknown> | undefined;
+let __showDataLanes = true;
+let __showTranscriptLane: boolean | undefined;
+let __omitTimelinePreferences = false;
+let __selectedDataItems: readonly TimelineDataItemRef[] | undefined;
+let __lanePlaneResolved = true;
+
+vi.mock('@/tools/video-editor/hooks/timelineStore', async () => {
+  const actual = await vi.importActual<typeof import('@/tools/video-editor/hooks/timelineStore')>(
+    '@/tools/video-editor/hooks/timelineStore',
+  );
+
+  return {
+    ...actual,
+    useTimelineMutableAdapters: () => useTimelineMutableAdaptersMock(),
+    useTimelineEditorDataSafe: () => ({
+      selectedDataItems: __selectedDataItems, selectedClipIds: new Set(),
+      data: __rowPlacement ? { resolvedConfig: { app: { timelineDataLanePlacement: __rowPlacement } } } : null,
+      ...(__omitTimelinePreferences ? {} : { preferences: { showDataLanes: __showDataLanes, showTranscriptLane: __showTranscriptLane } }),
+    }),
+  };
+});
+
+const useDataLanesMock = vi.fn((args?: { base?: unknown }) => args?.base ?? null);
+vi.mock('@/tools/video-editor/data-kinds/useDataLanes', () => ({
+  useDataLanePlane: (args?: { base?: unknown }) => ({ data: useDataLanesMock(args), resolved: __lanePlaneResolved }),
+  useDataLanes: (args?: { base?: unknown }) => useDataLanesMock(args),
+}));
+
+const track: TrackDefinition = { id: 'V1', kind: 'visual', label: 'V1' };
+const action: TimelineAction = { id: 'clip-1', start: 0, end: 2, effectId: 'effect-clip-1' };
+const row: TimelineRow = { id: 'V1', actions: [action] };
+const pinnedGroupRow: TimelineRow = {
+  id: 'V1',
+  actions: [
+    { id: 'clip-1', start: 0, end: 1, effectId: 'effect-clip-1' },
+    { id: 'clip-2', start: 1, end: 2, effectId: 'effect-clip-2' },
+    { id: 'clip-3', start: 2, end: 3, effectId: 'effect-clip-3' },
+  ],
+};
+const shiftedPinnedGroupRow: TimelineRow = {
+  id: 'V1',
+  actions: [
+    { id: 'clip-1', start: 1, end: 2, effectId: 'effect-clip-1' },
+    { id: 'clip-2', start: 2, end: 3, effectId: 'effect-clip-2' },
+    { id: 'clip-3', start: 3, end: 4, effectId: 'effect-clip-3' },
+  ],
+};
+const pinnedShotGroup: NonNullable<React.ComponentProps<typeof TimelineCanvas>['shotGroups']>[number] = {
+  shotId: 'shot-1',
+  shotName: 'Pinned Shot',
+  rowId: 'V1',
+  rowIndex: 0,
+  start: 0,
+  clipIds: ['clip-1', 'clip-2', 'clip-3'],
+  children: [
+    { clipId: 'clip-1', offset: 0, duration: 1 },
+    { clipId: 'clip-2', offset: 1, duration: 1 },
+    { clipId: 'clip-3', offset: 2, duration: 1 },
+  ],
+  color: '#22c55e',
+};
+const setGestureOwner = vi.fn();
+const setInputModalityFromPointerType = vi.fn(() => 'mouse');
+
+function buildRuntime(
+  commandRegistry: CommandRegistry,
+  overlays: readonly ResolvedTimelineOverlayDescriptor[] = [],
+  timelineOverlaysEnabled = false,
+): VideoEditorRuntimeContextValue {
+  const extension = {
+    manifest: {
+      id: 'ext.timeline',
+      version: '1.0.0',
+      label: 'Timeline Extension',
+    },
+  } as AstridExtension;
+
+  return {
+    provider: {} as VideoEditorRuntimeContextValue['provider'],
+    assetResolver: {} as VideoEditorRuntimeContextValue['assetResolver'],
+    auth: { userId: 'user-1' },
+    project: { projectId: 'project-1' },
+    shots: {} as VideoEditorRuntimeContextValue['shots'],
+    mediaLightbox: {} as VideoEditorRuntimeContextValue['mediaLightbox'],
+    agentChat: {} as VideoEditorRuntimeContextValue['agentChat'],
+    toast: {
+      error: vi.fn(),
+      success: vi.fn(),
+      warning: vi.fn(),
+      info: vi.fn(),
+    },
+    telemetry: {
+      log: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+    timelineId: 'timeline-1',
+    userId: 'user-1',
+    extensions: {
+      slots: {},
+      dialogHost: { dialogs: [] },
+      registry: { panels: [], inspectorSections: [] },
+      overlays,
+    },
+    extensionRuntime: {
+      extensions: [extension],
+      byId: new Map([['ext.timeline', extension]]),
+    } as VideoEditorRuntimeContextValue['extensionRuntime'],
+    commandRegistry,
+    timelineOverlaysEnabled,
+  };
+}
+
+function registerTimelineAreaMenuCommand(
+  registry: CommandRegistry,
+  handler: Parameters<CommandRegistry['registerCommand']>[2] = vi.fn(),
+  options: {
+    command?: string;
+    label?: string;
+    menuLabel?: string;
+    when?: string;
+  } = {},
+) {
+  const command = options.command ?? 'ext.timeline.open';
+  registry.ingestCommandContribution('ext.timeline', {
+    id: `${command}.command` as never,
+    kind: 'command',
+    command,
+    label: options.label ?? 'Open timeline command',
+  });
+  registry.ingestContextMenuItemContribution('ext.timeline', {
+    id: `${command}.menu` as never,
+    kind: 'contextMenuItem',
+    command,
+    target: 'timeline-area',
+    label: options.menuLabel ?? 'Open timeline command',
+    when: options.when,
+  });
+  registry.registerCommand('ext.timeline', command, handler);
+}
+
+function cloneRowState(source: TimelineRow): TimelineRow {
+  return {
+    ...source,
+    actions: source.actions.map((timelineAction) => ({ ...timelineAction })),
+  };
+}
+
+function materializeShotGroup(
+  template: NonNullable<React.ComponentProps<typeof TimelineCanvas>['shotGroups']>[number],
+  rows: TimelineRow[],
+): NonNullable<React.ComponentProps<typeof TimelineCanvas>['shotGroups']>[number] {
+  const targetRow = rows.find((candidate) => candidate.id === template.rowId);
+  if (!targetRow) {
+    throw new Error(`expected row ${template.rowId}`);
+  }
+
+  const groupActions = template.clipIds.map((clipId) => {
+    const timelineAction = targetRow.actions.find((candidate) => candidate.id === clipId);
+    if (!timelineAction) {
+      throw new Error(`expected action ${clipId}`);
+    }
+    return timelineAction;
+  });
+  const start = Math.min(...groupActions.map((timelineAction) => timelineAction.start));
+
+  return {
+    ...template,
+    start,
+    children: template.clipIds.map((clipId) => {
+      const timelineAction = groupActions.find((candidate) => candidate.id === clipId);
+      if (!timelineAction) {
+        throw new Error(`expected action ${clipId}`);
+      }
+
+      return {
+        clipId,
+        offset: timelineAction.start - start,
+        duration: timelineAction.end - timelineAction.start,
+      };
+    }),
+  };
+}
+
+function applyRowUpdates(
+  rows: TimelineRow[],
+  rowId: string,
+  updates: Record<string, { start: number; end: number }>,
+): TimelineRow[] {
+  return rows.map((candidate) => {
+    if (candidate.id !== rowId) {
+      return candidate;
+    }
+
+    return {
+      ...candidate,
+      actions: candidate.actions.map((timelineAction) => {
+        const update = updates[timelineAction.id];
+        return update ? { ...timelineAction, ...update } : timelineAction;
+      }),
+    };
+  });
+}
+
+function renderStatefulPinnedGroupCanvas(params: {
+  initialRow?: TimelineRow;
+  initialShotGroup?: NonNullable<React.ComponentProps<typeof TimelineCanvas>['shotGroups']>[number];
+  actionId: string;
+  startLeft?: number;
+  scale?: number;
+  scaleWidth?: number;
+}) {
+  const dataRef = { current: null };
+  const onClipEdgeResizeEndSpy = vi.fn();
+  const initialRow = params.initialRow ?? pinnedGroupRow;
+  const initialShotGroup = params.initialShotGroup ?? pinnedShotGroup;
+
+  useTimelineMutableAdaptersMock.mockReturnValue({
+    dataRef,
+    pendingOpsRef: { current: 0 },
+    interactionStateRef: { current: createInteractionState() },
+    selectedClipIdsRef: { current: new Set<string>() },
+    additiveSelectionRef: { current: false },
+  });
+
+  function Harness() {
+    const [rows, setRows] = useState<TimelineRow[]>([cloneRowState(initialRow)]);
+    const shotGroups = useMemo(
+      () => [materializeShotGroup(initialShotGroup, rows)],
+      [rows],
+    );
+
+    return (
+      <TimelineCanvas
+        rows={rows}
+        tracks={[track]}
+        deviceClass="desktop"
+        inputModality="mouse"
+        interactionMode="select"
+        gestureOwner="none"
+        scale={params.scale ?? 1}
+        scaleWidth={params.scaleWidth ?? 100}
+        scaleSplitCount={1}
+        startLeft={params.startLeft ?? 0}
+        rowHeight={48}
+        minScaleCount={1}
+        maxScaleCount={10}
+        selectedTrackId={null}
+        getActionRender={() => <div>clip</div>}
+        onSelectTrack={vi.fn()}
+        onTrackChange={vi.fn()}
+        onRemoveTrack={vi.fn()}
+        onTrackDragEnd={vi.fn()}
+        trackSensors={[] as never}
+        onCursorDrag={vi.fn()}
+        onClickTimeArea={vi.fn()}
+        setInputModalityFromPointerType={setInputModalityFromPointerType}
+        setGestureOwner={setGestureOwner}
+        onActionResizeStart={vi.fn()}
+        onClipEdgeResizeEnd={(resizeParams) => {
+          onClipEdgeResizeEndSpy(resizeParams);
+          if (resizeParams.cancelled) {
+            return;
+          }
+          setRows((currentRows) => applyRowUpdates(
+            currentRows,
+            resizeParams.session.rowId,
+            Object.fromEntries(
+              resizeParams.updates.map((update) => [
+                update.clipId,
+                { start: update.start, end: update.end },
+              ]),
+            ),
+          ));
+        }}
+        shotGroups={shotGroups}
+        dragSessionRef={{ current: null }}
+      />
+    );
+  }
+
+  const renderResult = render(<Harness />);
+
+  const getActionElement = (actionId: string) => {
+    const element = renderResult.container.querySelector(`[data-action-id="${actionId}"]`);
+    if (!(element instanceof HTMLElement)) {
+      throw new Error(`expected action element for ${actionId}`);
+    }
+    return element;
+  };
+
+  return {
+    ...renderResult,
+    onClipEdgeResizeEndSpy,
+    getActionElement,
+    getHandle: (actionId: string, side: 'left' | 'right') => {
+      const selector = `[data-resize-edge="${side}"]`;
+      const handle = getActionElement(actionId).querySelector(selector);
+      if (!(handle instanceof HTMLElement)) {
+        throw new Error(`expected ${side} handle for ${actionId}`);
+      }
+      return handle;
+    },
+  };
+}
+
+function renderCanvas(params?: {
+  allowEmpty?: boolean;
+  interactionStateRef?: React.MutableRefObject<{ drag: boolean; resize: boolean }>;
+  dataRef?: { current: unknown };
+  onActionResizeStart?: ReturnType<typeof vi.fn>;
+  onClipEdgeResizeEnd?: ReturnType<typeof vi.fn>;
+  getActionRender?: ReturnType<typeof vi.fn>;
+  track?: TrackDefinition;
+  row?: TimelineRow;
+  actionId?: string;
+  shotGroups?: React.ComponentProps<typeof TimelineCanvas>['shotGroups'];
+  isDragging?: React.ComponentProps<typeof TimelineCanvas>['isDragging'];
+  finalVideoMap?: React.ComponentProps<typeof TimelineCanvas>['finalVideoMap'];
+  onShotGroupNavigate?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupNavigate'];
+  onSelectClips?: React.ComponentProps<typeof TimelineCanvas>['onSelectClips'];
+  onShotGroupUnpin?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupUnpin'];
+  onShotGroupDelete?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupDelete'];
+  onShotGroupDuplicate?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupDuplicate'];
+  onShotGroupPromotePrimary?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupPromotePrimary'];
+  selectedCanonicalOccurrenceId?: React.ComponentProps<typeof TimelineCanvas>['selectedCanonicalOccurrenceId'];
+  onShotGroupSwitchToFinalVideo?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupSwitchToFinalVideo'];
+  onShotGroupExportManagedOutput?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupExportManagedOutput'];
+  onShotGroupSwitchToImages?: React.ComponentProps<typeof TimelineCanvas>['onShotGroupSwitchToImages'];
+  allowMissingHandles?: boolean;
+  deviceClass?: React.ComponentProps<typeof TimelineCanvas>['deviceClass'];
+  inputModality?: React.ComponentProps<typeof TimelineCanvas>['inputModality'];
+  interactionMode?: React.ComponentProps<typeof TimelineCanvas>['interactionMode'];
+  gestureOwner?: React.ComponentProps<typeof TimelineCanvas>['gestureOwner'];
+  rowHeight?: number;
+  startLeft?: number;
+  scale?: number;
+  scaleWidth?: number;
+  tracks?: TrackDefinition[];
+  rows?: TimelineRow[];
+  onAddEffectLayerAt?: React.ComponentProps<typeof TimelineCanvas>['onAddEffectLayerAt'];
+  onOpenElementCreationPrompt?: React.ComponentProps<typeof TimelineCanvas>['onOpenElementCreationPrompt'];
+  onOpenExtensionManager?: React.ComponentProps<typeof TimelineCanvas>['onOpenExtensionManager'];
+  readOnly?: boolean;
+  onAddTrack?: React.ComponentProps<typeof TimelineCanvas>['onAddTrack'];
+  onClearUnusedTracks?: React.ComponentProps<typeof TimelineCanvas>['onClearUnusedTracks'];
+  unusedTrackCount?: number;
+  commandRegistry?: CommandRegistry;
+  overlays?: readonly ResolvedTimelineOverlayDescriptor[];
+  timelineOverlaysEnabled?: boolean;
+  ops?: {
+    clearSelection?: ReturnType<typeof vi.fn>;
+    setSelectedTrackId?: ReturnType<typeof vi.fn>;
+    setContextTarget: ReturnType<typeof vi.fn>;
+    setInspectorTarget: ReturnType<typeof vi.fn>;
+  };
+  onSelectTrack?: React.ComponentProps<typeof TimelineCanvas>['onSelectTrack'];
+  onCursorDrag?: React.ComponentProps<typeof TimelineCanvas>['onCursorDrag'];
+  onClickTimeArea?: React.ComponentProps<typeof TimelineCanvas>['onClickTimeArea'];
+  onEditAreaPointerDown?: React.ComponentProps<typeof TimelineCanvas>['onEditAreaPointerDown'];
+  postprocessShader?: TimelinePostprocessShaderMetadata;
+  onSelectPostprocessShader?: React.ComponentProps<typeof TimelineCanvas>['onSelectPostprocessShader'];
+  onCreateShotFromSelection?: React.ComponentProps<typeof TimelineCanvas>['onCreateShotFromSelection'];
+  canCreateShotFromSelection?: boolean;
+  isCreatingShot?: boolean;
+  selectedClipCount?: number;
+  onScaleWidthChange?: React.ComponentProps<typeof TimelineCanvas>['onScaleWidthChange'];
+}) {
+  const dataRef = params?.dataRef ?? { current: null };
+  const trackDefinitions = params?.tracks ?? [params?.track ?? track];
+  const timelineRows = params?.rows ?? [params?.row ?? row];
+  useTimelineMutableAdaptersMock.mockReturnValue({
+    dataRef,
+    pendingOpsRef: { current: 0 },
+    interactionStateRef: params?.interactionStateRef ?? { current: createInteractionState() },
+    selectedClipIdsRef: { current: new Set<string>() },
+    additiveSelectionRef: { current: false },
+    ops: params?.ops,
+  });
+
+  const onActionResizeStart = params?.onActionResizeStart ?? vi.fn();
+  const onClipEdgeResizeEnd = params?.onClipEdgeResizeEnd ?? vi.fn();
+  const getActionRender = params?.getActionRender ?? vi.fn(() => <div>clip</div>);
+  const runtimeCommandRegistry = params?.commandRegistry ?? createCommandRegistry();
+
+  const canvas = (
+    <TimelineCanvas
+      rows={timelineRows}
+      tracks={trackDefinitions}
+      deviceClass={params?.deviceClass ?? 'desktop'}
+      onAddTrack={params?.onAddTrack}
+      onClearUnusedTracks={params?.onClearUnusedTracks}
+      unusedTrackCount={params?.unusedTrackCount}
+      inputModality={params?.inputModality ?? 'mouse'}
+      interactionMode={params?.interactionMode ?? 'select'}
+      gestureOwner={params?.gestureOwner ?? 'none'}
+      scale={params?.scale ?? 1}
+      scaleWidth={params?.scaleWidth ?? 100}
+      scaleSplitCount={1}
+      startLeft={params?.startLeft ?? 0}
+      rowHeight={params?.rowHeight ?? 48}
+      minScaleCount={1}
+      maxScaleCount={10}
+      selectedTrackId={null}
+      getActionRender={getActionRender}
+      onSelectTrack={params?.onSelectTrack ?? vi.fn()}
+      onTrackChange={vi.fn()}
+      onRemoveTrack={vi.fn()}
+      onTrackDragEnd={vi.fn()}
+      trackSensors={[] as never}
+      onCursorDrag={params?.onCursorDrag ?? vi.fn()}
+      onClickTimeArea={params?.onClickTimeArea ?? vi.fn()}
+      setInputModalityFromPointerType={setInputModalityFromPointerType}
+      setGestureOwner={setGestureOwner}
+      onActionResizeStart={onActionResizeStart}
+      onClipEdgeResizeEnd={onClipEdgeResizeEnd}
+      shotGroups={params?.shotGroups}
+      isDragging={params?.isDragging}
+      finalVideoMap={params?.finalVideoMap}
+      onShotGroupNavigate={params?.onShotGroupNavigate}
+      onSelectClips={params?.onSelectClips}
+      onShotGroupUnpin={params?.onShotGroupUnpin}
+      onShotGroupDelete={params?.onShotGroupDelete}
+      onShotGroupDuplicate={params?.onShotGroupDuplicate}
+      onShotGroupPromotePrimary={params?.onShotGroupPromotePrimary}
+      selectedCanonicalOccurrenceId={params?.selectedCanonicalOccurrenceId}
+      onShotGroupSwitchToFinalVideo={params?.onShotGroupSwitchToFinalVideo}
+      onShotGroupExportManagedOutput={params?.onShotGroupExportManagedOutput}
+      onShotGroupSwitchToImages={params?.onShotGroupSwitchToImages}
+      interactionStateRef={params?.interactionStateRef}
+      onAddEffectLayerAt={params?.onAddEffectLayerAt}
+      onOpenElementCreationPrompt={params?.onOpenElementCreationPrompt}
+      onOpenExtensionManager={params?.onOpenExtensionManager}
+      readOnly={params?.readOnly}
+      postprocessShader={params?.postprocessShader}
+      onSelectPostprocessShader={params?.onSelectPostprocessShader}
+      onEditAreaPointerDown={params?.onEditAreaPointerDown}
+      onCreateShotFromSelection={params?.onCreateShotFromSelection}
+      canCreateShotFromSelection={params?.canCreateShotFromSelection}
+      isCreatingShot={params?.isCreatingShot}
+      selectedClipCount={params?.selectedClipCount}
+      onScaleWidthChange={params?.onScaleWidthChange}
+      dragSessionRef={{ current: null }}
+    />
+  );
+
+  const renderResult = render(
+    params?.commandRegistry || params?.overlays || params?.timelineOverlaysEnabled
+      ? (
+          <VideoEditorRuntimeProvider value={buildRuntime(
+            runtimeCommandRegistry,
+            params?.overlays ?? [],
+            params?.timelineOverlaysEnabled ?? false,
+          )}
+          >
+            {canvas}
+          </VideoEditorRuntimeProvider>
+        )
+      : canvas,
+  );
+
+  const targetRow = timelineRows.find((candidate) => candidate.actions.length > 0) ?? timelineRows[0];
+  const targetActionId = params?.actionId ?? targetRow?.actions[0]?.id ?? 'clip-1';
+  const actionElement = params?.allowEmpty ? renderResult.container : renderResult.container.querySelector(`[data-action-id="${targetActionId}"]`);
+  if (!(actionElement instanceof HTMLElement)) {
+    throw new Error('expected action element');
+  }
+
+  // Identify handles by their rounding class so we don't mis-label when
+  // only one of the two is rendered (e.g. for first/last children of a
+  // pinned shot group, where only one interior boundary exists).
+  const leftHandle = actionElement.querySelector('[data-resize-edge="left"]');
+  const rightHandle = actionElement.querySelector('[data-resize-edge="right"]');
+  if (!params?.allowMissingHandles && (!(leftHandle instanceof HTMLElement) || !(rightHandle instanceof HTMLElement))) {
+    throw new Error('expected resize handles');
+  }
+
+  return {
+    ...renderResult,
+    actionElement,
+    leftHandle: leftHandle instanceof HTMLElement ? leftHandle : null,
+    rightHandle: rightHandle instanceof HTMLElement ? rightHandle : null,
+    getShotGroupHandle: (side: 'left' | 'right') => {
+      const handle = renderResult.container.querySelector(`[data-shot-group-resize-handle="${side}"]`);
+      if (!(handle instanceof HTMLElement)) {
+        throw new Error(`expected ${side} shot group handle`);
+      }
+      return handle;
+    },
+    onActionResizeStart,
+    onClipEdgeResizeEnd,
+    getActionRender,
+  };
+}
+
+afterEach(() => {
+  cleanup();
+  useTimelineMutableAdaptersMock.mockReset();
+  setGestureOwner.mockReset();
+  setInputModalityFromPointerType.mockClear();
+  __rowPlacement = undefined;
+  __showDataLanes = true;
+  __showTranscriptLane = undefined;
+  __omitTimelinePreferences = false;
+  __selectedDataItems = undefined;
+  __lanePlaneResolved = true;
+  __resetSelectionStoreForTests();
+});
+
+describe('TimelineCanvas DOM contract', () => {
+  it('marks the edit area with the touch mechanism the stylesheet keys on', () => {
+    const { container } = renderCanvas({ deviceClass: 'phone', interactionMode: 'move' });
+    const editArea = container.querySelector(EDIT_AREA_SELECTOR);
+
+    if (!(editArea instanceof HTMLElement)) {
+      throw new Error(`expected a rendered ${EDIT_AREA_SELECTOR}`);
+    }
+    expect(editArea.getAttribute(TOUCH_GESTURE_MODE_ATTR)).toBe(
+      resolveArmedTouchGesture('phone', 'move'),
+    );
+  });
+
+  it('holds the desktop tool cluster in the footer row under the tracks, so no button floats over a track', () => {
+    const desktop = renderCanvas({ deviceClass: 'desktop', onAddEffectLayerAt: vi.fn(), rowHeight: 36 });
+    const cluster = desktop.container.querySelector('[data-testid="timeline-tool-buttons"]');
+    expect(cluster).toBeInstanceOf(HTMLElement);
+    // Inside the scroll container, in the footer row that ends its content, and in the layout flow.
+    expect(desktop.container.querySelector(EDIT_AREA_SELECTOR)?.contains(cluster)).toBe(true);
+    const footer = (cluster as HTMLElement).parentElement as HTMLElement;
+    expect(footer.nextElementSibling?.getAttribute('data-testid')).toBe('timeline-playhead');
+    expect(footer.className).not.toContain('absolute');
+    expect(cluster?.className).not.toContain('absolute');
+    // The 24px pointer buttons need 32px (one button plus 4px above and below): a 36px track row holds them.
+    expect(footer.style.height).toBe('36px');
+    // The footer row is pinned to the bottom of the scroll viewport.
+    expect(footer.getAttribute('data-testid')).toBe('timeline-footer-row');
+    expect(footer.className).toContain('sticky');
+    expect(footer.className).toContain('bottom-0');
+    desktop.unmount();
+
+    // A short row grows to hold the buttons rather than letting them overlap a track.
+    const short = renderCanvas({ deviceClass: 'desktop', onAddEffectLayerAt: vi.fn(), rowHeight: 24 });
+    const shortFooter = (short.container.querySelector('[data-testid="timeline-tool-buttons"]') as HTMLElement).parentElement as HTMLElement;
+    expect(shortFooter.style.height).toBe('32px');
+    short.unmount();
+
+    const noCluster = renderCanvas({ deviceClass: 'desktop', rowHeight: 36 });
+    expect(noCluster.container.querySelector('[data-testid="timeline-tool-buttons"]')).toBeNull();
+    expect((noCluster.container.querySelector(`${EDIT_AREA_SELECTOR} .border-t.bg-background`) as HTMLElement).style.height).toBe('36px');
+  });
+
+  it('draws no create tools on touch: the footer is a plain track row', () => {
+    ['phone', 'tablet'].forEach((deviceClass) => {
+      const touch = renderCanvas({
+        deviceClass: deviceClass as 'phone' | 'tablet',
+        inputModality: 'touch',
+        onOpenElementCreationPrompt: vi.fn(),
+        rowHeight: 36,
+      });
+      expect(touch.container.querySelector('[data-testid="timeline-tool-buttons"]')).toBeNull();
+      const footer = touch.container.querySelector(`${EDIT_AREA_SELECTOR} [data-testid="timeline-playhead"]`)?.previousElementSibling as HTMLElement;
+      expect(footer.style.height).toBe('36px');
+      touch.unmount();
+    });
+  });
+
+  it('stacks the ruler time labels above the extension ruler overlay that carries marker diamonds', () => {
+    const { container } = renderCanvas();
+    const zIndexOf = (element: Element | null): number => {
+      const match = /(?:^|\s)z-(\d+)(?:\s|$)/.exec(element?.getAttribute('class') ?? '');
+      if (!match) throw new Error('expected a z-index class');
+      return Number(match[1]);
+    };
+    const labels = container.querySelector('[data-testid="timeline-ruler-labels"]');
+    const clip = labels?.parentElement ?? null;
+    const overlay = container.querySelector('[data-testid="timeline-extension-ruler-overlay-root"]');
+    expect(labels?.textContent).toContain('0:00.00');
+    expect(zIndexOf(clip)).toBeGreaterThan(zIndexOf(overlay));
+    // No ancestor between the label layer and the canvas root may open a stacking context of its own, or the
+    // label layer's z-index would only order it inside that ancestor.
+    expect(clip?.parentElement?.getAttribute('data-testid')).toBe('timeline-ruler');
+    expect(overlay?.parentElement).toBe(clip?.parentElement?.parentElement);
+  });
+
+  it('clips the ruler labels to the timeline area, so a scrolled label never paints over the gutter legend or pager', () => {
+    const { container } = renderCanvas({ startLeft: 144 });
+    const labels = container.querySelector('[data-testid="timeline-ruler-labels"]') as HTMLElement;
+    const clip = labels.parentElement as HTMLElement;
+    expect(clip.className).toContain('overflow-hidden');
+    expect(clip.style.left).toBe('144px');
+    // The layer is offset by the gutter too, so a label still lands on its tick: left of the clip edge it is cut off.
+    expect(labels.style.transform).toBe('translateX(-144px)');
+  });
+
+  it('labels the ruler ticks as m:ss on touch and m:ss.cc on desktop', () => {
+    const desktop = renderCanvas({ deviceClass: 'desktop' });
+    expect(desktop.container.querySelector('[data-testid="timeline-ruler-labels"]')?.textContent).toContain('0:00.00');
+    desktop.unmount();
+    const phone = renderCanvas({ deviceClass: 'phone', inputModality: 'touch' });
+    const text = phone.container.querySelector('[data-testid="timeline-ruler-labels"]')?.textContent ?? '';
+    expect(text).toContain('0:00');
+    expect(text).not.toContain('0:00.00');
+  });
+
+  it('writes row, track and trim-handle attributes the gesture layer reads back', () => {
+    const { container } = renderCanvas();
+    const handle = container.querySelector(`[${RESIZE_EDGE_ATTR}='left']`);
+
+    if (!(handle instanceof HTMLElement)) {
+      throw new Error('expected a rendered left trim handle');
+    }
+    expect(handle.getAttribute(CLIP_ID_ATTR)).toBe(action.id);
+    expect(handle.getAttribute(ROW_ID_ATTR)).toBe(row.id);
+    expect(container.querySelector(`[${ROW_ID_ATTR}='${row.id}']`)).toBeTruthy();
+    expect(container.querySelector(`[${TRACK_ID_ATTR}='${track.id}']`)).toBeTruthy();
+  });
+
+  it('keeps clip drag, marquee, context menu, native scroll, ruler, and selection live under a passive overlay', async () => {
+    const registry = createCommandRegistry();
+    const contextCommand = vi.fn();
+    registerTimelineAreaMenuCommand(registry, contextCommand);
+    const clipDragEvents: string[] = [];
+    const selectClip = vi.fn();
+    const onMarqueePointerDown = vi.fn();
+    const onSelectTrack = vi.fn();
+    const onClickTimeArea = vi.fn();
+    const PassiveOverlay = (_props: TimelineOverlayRenderProps) => (
+      <div data-testid="canvas-passive-overlay">passive overlay</div>
+    );
+    const passiveDescriptor: ResolvedTimelineOverlayDescriptor = {
+      extensionId: 'ext.timeline',
+      id: 'passive' as never,
+      renderId: 'passive/render',
+      render: PassiveOverlay,
+    };
+
+    const { container } = renderCanvas({
+      commandRegistry: registry,
+      overlays: [passiveDescriptor],
+      timelineOverlaysEnabled: true,
+      ops: {
+        setContextTarget: vi.fn(),
+        setInspectorTarget: vi.fn(),
+      },
+      getActionRender: vi.fn(() => (
+        <button
+          type="button"
+          data-testid="passive-overlay-clip"
+          onPointerDown={(event) => {
+            event.stopPropagation();
+            clipDragEvents.push('down');
+          }}
+          onPointerMove={() => clipDragEvents.push('move')}
+          onPointerUp={() => clipDragEvents.push('up')}
+          onClick={selectClip}
+        >
+          clip
+        </button>
+      )),
+      onEditAreaPointerDown: onMarqueePointerDown,
+      onSelectTrack,
+      onClickTimeArea,
+    });
+
+    const contentRoot = screen.getByTestId('timeline-extension-content-overlay-root');
+    const wrapper = screen.getByTestId('timeline-extension-overlay-ext.timeline-passive');
+    expect(screen.getByTestId('canvas-passive-overlay')).toBeInTheDocument();
+    expect(contentRoot).toHaveStyle({ pointerEvents: 'none' });
+    expect(wrapper).toHaveStyle({ pointerEvents: 'none' });
+    expect(wrapper).not.toHaveAttribute('data-overlay-interactive');
+
+    const clip = screen.getByTestId('passive-overlay-clip');
+    fireEvent.pointerDown(clip, { button: 0, pointerId: 31, clientX: 120 });
+    fireEvent.pointerMove(clip, { pointerId: 31, clientX: 145 });
+    fireEvent.pointerUp(clip, { pointerId: 31, clientX: 145 });
+    fireEvent.click(clip);
+    expect(clipDragEvents).toEqual(['down', 'move', 'up']);
+    expect(selectClip).toHaveBeenCalledTimes(1);
+
+    const editArea = container.querySelector(EDIT_AREA_SELECTOR);
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(editArea instanceof HTMLElement) || !(background instanceof HTMLElement)) {
+      throw new Error('expected timeline edit area and background');
+    }
+    fireEvent.pointerDown(background, { button: 0, pointerId: 32, clientX: 300, clientY: 100 });
+    expect(onMarqueePointerDown).toHaveBeenCalledTimes(1);
+
+    fireEvent.contextMenu(background, { clientX: 300, clientY: 100 });
+    fireEvent.click(screen.getByText('Open timeline command'));
+    await waitFor(() => expect(contextCommand).toHaveBeenCalledTimes(1));
+
+    const wheel = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 40 });
+    editArea.dispatchEvent(wheel);
+    expect(wheel.defaultPrevented).toBe(false);
+    editArea.scrollLeft = 64;
+    editArea.scrollTop = 12;
+    fireEvent.scroll(editArea);
+    expect(screen.getByTestId('timeline-extension-ruler-overlay-strip')).toHaveStyle({
+      transform: 'translateX(-64px)',
+    });
+
+    fireEvent.click(screen.getByText(track.label));
+    expect(onSelectTrack).toHaveBeenCalledWith(track.id);
+
+    const ruler = screen.getByTestId('timeline-ruler');
+    const rulerHit = ruler.lastElementChild;
+    if (!(rulerHit instanceof HTMLElement)) {
+      throw new Error('expected ruler pointer surface');
+    }
+    rulerHit.setPointerCapture = vi.fn();
+    rulerHit.hasPointerCapture = vi.fn(() => false);
+    fireEvent.pointerDown(rulerHit, { button: 0, pointerId: 33, clientX: 100 });
+    fireEvent.pointerUp(rulerHit, { button: 0, pointerId: 33, clientX: 100 });
+    expect(onClickTimeArea).toHaveBeenCalledTimes(1);
+  });
+
+});
+
+describe('TimelineCanvas floating tools', () => {
+  it('shows AI generation, extension and effect-or-animation tools in that order, each opening the chat with its draft', () => {
+    const onOpenElementCreationPrompt = vi.fn();
+    renderCanvas({ deviceClass: 'desktop', onOpenElementCreationPrompt });
+
+    const cluster = screen.getByTestId('timeline-tool-buttons');
+    expect(within(cluster).getAllByRole('button').map((button) => button.getAttribute('aria-label'))).toEqual([
+      'New AI generation',
+      'New extension',
+      'New effect or animation',
+    ]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'New AI generation' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New extension' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New effect or animation' }));
+    expect(onOpenElementCreationPrompt.mock.calls).toEqual([
+      [AI_GENERATION_DRAFT],
+      [EXTENSION_DRAFT],
+      [EFFECT_OR_ANIMATION_DRAFT],
+    ]);
+  });
+
+  it.each(['tablet', 'phone'] as const)('shows no floating tool cluster on %s (touch)', (deviceClass) => {
+    // Touch leaves adding elements to the agent: the timeline is for seeing the cut and tapping a clip.
+    renderCanvas({
+      deviceClass,
+      inputModality: 'touch',
+      onAddEffectLayerAt: vi.fn(),
+      onOpenExtensionManager: vi.fn(),
+      onOpenElementCreationPrompt: vi.fn(),
+      tracks: [{ id: 'A1', kind: 'audio', label: 'A1' }, track],
+      rows: [{ id: 'A1', actions: [] }, row],
+    });
+
+    expect(screen.queryByTestId('timeline-tool-buttons')).toBeNull();
+    for (const name of ['New AI generation', 'New extension', 'New effect or animation']) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+  });
+
+  it.each(['tablet', 'phone'] as const)('offers no add-track or clear-unused controls on %s (touch)', (deviceClass) => {
+    // Touch leaves adding tracks and tidying them to the agent: its timeline is for seeing the cut and tapping a clip.
+    renderCanvas({
+      deviceClass,
+      inputModality: 'touch',
+      onAddEffectLayerAt: vi.fn(),
+      onAddTrack: vi.fn(),
+      onClearUnusedTracks: vi.fn(),
+      unusedTrackCount: 1,
+      tracks: [{ id: 'A1', kind: 'audio', label: 'A1' }, track],
+      rows: [{ id: 'A1', actions: [] }, row],
+    });
+
+    for (const name of ['+ Video', '+ Audio', 'Clear 1 unused']) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+  });
+});
+
+describe('TimelineCanvas postprocess shader badge', () => {
+  const postprocessShader: TimelinePostprocessShaderMetadata = {
+    scope: 'postprocess',
+    extensionId: 'ext.shader',
+    contributionId: 'post-grade',
+    shaderId: 'shader.post.grade',
+    label: 'Post Grade',
+  };
+
+  it('renders a stable postprocess shader badge and selects the shader target', () => {
+    const onSelectPostprocessShader = vi.fn();
+    const { container } = renderCanvas({
+      postprocessShader,
+      onSelectPostprocessShader,
+    });
+
+    const badge = container.querySelector('[data-postprocess-shader-badge="true"]');
+    if (!(badge instanceof HTMLElement)) {
+      throw new Error('expected postprocess shader badge');
+    }
+
+    expect(badge).toHaveAttribute('data-shader-scope', 'postprocess');
+    expect(badge).toHaveAttribute('data-shader-id', 'shader.post.grade');
+    expect(badge).toHaveTextContent('Postprocess');
+    expect(badge).toHaveTextContent('Post Grade');
+
+    fireEvent.click(badge);
+
+    expect(onSelectPostprocessShader).toHaveBeenCalledTimes(1);
+    expect(onSelectPostprocessShader).toHaveBeenCalledWith(postprocessShader);
+  });
+});
+
+describe('TimelineCanvas extension context menus', () => {
+  it('invokes timeline-area context menu commands from editable canvas background targets', async () => {
+    const registry = createCommandRegistry();
+    const handler = vi.fn();
+    registerTimelineAreaMenuCommand(registry, handler);
+    const { container } = renderCanvas({ commandRegistry: registry });
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(background instanceof HTMLElement)) {
+      throw new Error('expected timeline background');
+    }
+
+    fireEvent.contextMenu(background, { clientX: 160, clientY: 120 });
+    fireEvent.click(screen.getByText('Open timeline command'));
+
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(handler.mock.calls[0][0]).toEqual(expect.objectContaining({
+      commandId: 'ext.timeline.open',
+      extensionId: 'ext.timeline',
+      target: { target: 'timeline-area' },
+    }));
+  });
+
+  it('zooms the timeline on Ctrl/Cmd+wheel and blocks page zoom, but leaves plain wheel alone', () => {
+    const onScaleWidthChange = vi.fn();
+    const { container } = renderCanvas({ onScaleWidthChange, scaleWidth: 100 });
+    const scroller = container.querySelector('.timeline-scroll');
+    if (!(scroller instanceof HTMLElement)) throw new Error('expected timeline scroller');
+
+    const plain = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -30 });
+    scroller.dispatchEvent(plain);
+    expect(plain.defaultPrevented).toBe(false);
+    expect(onScaleWidthChange).not.toHaveBeenCalled();
+
+    const zoomIn = new WheelEvent('wheel', { bubbles: true, cancelable: true, ctrlKey: true, deltaY: -30, clientX: 50 });
+    scroller.dispatchEvent(zoomIn);
+    expect(zoomIn.defaultPrevented).toBe(true);
+    expect(onScaleWidthChange).toHaveBeenCalledTimes(1);
+    expect(onScaleWidthChange.mock.calls[0][0]).toBeGreaterThan(100);
+
+    const zoomOut = new WheelEvent('wheel', { bubbles: true, cancelable: true, metaKey: true, deltaY: 30, clientX: 50 });
+    scroller.dispatchEvent(zoomOut);
+    expect(zoomOut.defaultPrevented).toBe(true);
+    expect(onScaleWidthChange.mock.calls[1][0]).toBeLessThan(100);
+  });
+
+  it('swallows the native context menu on the empty timeline when no actions are eligible', () => {
+    const { container } = renderCanvas();
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(background instanceof HTMLElement)) {
+      throw new Error('expected timeline background');
+    }
+
+    const event = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 160,
+      clientY: 120,
+    });
+    background.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.body.querySelector('div.fixed.z-50')).toBeNull();
+  });
+
+  it('filters timeline-area context menu items by predicate', () => {
+    const registry = createCommandRegistry();
+    registerTimelineAreaMenuCommand(registry, vi.fn(), {
+      command: 'ext.timeline.visible',
+      menuLabel: 'Visible timeline action',
+      when: 'target.target == "timeline-area"',
+    });
+    registerTimelineAreaMenuCommand(registry, vi.fn(), {
+      command: 'ext.timeline.hidden',
+      menuLabel: 'Hidden timeline action',
+      when: 'target.target == "clip"',
+    });
+    const { container } = renderCanvas({ commandRegistry: registry });
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(background instanceof HTMLElement)) {
+      throw new Error('expected timeline background');
+    }
+
+    fireEvent.contextMenu(background, { clientX: 160, clientY: 120 });
+
+    expect(screen.getByText('Visible timeline action')).toBeInTheDocument();
+    expect(screen.queryByText('Hidden timeline action')).not.toBeInTheDocument();
+  });
+
+  it('keeps shot-group context menus reserved to the built-in shot-group surface', () => {
+    const registry = createCommandRegistry();
+    const handler = vi.fn();
+    registerTimelineAreaMenuCommand(registry, handler);
+    const onShotGroupNavigate = vi.fn();
+    const { getByTitle } = renderCanvas({
+      commandRegistry: registry,
+      row: pinnedGroupRow,
+      shotGroups: [pinnedShotGroup],
+      allowMissingHandles: true,
+      onShotGroupNavigate,
+    });
+    const label = getByTitle('Pinned Shot') as HTMLElement;
+
+    fireEvent.contextMenu(label, { clientX: 120, clientY: 80 });
+
+    expect(screen.getByText('Jump to Shot')).toBeInTheDocument();
+    expect(screen.queryByText('Open timeline command')).not.toBeInTheDocument();
+  });
+
+  it('does not open an area menu on empty-area right-click when nothing is eligible', () => {
+    const { container } = renderCanvas({
+      scale: 1,
+      scaleWidth: 100,
+      startLeft: 0,
+    });
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(background instanceof HTMLElement)) {
+      throw new Error('expected timeline background');
+    }
+
+    fireEvent.contextMenu(background, { clientX: 160, clientY: 120 });
+
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByText('Create Shot')).not.toBeInTheDocument();
+  });
+
+  it('shows Create Shot from selection in the area menu for an eligible multi-selection', () => {
+    const onCreateShotFromSelection = vi.fn(async () => null);
+    const { container } = renderCanvas({
+      canCreateShotFromSelection: true,
+      selectedClipCount: 3,
+      onCreateShotFromSelection,
+    });
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(background instanceof HTMLElement)) {
+      throw new Error('expected timeline background');
+    }
+
+    fireEvent.contextMenu(background, { clientX: 160, clientY: 120 });
+
+    expect(screen.getByText('Create Shot from selection')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Create Shot from selection'));
+    expect(onCreateShotFromSelection).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits Create Shot from selection for a single-clip selection', () => {
+    const onCreateShotFromSelection = vi.fn(async () => null);
+    const { container } = renderCanvas({
+      canCreateShotFromSelection: true,
+      selectedClipCount: 1,
+      onCreateShotFromSelection,
+    });
+    const background = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(background instanceof HTMLElement)) {
+      throw new Error('expected timeline background');
+    }
+
+    fireEvent.contextMenu(background, { clientX: 160, clientY: 120 });
+
+    expect(screen.queryByText('Create Shot from selection')).not.toBeInTheDocument();
+  });
+});
+
+describe('TimelineCanvas resize pending ops', () => {
+  it('selects a short or overlapped clip when its trim handle is clicked without resizing', () => {
+    const onSelectClips = vi.fn();
+    const { actionElement, leftHandle, onActionResizeStart, onClipEdgeResizeEnd } = renderCanvas({
+      onSelectClips,
+      getActionRender: vi.fn((renderedAction) => (
+        <div className="clip-action" data-clip-id={renderedAction.id} role="button" tabIndex={0}>
+          clip body
+        </div>
+      )),
+    });
+    if (!leftHandle) throw new Error('expected left handle');
+
+    // The trim handles mirror data-clip-id for the document-native resize
+    // machine. Only the interactive body may satisfy a clip-body locator.
+    expect(actionElement.querySelectorAll(`[${CLIP_ID_ATTR}="clip-1"]`)).toHaveLength(3);
+    expect(actionElement.querySelectorAll(`${CLIP_BODY_SELECTOR}[${CLIP_ID_ATTR}="clip-1"]`)).toHaveLength(1);
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 6,
+      clientX: 120,
+    });
+    fireEvent.pointerUp(leftHandle, {
+      button: 0,
+      pointerId: 6,
+      clientX: 120,
+    });
+
+    expect(onSelectClips).toHaveBeenCalledWith(['clip-1']);
+    expect(onActionResizeStart).not.toHaveBeenCalled();
+    expect(onClipEdgeResizeEnd).not.toHaveBeenCalled();
+  });
+
+  it('centers a requested clip in the scroll viewport', async () => {
+    const secondTrack: TrackDefinition = { id: 'V2', kind: 'visual', label: 'V2' };
+    const lateRow: TimelineRow = {
+      id: 'V2',
+      actions: [{ id: 'clip-late', start: 6, end: 8, effectId: 'effect-clip-late' }],
+    };
+    const { container } = renderCanvas({
+      tracks: [track, secondTrack],
+      rows: [row, lateRow],
+      actionId: 'clip-late',
+      scale: 1,
+      scaleWidth: 100,
+    });
+    const editArea = container.querySelector('.timeline-canvas-edit-area') as HTMLElement;
+    Object.defineProperty(editArea, 'clientWidth', { value: 200, configurable: true });
+    Object.defineProperty(editArea, 'clientHeight', { value: 48, configurable: true });
+    const scrollTo = vi.fn((options: ScrollToOptions) => {
+      editArea.scrollLeft = Number(options.left ?? 0);
+      editArea.scrollTop = Number(options.top ?? 0);
+    });
+    editArea.scrollTo = scrollTo;
+
+    requestCenterTimelineClip('clip-late');
+
+    await waitFor(() => expect(scrollTo).toHaveBeenCalled());
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({
+      left: 600,
+      top: 48,
+      behavior: 'smooth',
+    }));
+  });
+
+  it('sizes the playhead to the full scrollable timeline content height', () => {
+    const secondTrack: TrackDefinition = { id: 'V2', kind: 'visual', label: 'V2' };
+    const secondRow: TimelineRow = {
+      id: 'V2',
+      actions: [{ id: 'clip-2', start: 1, end: 3, effectId: 'effect-clip-2' }],
+    };
+
+    const { getByTestId } = renderCanvas({
+      tracks: [track, secondTrack],
+      rows: [row, secondRow],
+    });
+
+    expect(getByTestId('timeline-playhead')).toHaveStyle({ height: '144px' });
+  });
+
+  it('sets interactionStateRef.resize on resize start and clears on resize end', () => {
+    const interactionStateRef = { current: createInteractionState() };
+    const { leftHandle, onActionResizeStart, onClipEdgeResizeEnd } = renderCanvas({ interactionStateRef });
+    if (!leftHandle) throw new Error('expected left handle');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 7,
+      clientX: 120,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(false);
+    expect(onActionResizeStart).toHaveBeenCalledTimes(0);
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 7,
+      clientX: 112,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(true);
+    expect(onActionResizeStart).toHaveBeenCalledTimes(1);
+
+    fireEvent.pointerUp(leftHandle, {
+      pointerId: 7,
+      clientX: 112,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(false);
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears interactionStateRef.resize on pointercancel and reports a cancelled resize end', () => {
+    const interactionStateRef = { current: createInteractionState() };
+    const { leftHandle, onClipEdgeResizeEnd } = renderCanvas({ interactionStateRef });
+    if (!leftHandle) throw new Error('expected left handle');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 8,
+      clientX: 120,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(false);
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 8,
+      clientX: 112,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(true);
+
+    fireEvent.pointerCancel(leftHandle, {
+      pointerId: 8,
+      clientX: 112,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(false);
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: true,
+      session: expect.objectContaining({ clipId: 'clip-1', edge: 'left', rowId: 'V1' }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0, end: 2 }),
+      ]),
+    }));
+  });
+
+  it('toggles interactionStateRef.resize with the resize lifecycle', () => {
+    const interactionStateRef = { current: createInteractionState() };
+    const { leftHandle } = renderCanvas({ interactionStateRef });
+    if (!leftHandle) throw new Error('expected left handle');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 18,
+      clientX: 120,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(false);
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 18,
+      clientX: 112,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(true);
+
+    fireEvent.pointerUp(leftHandle, {
+      pointerId: 18,
+      clientX: 112,
+    });
+
+    expect(interactionStateRef.current.resize).toBe(false);
+  });
+
+  it('gates touch trim ownership and resize state until the trim threshold is crossed', () => {
+    setInputModalityFromPointerType.mockReturnValue('touch');
+    const interactionStateRef = { current: createInteractionState() };
+    const { leftHandle, onActionResizeStart, onClipEdgeResizeEnd } = renderCanvas({
+      deviceClass: 'tablet',
+      inputModality: 'touch',
+      interactionMode: 'trim',
+      interactionStateRef,
+    });
+    if (!leftHandle) throw new Error('expected left handle');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 27,
+      pointerType: 'touch',
+      clientX: 120,
+    });
+
+    expect(setGestureOwner).not.toHaveBeenCalled();
+    expect(onActionResizeStart).not.toHaveBeenCalled();
+    expect(interactionStateRef.current.resize).toBe(false);
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 27,
+      pointerType: 'touch',
+      clientX: 118,
+    });
+
+    expect(setGestureOwner).not.toHaveBeenCalled();
+    expect(onActionResizeStart).not.toHaveBeenCalled();
+    expect(interactionStateRef.current.resize).toBe(false);
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 27,
+      pointerType: 'touch',
+      clientX: 110,
+    });
+
+    expect(setGestureOwner).toHaveBeenNthCalledWith(1, 'trim');
+    expect(onActionResizeStart).toHaveBeenCalledTimes(1);
+    expect(interactionStateRef.current.resize).toBe(true);
+
+    fireEvent.pointerUp(leftHandle, {
+      pointerId: 27,
+      pointerType: 'touch',
+      clientX: 110,
+    });
+
+    expect(setGestureOwner).toHaveBeenLastCalledWith('none');
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledTimes(1);
+    expect(interactionStateRef.current.resize).toBe(false);
+  });
+
+  it('clears resize preview and completes release on pointerup without pointer capture', () => {
+    const interactionStateRef = { current: createInteractionState() };
+    const onInteractionEndSpy = vi.fn();
+    onInteractionEnd(interactionStateRef, onInteractionEndSpy);
+    const { actionElement, rightHandle, onClipEdgeResizeEnd } = renderCanvas({ interactionStateRef });
+    if (!rightHandle) throw new Error('expected right handle');
+
+    fireEvent.pointerDown(rightHandle, {
+      button: 0,
+      pointerId: 19,
+      clientX: 200,
+    });
+
+    fireEvent.pointerMove(rightHandle, {
+      pointerId: 19,
+      clientX: 300,
+    });
+
+    expect(actionElement.style.width).toBe('300px');
+    expect(interactionStateRef.current.resize).toBe(true);
+
+    fireEvent.pointerUp(rightHandle, {
+      pointerId: 19,
+      clientX: 300,
+    });
+
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({ clipId: 'clip-1', edge: 'right', rowId: 'V1' }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0, end: 3 }),
+      ]),
+    }));
+    expect(actionElement.style.width).toBe('200px');
+    expect(interactionStateRef.current.resize).toBe(false);
+    expect(onInteractionEndSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes the rendered clip width into getActionRender', () => {
+    const getActionRender = vi.fn(() => <div>clip</div>);
+    renderCanvas({ getActionRender });
+
+    expect(getActionRender).toHaveBeenCalledWith(action, row, 200);
+  });
+
+  it('clamps right-edge audio resize preview to the source duration and clears the ring on resize end', () => {
+    const audioTrack: TrackDefinition = { id: 'A1', kind: 'audio', label: 'A1' };
+    const audioAction: TimelineAction = { id: 'clip-1', start: 0, end: 2, effectId: 'effect-clip-1' };
+    const audioRow: TimelineRow = { id: 'A1', actions: [audioAction] };
+    const dataRef = {
+      current: {
+        meta: {
+          'clip-1': { track: 'A1', clipType: 'media', asset: 'asset-1', from: 1, speed: 1 },
+        },
+        tracks: [audioTrack],
+        resolvedConfig: {
+          registry: {
+            'asset-1': { duration: 3.5 },
+          },
+        },
+        registry: {
+          assets: {
+            'asset-1': { duration: 3.5 },
+          },
+        },
+      },
+    };
+    const { actionElement, rightHandle, onClipEdgeResizeEnd } = renderCanvas({
+      track: audioTrack,
+      row: audioRow,
+      dataRef,
+    });
+    if (!rightHandle) throw new Error('expected right handle');
+
+    fireEvent.pointerDown(rightHandle, {
+      button: 0,
+      pointerId: 9,
+      clientX: 200,
+    });
+
+    fireEvent.pointerMove(rightHandle, {
+      pointerId: 9,
+      clientX: 400,
+    });
+
+    expect(actionElement.className).toContain('ring-[var(--video-editor-warning-ring)]');
+
+    fireEvent.pointerUp(rightHandle, {
+      pointerId: 9,
+      clientX: 400,
+    });
+
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({ clipId: 'clip-1', edge: 'right', rowId: 'A1' }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0, end: 2.5 }),
+      ]),
+    }));
+    expect(actionElement.className).not.toContain('ring-[var(--video-editor-warning-ring)]');
+  });
+
+  it('clamps left-edge audio resize preview before source time zero', () => {
+    const audioTrack: TrackDefinition = { id: 'A1', kind: 'audio', label: 'A1' };
+    const audioAction: TimelineAction = { id: 'clip-1', start: 2, end: 4, effectId: 'effect-clip-1' };
+    const audioRow: TimelineRow = { id: 'A1', actions: [audioAction] };
+    const dataRef = {
+      current: {
+        meta: {
+          'clip-1': { track: 'A1', clipType: 'media', asset: 'asset-1', from: 1, speed: 1 },
+        },
+        tracks: [audioTrack],
+        resolvedConfig: {
+          registry: {
+            'asset-1': { duration: 5 },
+          },
+        },
+        registry: {
+          assets: {
+            'asset-1': { duration: 5 },
+          },
+        },
+      },
+    };
+    const { actionElement, leftHandle, onClipEdgeResizeEnd } = renderCanvas({
+      track: audioTrack,
+      row: audioRow,
+      dataRef,
+    });
+    if (!leftHandle) throw new Error('expected left handle');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 10,
+      clientX: 200,
+    });
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 10,
+      clientX: -100,
+    });
+
+    expect(actionElement.className).toContain('ring-[var(--video-editor-warning-ring)]');
+
+    fireEvent.pointerUp(leftHandle, {
+      pointerId: 10,
+      clientX: -100,
+    });
+
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({ clipId: 'clip-1', edge: 'left', rowId: 'A1' }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 1, end: 4 }),
+      ]),
+    }));
+    expect(actionElement.className).not.toContain('ring-[var(--video-editor-warning-ring)]');
+  });
+
+  it('anchors free clip preview to the real boundary pixel when the handle is grabbed off-center', () => {
+    const { actionElement, rightHandle, onClipEdgeResizeEnd } = renderCanvas({ startLeft: 25 });
+    if (!rightHandle) throw new Error('expected right handle');
+
+    fireEvent.pointerDown(rightHandle, {
+      button: 0,
+      pointerId: 30,
+      clientX: 221,
+    });
+
+    fireEvent.pointerMove(rightHandle, {
+      pointerId: 30,
+      clientX: 271,
+    });
+
+    expect(actionElement.style.width).toBe('250px');
+
+    fireEvent.pointerUp(rightHandle, {
+      pointerId: 30,
+      clientX: 271,
+    });
+
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({ clipId: 'clip-1', edge: 'right', rowId: 'V1' }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0, end: 2.5 }),
+      ]),
+    }));
+  });
+
+  it('snaps a free clip edge to sibling boundaries on release', () => {
+    const snappingRow: TimelineRow = {
+      id: 'V1',
+      actions: [
+        { id: 'clip-1', start: 0, end: 2, effectId: 'effect-clip-1' },
+        { id: 'clip-2', start: 3, end: 4, effectId: 'effect-clip-2' },
+      ],
+    };
+    const { actionElement, rightHandle, onClipEdgeResizeEnd } = renderCanvas({
+      row: snappingRow,
+      actionId: 'clip-1',
+    });
+    if (!rightHandle) throw new Error('expected right handle');
+
+    fireEvent.pointerDown(rightHandle, {
+      button: 0,
+      pointerId: 34,
+      clientX: 200,
+    });
+
+    fireEvent.pointerMove(rightHandle, {
+      pointerId: 34,
+      clientX: 295,
+    });
+
+    expect(actionElement.style.width).toBe('300px');
+
+    fireEvent.pointerUp(rightHandle, {
+      pointerId: 34,
+      clientX: 295,
+    });
+
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({ clipId: 'clip-1', edge: 'right', rowId: 'V1' }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0, end: 3 }),
+      ]),
+    }));
+  });
+
+  it('anchors interior pinned-group boundary preview to the real boundary pixel when grabbed off-center', () => {
+    const { container, actionElement, rightHandle, onClipEdgeResizeEnd } = renderCanvas({
+      row: pinnedGroupRow,
+      actionId: 'clip-2',
+      shotGroups: [pinnedShotGroup],
+      allowMissingHandles: true,
+      startLeft: 25,
+    });
+    if (!rightHandle) throw new Error('expected right handle');
+
+    fireEvent.pointerDown(rightHandle, {
+      button: 0,
+      pointerId: 31,
+      clientX: 221,
+    });
+
+    fireEvent.pointerMove(rightHandle, {
+      pointerId: 31,
+      clientX: 251,
+    });
+
+    const adjacentElement = container.querySelector('[data-action-id="clip-3"]');
+    if (!(adjacentElement instanceof HTMLElement)) {
+      throw new Error('expected adjacent action element');
+    }
+
+    expect(Number.parseFloat(actionElement.style.width)).toBeCloseTo(130, 5);
+    expect(Number.parseFloat(adjacentElement.style.left)).toBeCloseTo(255, 5);
+
+    fireEvent.pointerUp(rightHandle, {
+      pointerId: 31,
+      clientX: 251,
+    });
+
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({
+        clipId: 'clip-2',
+        edge: 'right',
+        rowId: 'V1',
+        context: expect.objectContaining({ kind: 'group' }),
+      }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-2', start: 1, end: 2.3 }),
+        expect.objectContaining({ clipId: 'clip-3', start: 2.3, end: 3.3 }),
+      ]),
+    }));
+  });
+
+  it('keeps the interior pinned-group boundary fixed on release after a pointer drag', () => {
+    const { getActionElement, getHandle, onClipEdgeResizeEndSpy } = renderStatefulPinnedGroupCanvas({
+      actionId: 'clip-2',
+      startLeft: 25,
+    });
+    const rightHandle = getHandle('clip-2', 'right');
+
+    fireEvent.pointerDown(rightHandle, {
+      button: 0,
+      pointerId: 32,
+      clientX: 221,
+    });
+
+    fireEvent.pointerMove(rightHandle, {
+      pointerId: 32,
+      clientX: 251,
+    });
+
+    const previewBoundaryLeft = Number.parseFloat(getActionElement('clip-3').style.left);
+    const previewDraggedWidth = Number.parseFloat(getActionElement('clip-2').style.width);
+    expect(previewBoundaryLeft).toBeCloseTo(255, 5);
+    expect(previewDraggedWidth).toBeCloseTo(130, 5);
+
+    fireEvent.pointerUp(rightHandle, {
+      pointerId: 32,
+      clientX: 251,
+    });
+
+    expect(Number.parseFloat(getActionElement('clip-3').style.left)).toBeCloseTo(previewBoundaryLeft, 5);
+    expect(Number.parseFloat(getActionElement('clip-2').style.width)).toBeCloseTo(previewDraggedWidth, 5);
+    expect(onClipEdgeResizeEndSpy).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({
+        clipId: 'clip-2',
+        edge: 'right',
+        context: expect.objectContaining({ kind: 'group' }),
+      }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-2', start: 1, end: 2.3 }),
+        expect.objectContaining({ clipId: 'clip-3', start: 2.3, end: 3.3 }),
+      ]),
+    }));
+  });
+
+  it('renders interior boundary resize handles for middle pinned-group children', () => {
+    // The middle child has both interior boundaries (between clip-1/clip-2
+    // on the left and clip-2/clip-3 on the right), so both handles render.
+    const { leftHandle, rightHandle } = renderCanvas({
+      row: pinnedGroupRow,
+      actionId: 'clip-2',
+      shotGroups: [pinnedShotGroup],
+      allowMissingHandles: true,
+    });
+
+    expect(leftHandle).not.toBeNull();
+    expect(rightHandle).not.toBeNull();
+  });
+
+  it('renders outer-edge resize handles on first/last pinned-group children (delegated to group edge resize)', () => {
+    // First and last children render BOTH handles. Their outer edge handle
+    // (left for first, right for last) is routed to the shot-group edge
+    // resize so the user can grab the group's outer edge directly from the
+    // clip handle in addition to the dedicated round overlay handle.
+    const first = renderCanvas({
+      row: pinnedGroupRow,
+      actionId: 'clip-1',
+      shotGroups: [pinnedShotGroup],
+      allowMissingHandles: true,
+    });
+    expect(first.leftHandle).not.toBeNull();
+    expect(first.rightHandle).not.toBeNull();
+
+    const last = renderCanvas({
+      row: pinnedGroupRow,
+      actionId: 'clip-3',
+      shotGroups: [pinnedShotGroup],
+      allowMissingHandles: true,
+    });
+    expect(last.leftHandle).not.toBeNull();
+    expect(last.rightHandle).not.toBeNull();
+  });
+
+  it('reveals only the hovered shot label across its body and label, then collapses on exit', () => {
+    const { container, getByTitle } = renderCanvas({
+      row: shiftedPinnedGroupRow,
+      shotGroups: [
+        { ...pinnedShotGroup, start: 1 },
+        { ...pinnedShotGroup, shotId: 'shot-2', shotName: 'Second Shot', start: 5 },
+      ],
+      allowMissingHandles: true,
+    });
+    const scroller = container.querySelector<HTMLElement>(EDIT_AREA_SELECTOR)!;
+    const label = getByTitle('Pinned Shot');
+    const otherLabel = getByTitle('Second Shot');
+    expect(label.classList.contains('h-1')).toBe(true);
+
+    // A pointer entering anywhere inside the body reveals its label.
+    fireEvent.pointerOver(scroller, { pointerType: 'mouse', clientX: 200, clientY: 24 });
+    expect(label.classList.contains('z-10')).toBe(true);
+    expect(label.classList.contains('h-[18px]')).toBe(true);
+    expect(otherLabel.classList.contains('h-1')).toBe(true);
+
+    // Body -> floating label does not collapse, despite separate DOM layers.
+    fireEvent.pointerOver(label, { pointerType: 'mouse', clientX: 200, clientY: -8 });
+    expect(label.classList.contains('h-[18px]')).toBe(true);
+    fireEvent.pointerMove(scroller, { pointerType: 'mouse', clientX: 450, clientY: 24 });
+    expect(label.classList.contains('h-1')).toBe(true);
+    fireEvent.pointerOver(label, { pointerType: 'mouse', clientX: 200, clientY: 2 });
+    expect(label.classList.contains('h-[18px]')).toBe(true);
+    fireEvent.pointerLeave(label, { relatedTarget: document.body });
+    expect(label.classList.contains('h-1')).toBe(true);
+  });
+
+  it('renders pinned shot groups from group.start and children rather than clip array order', () => {
+    const unorderedRow: TimelineRow = {
+      id: 'V1',
+      actions: [
+        { id: 'clip-3', start: 3, end: 4, effectId: 'effect-clip-3' },
+        { id: 'clip-1', start: 1, end: 2, effectId: 'effect-clip-1' },
+        { id: 'clip-2', start: 2, end: 3, effectId: 'effect-clip-2' },
+      ],
+    };
+    const unorderedGroup: NonNullable<React.ComponentProps<typeof TimelineCanvas>['shotGroups']>[number] = {
+      ...pinnedShotGroup,
+      start: 1,
+      clipIds: ['clip-3', 'clip-1', 'clip-2'],
+      children: [
+        { clipId: 'clip-1', offset: 0, duration: 1 },
+        { clipId: 'clip-2', offset: 1, duration: 1 },
+        { clipId: 'clip-3', offset: 2, duration: 1 },
+      ],
+    };
+
+    const { getByText, getByTitle } = renderCanvas({
+      row: unorderedRow,
+      shotGroups: [unorderedGroup],
+      allowMissingHandles: true,
+    });
+
+    expect(getByText('Pinned Shot')).toBeTruthy();
+    const label = getByTitle('Pinned Shot') as HTMLElement;
+    expect(label).toBeTruthy();
+    expect(label.style.left).toBe('100px');
+    expect(label.style.width).toBe('300px');
+  });
+
+  it('routes the first child clip\'s outer-left handle through the pinned-group outer resize session', () => {
+    const onClipEdgeResizeEnd = vi.fn();
+    const { actionElement, leftHandle, onActionResizeStart } = renderCanvas({
+      row: shiftedPinnedGroupRow,
+      actionId: 'clip-1',
+      shotGroups: [{
+        ...pinnedShotGroup,
+        start: 1,
+      }],
+      dataRef: {
+        current: {
+          config: {
+            output: { resolution: '1920x1080', fps: 30, file: 'out.mp4' },
+            tracks: [track],
+            clips: [
+              { id: 'clip-1', at: 1, track: 'V1', clipType: 'hold', hold: 1 },
+              { id: 'clip-2', at: 2, track: 'V1', clipType: 'hold', hold: 1 },
+              { id: 'clip-3', at: 3, track: 'V1', clipType: 'hold', hold: 1 },
+            ],
+            pinnedShotGroups: [{
+              shotId: 'shot-1',
+              trackId: 'V1',
+              start: 1,
+              clipIds: ['clip-1', 'clip-2', 'clip-3'],
+              children: [
+                { clipId: 'clip-1', offset: 0, duration: 1 },
+                { clipId: 'clip-2', offset: 1, duration: 1 },
+                { clipId: 'clip-3', offset: 2, duration: 1 },
+              ],
+              mode: 'images',
+            }],
+          },
+        },
+      },
+      onClipEdgeResizeEnd,
+      allowMissingHandles: true,
+      startLeft: 25,
+    });
+
+    if (!leftHandle) throw new Error('expected outer-left clip handle on first child');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 12,
+      clientX: 121,
+    });
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 12,
+      clientX: 71,
+    });
+
+    expect(actionElement.style.left).toBe('75px');
+
+    fireEvent.pointerUp(leftHandle, {
+      pointerId: 12,
+      clientX: 71,
+    });
+
+    expect(onActionResizeStart).not.toHaveBeenCalled();
+    expect(onClipEdgeResizeEnd).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({
+        clipId: 'clip-1',
+        edge: 'left',
+        rowId: 'V1',
+        context: expect.objectContaining({ kind: 'group', shotId: 'shot-1', trackId: 'V1' }),
+      }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0.5, end: 2 }),
+        expect.objectContaining({ clipId: 'clip-2', start: 2, end: 3 }),
+        expect.objectContaining({ clipId: 'clip-3', start: 3, end: 4 }),
+      ]),
+    }));
+  });
+
+  it('keeps the outer-left preview boundary fixed on release after a pointer drag', () => {
+    const { getActionElement, getHandle, onClipEdgeResizeEndSpy } = renderStatefulPinnedGroupCanvas({
+      initialRow: shiftedPinnedGroupRow,
+      initialShotGroup: {
+        ...pinnedShotGroup,
+        start: 1,
+      },
+      actionId: 'clip-1',
+      startLeft: 25,
+    });
+    const leftHandle = getHandle('clip-1', 'left');
+
+    fireEvent.pointerDown(leftHandle, {
+      button: 0,
+      pointerId: 33,
+      clientX: 121,
+    });
+
+    fireEvent.pointerMove(leftHandle, {
+      pointerId: 33,
+      clientX: 71,
+    });
+
+    const previewLeft = Number.parseFloat(getActionElement('clip-1').style.left);
+    expect(previewLeft).toBeCloseTo(75, 5);
+
+    fireEvent.pointerUp(leftHandle, {
+      pointerId: 33,
+      clientX: 71,
+    });
+
+    expect(Number.parseFloat(getActionElement('clip-1').style.left)).toBeCloseTo(previewLeft, 5);
+    expect(onClipEdgeResizeEndSpy).toHaveBeenCalledWith(expect.objectContaining({
+      cancelled: false,
+      session: expect.objectContaining({
+        clipId: 'clip-1',
+        edge: 'left',
+        context: expect.objectContaining({ kind: 'group', shotId: 'shot-1', trackId: 'V1' }),
+      }),
+      updates: expect.arrayContaining([
+        expect.objectContaining({ clipId: 'clip-1', start: 0.5, end: 2 }),
+        expect.objectContaining({ clipId: 'clip-2', start: 2, end: 3 }),
+        expect.objectContaining({ clipId: 'clip-3', start: 3, end: 4 }),
+      ]),
+    }));
+  });
+
+  it('renders all shot groups with solid borders and always shows the shot name label', () => {
+    const { container, getByText, getAllByTitle } = renderCanvas({
+      shotGroups: [
+        {
+          shotId: 'shot-a',
+          shotName: 'Shot A',
+          rowId: 'V1',
+          rowIndex: 0,
+          start: 0,
+          clipIds: ['clip-1'],
+          children: [{ clipId: 'clip-1', offset: 0, duration: 2 }],
+          color: '#3b82f6',
+        },
+        {
+          shotId: 'shot-b',
+          shotName: 'Shot B',
+          rowId: 'V1',
+          rowIndex: 0,
+          start: 0,
+          clipIds: ['clip-1'],
+          children: [{ clipId: 'clip-1', offset: 0, duration: 2 }],
+          color: '#22c55e',
+          mode: 'images',
+        },
+      ],
+      allowMissingHandles: true,
+    });
+
+    expect(container.innerHTML).not.toContain('border-dashed');
+    expect(container.innerHTML).toContain('border-solid');
+    expect(getAllByTitle(/Shot [AB]/)).toHaveLength(2);
+    expect(getByText('Shot A')).toBeTruthy();
+    expect(getByText('Shot B')).toBeTruthy();
+  });
+
+  it('renders the first-row shot group label in an overlay above the tracks without adding layout headroom', () => {
+    const { container, getByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      allowMissingHandles: true,
+    });
+
+    const gridSurface = container.querySelector('.timeline-canvas-edit-area > .relative');
+    if (!(gridSurface instanceof HTMLElement)) {
+      throw new Error('expected timeline grid surface');
+    }
+
+    expect(gridSurface.style.paddingTop).toBe('');
+    expect(getByTitle('Pinned Shot')).toHaveStyle({
+      top: '16px',
+    });
+    expect(getByTitle('Pinned Shot').classList.contains('h-1')).toBe(true);
+  });
+
+  it('hides shot overlays while a clip drag is active', () => {
+    const { queryByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      isDragging: true,
+      allowMissingHandles: true,
+    });
+
+    expect(queryByTitle('Pinned Shot')).toBeNull();
+  });
+
+  it('double-clicks a shot group label to jump to the shot', () => {
+    const onShotGroupNavigate = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      onShotGroupNavigate,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.doubleClick(getByTitle('Pinned Shot'));
+
+    expect(onShotGroupNavigate).toHaveBeenCalledWith('shot-1');
+  });
+
+  it('single-clicks a shot group label to select the group clips', () => {
+    const onSelectClips = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      onSelectClips,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.click(getByTitle('Pinned Shot'));
+
+    expect(onSelectClips).toHaveBeenCalledWith(['clip-1', 'clip-2', 'clip-3']);
+  });
+
+  it('selects a canonical occurrence identity without selecting its child clip IDs', () => {
+    const occurrence = {
+      projectId: 'project-1',
+      occurrenceId: 'occurrence-opening',
+      parentDocumentId: 'timeline-1',
+      shotId: 'shot-opening',
+      revisionId: 'revision-opening',
+      ordinal: 0,
+      atMs: 1_000,
+      durationMs: 4_000,
+      stableDeepLink: '/shot/opening',
+      outputIdentity: 'output-opening',
+      trackId: 'picture',
+      revision: {},
+    } satisfies CanonicalShotOccurrence;
+    const onSelectTrack = vi.fn();
+    const onSelectClips = vi.fn();
+    const clearSelection = vi.fn();
+    const setInspectorTarget = vi.fn();
+    const { getByTitle } = renderCanvas({
+      rows: [
+        { id: 'frame', actions: [{ id: 'frame-overlay', start: 0, end: 120, effectId: 'frame-overlay' }] },
+        { id: 'picture', actions: [] },
+      ],
+      tracks: [
+        { id: 'frame', kind: 'visual', label: 'Frame' },
+        { id: 'picture', kind: 'visual', label: 'Picture' },
+      ],
+      shotGroups: [{
+        shotId: occurrence.shotId,
+        shotName: 'Opening',
+        rowId: 'picture',
+        rowIndex: 1,
+        start: 1,
+        end: 5,
+        clipIds: ['occurrence-opening:child'],
+        children: [{ clipId: 'occurrence-opening:child', offset: 0, duration: 4 }],
+        color: '#a855f7',
+        canonicalIdentity: occurrence,
+      }],
+      onSelectTrack,
+      onSelectClips,
+      ops: { clearSelection, setContextTarget: vi.fn(), setInspectorTarget },
+      allowMissingHandles: true,
+    });
+
+    fireEvent.click(getByTitle('Opening'));
+
+    expect(onSelectTrack).toHaveBeenCalledWith('picture');
+    expect(clearSelection).toHaveBeenCalledTimes(1);
+    expect(setInspectorTarget).toHaveBeenCalledWith({
+      kind: 'shotOccurrence',
+      occurrenceId: 'occurrence-opening',
+      shotId: 'shot-opening',
+      revisionId: 'revision-opening',
+      parentDocumentId: 'timeline-1',
+      shotName: 'Opening',
+      trackId: 'picture',
+      start: 1,
+      end: 5,
+    });
+    expect(onSelectClips).not.toHaveBeenCalled();
+  });
+
+  it('shows deconstruct/delete and switch-to-video actions for pinned groups with a final video', () => {
+    const onShotGroupSwitchToFinalVideo = vi.fn();
+    const onShotGroupUnpin = vi.fn();
+    const onShotGroupDelete = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [{
+        shotId: 'shot-1',
+        shotName: 'Pinned Shot',
+        rowId: 'V1',
+        rowIndex: 0,
+        start: 0,
+        clipIds: ['clip-1'],
+        children: [{ clipId: 'clip-1', offset: 0, duration: 2 }],
+        color: '#22c55e',
+        mode: 'images',
+      }],
+      finalVideoMap: new Map([['shot-1', {}]]),
+      onShotGroupUnpin,
+      onShotGroupDelete,
+      onShotGroupSwitchToFinalVideo,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+
+    expect(screen.getByText('Deconstruct shot')).toBeTruthy();
+    expect(screen.getByText('Delete shot')).toBeTruthy();
+    expect(screen.getByText('Switch to Final Video')).toBeTruthy();
+    expect(screen.queryByText('Pin as Shot Group')).toBeNull();
+    expect(screen.queryByText('Switch to Images')).toBeNull();
+
+    fireEvent.click(screen.getByText('Switch to Final Video'));
+
+    expect(onShotGroupSwitchToFinalVideo).toHaveBeenCalledWith({
+      shotId: 'shot-1',
+      clipIds: ['clip-1'],
+      rowId: 'V1',
+    });
+  });
+
+  it('exposes export only for a Runtime-managed selected output and preserves its group identity', () => {
+    const onShotGroupExportManagedOutput = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      finalVideoMap: new Map([['shot-1', { id: 'object-1', managedOutput: { association_id: 'managed-output-1' } }]]),
+      onShotGroupExportManagedOutput,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+
+    expect(screen.getByText('Export managed output')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Export managed output'));
+
+    expect(onShotGroupExportManagedOutput).toHaveBeenCalledWith({
+      shotId: 'shot-1',
+      clipIds: ['clip-1', 'clip-2', 'clip-3'],
+      rowId: 'V1',
+    });
+  });
+
+  it('does not offer Runtime export for a legacy final-video identity', () => {
+    const onShotGroupExportManagedOutput = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      finalVideoMap: new Map([['shot-1', { id: 'legacy-final-video' }]]),
+      onShotGroupExportManagedOutput,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+
+    expect(screen.queryByText('Export managed output')).toBeNull();
+  });
+
+  it('exposes document-native duplicate and promote controls with the exact group locator', () => {
+    const onShotGroupDuplicate = vi.fn();
+    const onShotGroupPromotePrimary = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [pinnedShotGroup],
+      onShotGroupDuplicate,
+      onShotGroupPromotePrimary,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+    fireEvent.click(screen.getByText('Duplicate shot'));
+    expect(onShotGroupDuplicate).toHaveBeenCalledWith({ shotId: 'shot-1', trackId: 'V1' });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+    fireEvent.click(screen.getByText('Promote next variant'));
+    expect(onShotGroupPromotePrimary).toHaveBeenCalledWith({ shotId: 'shot-1', trackId: 'V1' });
+  });
+
+  it('shows deconstruct/delete and switch-to-images actions for pinned video groups', () => {
+    const onShotGroupUnpin = vi.fn();
+    const onShotGroupDelete = vi.fn();
+    const onShotGroupSwitchToImages = vi.fn();
+    const { getByTitle } = renderCanvas({
+      shotGroups: [{
+        shotId: 'shot-1',
+        shotName: 'Pinned Shot',
+        rowId: 'V1',
+        rowIndex: 0,
+        start: 0,
+        clipIds: ['clip-1'],
+        children: [{ clipId: 'clip-1', offset: 0, duration: 2 }],
+        color: '#3b82f6',
+        mode: 'video',
+      }],
+      finalVideoMap: new Map([['shot-1', {}]]),
+      onShotGroupUnpin,
+      onShotGroupDelete,
+      onShotGroupSwitchToImages,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+
+    expect(screen.getByText('Deconstruct shot')).toBeTruthy();
+    expect(screen.getByText('Delete shot')).toBeTruthy();
+    expect(screen.getByText('Switch to Images')).toBeTruthy();
+    expect(screen.queryByText('Pin as Shot Group')).toBeNull();
+    expect(screen.queryByText('Switch to Final Video')).toBeNull();
+
+    fireEvent.click(screen.getByText('Switch to Images'));
+    expect(onShotGroupSwitchToImages).toHaveBeenCalledWith({ shotId: 'shot-1', rowId: 'V1' });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+    fireEvent.click(screen.getByText('Deconstruct shot'));
+    expect(onShotGroupUnpin).toHaveBeenCalledWith({ shotId: 'shot-1', trackId: 'V1' });
+
+    fireEvent.contextMenu(getByTitle('Pinned Shot'));
+    fireEvent.click(screen.getByText('Delete shot'));
+    expect(onShotGroupDelete).toHaveBeenCalledWith({ shotId: 'shot-1', trackId: 'V1', clipIds: ['clip-1'] });
+  });
+
+  it('shows a visible shot-group actions trigger on touch layouts with reachable menu actions', () => {
+    const onShotGroupNavigate = vi.fn();
+    const onShotGroupSwitchToFinalVideo = vi.fn();
+    renderCanvas({
+      deviceClass: 'phone',
+      shotGroups: [pinnedShotGroup],
+      finalVideoMap: new Map([['shot-1', {}]]),
+      onShotGroupNavigate,
+      onShotGroupSwitchToFinalVideo,
+      allowMissingHandles: true,
+    });
+
+    fireEvent.click(screen.getByLabelText('Open actions for Pinned Shot'));
+
+    expect(screen.getByText('Jump to Shot')).toBeInTheDocument();
+    expect(screen.getByText('Switch to Final Video')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Jump to Shot'));
+
+    expect(onShotGroupNavigate).toHaveBeenCalledWith('shot-1');
+
+    fireEvent.click(screen.getByLabelText('Open actions for Pinned Shot'));
+    fireEvent.click(screen.getByText('Switch to Final Video'));
+
+    expect(onShotGroupSwitchToFinalVideo).toHaveBeenCalledWith({
+      shotId: 'shot-1',
+      clipIds: ['clip-1', 'clip-2', 'clip-3'],
+      rowId: 'V1',
+    });
+  });
+});
+
+  describe('source-map stale indicators and navigation', () => {
+    it('accepts sourceMapStaleClipIds prop without errors', () => {
+      const { container } = renderCanvas({
+        sourceMapStaleClipIds: new Set(['clip-1', 'clip-3']),
+      });
+
+      // Canvas should render normally with the prop
+      expect(container.querySelector('[data-action-id="clip-1"]')).toBeTruthy();
+    });
+
+    it('accepts empty sourceMapStaleClipIds set', () => {
+      const { container } = renderCanvas({
+        sourceMapStaleClipIds: new Set(),
+      });
+
+      expect(container.querySelector('[data-action-id="clip-1"]')).toBeTruthy();
+    });
+
+    it('accepts undefined sourceMapStaleClipIds', () => {
+      const { container } = renderCanvas({
+        sourceMapStaleClipIds: undefined,
+      });
+
+      expect(container.querySelector('[data-action-id="clip-1"]')).toBeTruthy();
+    });
+
+    it('dispatches astrid:source-navigate-to-timeline-handled when SOURCE_NAVIGATE_TO_TIMELINE_EVENT fires', () => {
+      const dispatchSpy = vi.spyOn(window, 'dispatchEvent');
+      renderCanvas();
+
+      const detail = {
+        extensionId: 'ext.test',
+        sourceUri: 'file:///test.ts',
+        sourceStartLine: 10,
+        sourceEndLine: 20,
+        targetId: 'clip-1',
+      };
+
+      window.dispatchEvent(
+        new CustomEvent('astrid:source-navigate-to-timeline', { detail }),
+      );
+
+      const handledEvent = dispatchSpy.mock.calls
+        .map((call) => call[0] as CustomEvent)
+        .find((e) => e.type === 'astrid:source-navigate-to-timeline-handled');
+      expect(handledEvent).toBeTruthy();
+      expect((handledEvent!.detail as Record<string, unknown>).handled).toBe(true);
+      expect((handledEvent!.detail as Record<string, unknown>).extensionId).toBe('ext.test');
+      dispatchSpy.mockRestore();
+    });
+
+    it('schedules center clip when SOURCE_NAVIGATE_TO_TIMELINE_EVENT includes targetId', async () => {
+      const { container } = renderCanvas({
+        scale: 1,
+        scaleWidth: 100,
+      });
+      const editArea = container.querySelector('.timeline-canvas-edit-area') as HTMLElement;
+      Object.defineProperty(editArea, 'clientWidth', { value: 200, configurable: true });
+      Object.defineProperty(editArea, 'clientHeight', { value: 48, configurable: true });
+      const scrollTo = vi.fn((options: ScrollToOptions) => {
+        editArea.scrollLeft = Number(options.left ?? 0);
+        editArea.scrollTop = Number(options.top ?? 0);
+      });
+      editArea.scrollTo = scrollTo;
+
+      window.dispatchEvent(
+        new CustomEvent('astrid:source-navigate-to-timeline', {
+          detail: {
+            extensionId: 'ext.test',
+            sourceUri: 'file:///test.ts',
+            sourceStartLine: 10,
+            sourceEndLine: 20,
+            targetId: 'clip-1',
+          },
+        }),
+      );
+
+      await vi.waitFor(() => expect(scrollTo).toHaveBeenCalled());
+      // Clip-1 starts at 0, duration 2, center ≈ 100px viewport minus half clip
+      expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({
+        left: 0,
+        behavior: 'smooth',
+      }));
+    });
+
+    it('handles SOURCE_NAVIGATE_TO_TIMELINE_EVENT without targetId gracefully', () => {
+      const dispatchSpy = vi.spyOn(window, 'dispatchEvent');
+      renderCanvas();
+
+      window.dispatchEvent(
+        new CustomEvent('astrid:source-navigate-to-timeline', {
+          detail: {
+            extensionId: 'ext.test',
+            sourceUri: 'file:///test.ts',
+            sourceStartLine: 10,
+            sourceEndLine: 20,
+          },
+        }),
+      );
+
+      const handledEvent = dispatchSpy.mock.calls
+        .map((call) => call[0] as CustomEvent)
+        .find((e) => e.type === 'astrid:source-navigate-to-timeline-handled');
+      expect(handledEvent).toBeTruthy();
+      expect((handledEvent!.detail as Record<string, unknown>).handled).toBe(true);
+      expect((handledEvent!.detail as Record<string, unknown>).targetId).toBeUndefined();
+      dispatchSpy.mockRestore();
+    });
+
+    it('ignores SOURCE_NAVIGATE_TO_TIMELINE_EVENT without extensionId', () => {
+      const dispatchSpy = vi.spyOn(window, 'dispatchEvent');
+      renderCanvas();
+
+      window.dispatchEvent(
+        new CustomEvent('astrid:source-navigate-to-timeline', {
+          detail: {
+            sourceUri: 'file:///test.ts',
+            sourceStartLine: 10,
+            sourceEndLine: 20,
+          },
+        }),
+      );
+
+      const handledEvent = dispatchSpy.mock.calls
+        .map((call) => call[0] as CustomEvent)
+        .find((e) => e.type === 'astrid:source-navigate-to-timeline-handled');
+      expect(handledEvent).toBeFalsy();
+      dispatchSpy.mockRestore();
+    });
+  });
+// ---------------------------------------------------------------------------
+// dataKind V1 (Batch 6): duration-neutral DataLaneList mount
+// ---------------------------------------------------------------------------
+
+const laneFixture = (overrides: Record<string, unknown> = {}) => ({
+  laneId: 'transcript',
+  kindId: 'transcript',
+  label: 'Transcript',
+  schemaRef: 'astrid.transcript_segment/v1',
+  shape: 'interval',
+  domain: 'source_seconds',
+  items: [],
+  hidden: false,
+  height: 24,
+  heightOverride: 24,
+  opaque: false,
+  laneRenderer: () => <div data-testid="lane-renderer-body">body</div>,
+  ...overrides,
+  heightOverride: overrides.heightOverride === null ? undefined : overrides.heightOverride ?? overrides.height ?? 24,
+});
+
+describe('TimelineCanvas — dataKind V1 lane strip', () => {
+  afterEach(() => {
+    useDataLanesMock.mockImplementation((args?: { base?: unknown }) => args?.base ?? null);
+  });
+
+  it('renders lane rows below the track rows inside the shared scroller', () => {
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture()] });
+    const { container } = renderCanvas({ rows: [row], tracks: [track] });
+
+    const laneList = screen.getByTestId('data-lane-list');
+    const trackRow = container.querySelector(`[${ROW_ID_ATTR}='V1']`);
+    expect(trackRow).toBeTruthy();
+    // The lane strip follows the track row in document order (below tracks).
+    expect(
+      Boolean(trackRow!.compareDocumentPosition(laneList) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    // Same scroller as the tracks — lanes share the scroll container.
+    expect(laneList.closest('.timeline-scroll')).toBeTruthy();
+    expect(screen.getByTestId('data-lane-row')).toBeTruthy();
+    expect(screen.getByTestId('lane-renderer-body')).toBeTruthy();
+  });
+
+  it('shows only transcript lanes when their independent preference is enabled', () => {
+    __showDataLanes = false; __showTranscriptLane = true;
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture({ kindId: 'astrid.transcript', heightOverride: null, label: 'Transcript only' }), laneFixture({ laneId: 'other', kindId: 'other', label: 'Unrelated data' })] });
+    renderCanvas({ rows: [row], tracks: [track] });
+    expect(screen.getAllByTestId('data-lane-row')).toHaveLength(1);
+    expect(screen.getByText('Transcript only')).toBeTruthy();
+    expect(screen.queryByText('Unrelated data')).toBeNull();
+  });
+  it('hides only transcript lanes while preserving other enabled data lanes', () => {
+    __showDataLanes = true; __showTranscriptLane = false;
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture({ kindId: 'astrid.transcript', heightOverride: null, label: 'Transcript only' }), laneFixture({ laneId: 'other', kindId: 'other', label: 'Unrelated data' })] });
+    renderCanvas({ rows: [row], tracks: [track] });
+    expect(screen.getAllByTestId('data-lane-row')).toHaveLength(1);
+    expect(screen.queryByText('Transcript only')).toBeNull();
+    expect(screen.getByText('Unrelated data')).toBeTruthy();
+  });
+  it('keeps optional lanes out of the timeline until the host preference enables them', () => {
+    __showDataLanes = false;
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture({ height: 30 })] });
+    renderCanvas({ rows: [row], tracks: [track] });
+
+    expect(screen.queryByTestId('data-lane-list')).toBeNull();
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '96px' });
+  });
+
+  it('defaults only the transcript lane on when mounted editor data has no preferences', () => {
+    __omitTimelinePreferences = true;
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [
+      laneFixture({ laneId: 'transcript-default', kindId: 'astrid.transcript', heightOverride: null, label: 'Transcript default', height: 30 }),
+      laneFixture({ laneId: 'other', kindId: 'other', label: 'Other lane', height: 30 }),
+    ] });
+    renderCanvas({ rows: [row], tracks: [track] });
+
+    expect(screen.getAllByTestId('data-lane-row')).toHaveLength(1);
+    expect(screen.getByText('Transcript default')).toBeTruthy();
+    expect(screen.queryByText('Other lane')).toBeNull();
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '144px' });
+  });
+
+  it('uses standard host row height for default lanes and preserves explicit developer overrides', () => {
+    __showTranscriptLane = true;
+    __showDataLanes = true;
+    const item = (id: string, timelineStart: number, timelineEnd: number) => ({ item: { id }, timelineStart, timelineEnd });
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [
+      laneFixture({
+        laneId: 'transcript-single-row',
+        kindId: 'astrid.transcript', heightOverride: null,
+        height: 72,
+        items: [item('a', 0, 1), item('b', 1, 2), item('c', 2, 3)],
+      }),
+      laneFixture({
+        laneId: 'transcript-overlap',
+        kindId: 'astrid.transcript', heightOverride: null,
+        height: 72,
+        items: [item('d', 0, 2), item('e', 1, 3)],
+      }),
+      laneFixture({
+        laneId: 'unrelated',
+        kindId: 'other',
+        height: 41,
+        items: [item('f', 0, 3)],
+      }),
+    ] });
+    const { container } = renderCanvas({ rows: [row], tracks: [track] });
+    const rowFor = (laneId: string) => container.querySelector(`[data-testid="data-lane-row"][data-lane-id="${laneId}"]`) as HTMLElement;
+
+    expect(rowFor('transcript-single-row').style.height).toBe('48px');
+    expect(rowFor('transcript-overlap').style.height).toBe('96px');
+    expect(rowFor('unrelated').style.height).toBe('41px');
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '281px' });
+  });
+
+  it('folds lane heights into the playhead element height', () => {
+    useDataLanesMock.mockReturnValue({
+      config: {},
+      dataLanes: [laneFixture({ height: 30 })],
+    });
+    renderCanvas({ rows: [row], tracks: [track] });
+
+    // One track row + footer at rowHeight 48, plus one 30px lane.
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '126px' });
+  });
+
+  it('excludes hidden lanes from the folded scrollContentHeight (rework R5)', () => {
+    useDataLanesMock.mockReturnValue({
+      config: {},
+      dataLanes: [
+        laneFixture({ height: 30 }),
+        laneFixture({
+          laneId: 'ghost',
+          kindId: 'ghost',
+          label: 'Ghost',
+          hidden: true,
+          height: 40,
+        }),
+      ],
+    });
+    renderCanvas({ rows: [row], tracks: [track] });
+
+    // Only the visible 30px lane folds in: 96 + 30 = 126px, not 166px.
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '126px' });
+    // The shared filter means the hidden lane mounts no row either.
+    expect(screen.getAllByTestId('data-lane-row')).toHaveLength(1);
+  });
+
+  it('renders lanes while timeline overlays are disabled', () => {
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture()] });
+    renderCanvas({ rows: [row], tracks: [track], timelineOverlaysEnabled: false });
+
+    expect(screen.getByTestId('data-lane-list')).toBeTruthy();
+  });
+
+  it('leaves geometry untouched when no lanes assemble', () => {
+    renderCanvas({ rows: [row], tracks: [track] });
+
+    expect(screen.queryByTestId('data-lane-list')).toBeNull();
+    // (rows + 1) * rowHeight = 96px, exactly as before Batch 6.
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '96px' });
+  });
+
+  it('clears a stale clip selection before one click switches to a lane item inspector', () => {
+    const clearSelection = vi.fn();
+    const setSelectedTrackId = vi.fn();
+    const setContextTarget = vi.fn();
+    const setInspectorTarget = vi.fn();
+    useDataLanesMock.mockReturnValue({
+      config: {},
+      dataLanes: [laneFixture({
+        opaque: true,
+        kindId: '',
+        laneId: 'opaque:x/v1',
+        laneRenderer: undefined,
+        items: [{ item: { id: 'a:c1:0' }, timelineStart: 0, timelineEnd: 1 }],
+      })],
+    });
+    renderCanvas({
+      rows: [row],
+      tracks: [track],
+      ops: { clearSelection, setSelectedTrackId, setContextTarget, setInspectorTarget },
+    });
+
+    fireEvent.click(screen.getByTestId('data-lane-extent-bar'));
+
+    const expected = { kind: 'dataItem', laneId: 'opaque:x/v1', itemId: 'a:c1:0' };
+    expect(clearSelection).not.toHaveBeenCalled(); // one atomic mixed selection update replaces legacy clear+set
+    expect(setSelectedTrackId).toHaveBeenCalledWith(null);
+    expect(setContextTarget).toHaveBeenCalledWith(expect.objectContaining(expected));
+    expect(setInspectorTarget).toHaveBeenCalledWith(expect.objectContaining(expected));
+
+  });
+
+  it('moves the real shared scroller before focusing a virtualized End target', async () => {
+    const items = Array.from({ length: 500 }, (_, index) => ({
+      item: {
+        id: `dense-${index}`,
+        shape: 'interval',
+        domain: 'timeline_seconds',
+        extent: { start: index * 0.02, end: index * 0.02 + 0.01 },
+        schemaRef: 'dense/v1',
+        payload: null,
+        provenance: { adapterId: 'test', adapterVersion: '1' },
+      },
+      timelineStart: index * 2,
+      timelineEnd: index * 2 + 0.5,
+    }));
+    useDataLanesMock.mockReturnValue({
+      config: {},
+      dataLanes: [laneFixture({
+        laneId: 'opaque:dense/v1',
+        kindId: '',
+        label: 'Dense',
+        opaque: true,
+        laneRenderer: undefined,
+        items,
+      })],
+    });
+    const { container } = renderCanvas({ rows: [row], tracks: [track], startLeft: 144 });
+    const editArea = container.querySelector<HTMLElement>('.timeline-canvas-edit-area')!;
+    Object.defineProperty(editArea, 'clientWidth', { configurable: true, value: 200 });
+    const scrollTo = vi.fn((options: ScrollToOptions) => {
+      editArea.scrollLeft = Number(options.left ?? 0);
+    });
+    Object.defineProperty(editArea, 'scrollTo', { configurable: true, value: scrollTo });
+    fireEvent(window, new Event('resize'));
+
+    const first = await screen.findByTitle('dense-0');
+    first.focus();
+    fireEvent.keyDown(first, { key: 'End' });
+
+    const last = await screen.findByTitle('dense-499');
+    await waitFor(() => expect(last).toHaveFocus());
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({
+      left: expect.any(Number),
+      behavior: 'auto',
+    }));
+    expect(Number(scrollTo.mock.calls.at(-1)?.[0].left)).toBeGreaterThan(200);
+    expect(editArea.scrollLeft).toBe(Number(scrollTo.mock.calls.at(-1)?.[0].left));
+    expect(Number.parseFloat((editArea.firstElementChild as HTMLElement).style.width))
+      .toBeGreaterThan(998 * 10);
+    expect(screen.queryByTitle('dense-0')).toBeNull();
+  });
+
+  it('updates the mounted lane window from an ordinary shared-scroller event', async () => {
+    const items = Array.from({ length: 500 }, (_, index) => ({
+      item: {
+        id: `scroll-${index}`,
+        shape: 'interval',
+        domain: 'timeline_seconds',
+        extent: { start: index * 2, end: index * 2 + 0.5 },
+        schemaRef: 'scroll/v1',
+        payload: null,
+        provenance: { adapterId: 'test', adapterVersion: '1' },
+      },
+      timelineStart: index * 2,
+      timelineEnd: index * 2 + 0.5,
+    }));
+    useDataLanesMock.mockReturnValue({
+      config: {},
+      dataLanes: [laneFixture({
+        laneId: 'opaque:scroll/v1',
+        kindId: '',
+        label: 'Scroll',
+        opaque: true,
+        laneRenderer: undefined,
+        items,
+      })],
+    });
+    const { container } = renderCanvas({ rows: [row], tracks: [track], startLeft: 144 });
+    const editArea = container.querySelector<HTMLElement>('.timeline-canvas-edit-area')!;
+    Object.defineProperty(editArea, 'clientWidth', { configurable: true, value: 400 });
+    fireEvent.scroll(editArea, { target: { scrollLeft: 20_000, scrollTop: 0 } });
+
+    await screen.findByTitle('scroll-100');
+    expect(screen.queryByTitle('scroll-0')).toBeNull();
+    expect(screen.getAllByTestId('data-lane-extent-bar').length).toBeLessThanOrEqual(128);
+  });
+});
+
+
+describe('TimelineCanvas mixed row geometry', () => {
+  afterEach(() => useDataLanesMock.mockImplementation((args?: { base?: unknown }) => args?.base ?? null));
+  it('renders placement and centers a clip below an interleaved transcript using its resolved media-height row', async () => {
+    __rowPlacement = { version: 1, lanes: [{ laneId: 'astrid.transcript', beforeTrackId: 'V2' }] };
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture({ laneId: 'astrid.transcript', kindId: 'astrid.transcript', heightOverride: null })] });
+    const secondTrack: TrackDefinition = { id: 'V2', kind: 'visual', label: 'V2' };
+    const lateRow: TimelineRow = { id: 'V2', actions: [{ id: 'clip-late', start: 6, end: 8, effectId: 'effect-clip-late' }] };
+    const { container } = renderCanvas({ tracks: [track, secondTrack], rows: [row, lateRow], actionId: 'clip-late', scale: 1, scaleWidth: 100 });
+    const editArea = container.querySelector('.timeline-canvas-edit-area') as HTMLElement;
+    expect(editArea).toHaveAttribute('data-timeline-row-layout', 'managed');
+    const lane = screen.getByTestId('data-lane-row');
+    const media = container.querySelector(`[${ROW_ID_ATTR}='V2']`)!;
+    expect(Boolean(lane.compareDocumentPosition(media) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
+    expect(lane.style.height).toBe('48px');
+    Object.defineProperty(editArea, 'clientWidth', { value: 200, configurable: true });
+    Object.defineProperty(editArea, 'clientHeight', { value: 48, configurable: true });
+    editArea.scrollTo = vi.fn();
+    requestCenterTimelineClip('clip-late');
+    await waitFor(() => expect(editArea.scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 96, left: 600 })));
+    expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ height: '192px' });
+  });
+  it('offsets pinned shot outlines by the same leading transcript row', () => {
+    __rowPlacement = { version: 1, lanes: [{ laneId: 'astrid.transcript', beforeTrackId: 'V1' }] };
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture({ laneId: 'astrid.transcript', kindId: 'astrid.transcript', heightOverride: null })] });
+    const { container } = renderCanvas({ row: pinnedGroupRow, actionId: 'clip-2', shotGroups: [pinnedShotGroup], allowMissingHandles: true });
+    const border = container.querySelector('.border-2.border-solid');
+    expect(border).toBeTruthy();
+    expect((border as HTMLElement).style.top).toBe('50px');
+  });
+});
+
+
+describe('assembled data selection pruning', () => {
+  afterEach(() => useDataLanesMock.mockImplementation((args?: { base?: unknown }) => args?.base ?? null));
+  const refs = [{ laneId: 'transcript', itemId: 'one@clip-1' }, { laneId: 'transcript', itemId: 'one@clip-2' }];
+  it.each([false, true])('preserves temporary unavailable plane, prunes only when resolved=%s', resolved => {
+    __selectedDataItems = refs;
+    __lanePlaneResolved = resolved;
+    userSelectTimelineItems({ clipIds: [], dataItems: refs }, { additive: false });
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [] });
+    renderCanvas({ rows: [row], tracks: [track] });
+    expect(getSelectedTimelineDataItems()).toHaveLength(resolved ? 0 : 2);
+  });
+  it('prunes deleted occurrences against the full assembled plane, not the virtual window', () => {
+    __selectedDataItems = refs;
+    userSelectTimelineItems({ clipIds: [], dataItems: refs }, { additive: false });
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture({ items: [{ item: { id: refs[1].itemId }, timelineStart: 100, timelineEnd: 101 }] })] });
+    renderCanvas({ rows: [row], tracks: [track] });
+    expect(getSelectedTimelineDataItems()).toEqual([refs[1]]);
+  });
+  it('prunes an explicitly hidden lane even when its source is not resolved', () => {
+    __selectedDataItems = refs;
+    __lanePlaneResolved = false;
+    __showDataLanes = false;
+    userSelectTimelineItems({ clipIds: [], dataItems: refs }, { additive: false });
+    useDataLanesMock.mockReturnValue({ config: {}, dataLanes: [laneFixture()] });
+    renderCanvas({ rows: [row], tracks: [track] });
+    expect(getSelectedTimelineDataItems()).toEqual([]);
+  });
+});
+
+
+it('paints clip-empty row bands across the viewport without leaking grid below the footer', () => {
+  const {container} = renderCanvas({rows: [{id: 'V1', actions: []}], tracks: [track], allowEmpty: true, allowMissingHandles: true});
+  const grid = container.querySelector('.timeline-canvas-edit-area > .relative') as HTMLElement;
+  expect(grid.style.minWidth).toBe('100%');
+  expect(grid.style.width).not.toBe('100%'); // canonical content width is retained
+  const plane = container.querySelector('.timeline-canvas-edit-area') as HTMLElement;
+  expect(grid.style.backgroundImage).toContain('var(--border)');
+  expect(grid.style.backgroundImage).toContain('/ 0.55');
+  expect(grid.style.backgroundImage).not.toContain('/ 0.25');
+  expect(plane.style.backgroundImage).toBe('');
+  expect(container.querySelector('[data-action-id]')).toBeNull();
+  expect(container.querySelector('[data-sortable-id="track-V1"]')).toHaveClass('border-border');
+});

@@ -1,0 +1,38 @@
+{
+  "tracks": [
+    {
+      "id": "V1",
+      "kind": "visual",
+      "label": "Light study"
+    }
+  ],
+  "clips": [
+    {
+      "id": "light-study-01",
+      "asset": "first-light",
+      "track": "V1",
+      "at": 0,
+      "from": 0,
+      "to": 8,
+      "label": "First Light"
+    },
+    {
+      "id": "light-study-02",
+      "asset": "passing-shapes",
+      "track": "V1",
+      "at": 8,
+      "from": 0,
+      "to": 12,
+      "label": "Passing Shapes"
+    },
+    {
+      "id": "light-study-03",
+      "asset": "quiet-finish",
+      "track": "V1",
+      "at": 20,
+      "from": 0,
+      "to": 8,
+      "label": "Quiet Finish"
+    }
+  ]
+}

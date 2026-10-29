@@ -1,0 +1,97 @@
+// A map of common aspect ratios to specific pixel resolutions.
+// This ensures that generated media conforms to a set of standard dimensions.
+export const ASPECT_RATIO_TO_RESOLUTION: { [key: string]: string } = {
+  '21:9': '1024x438',
+  '16:9': '902x508',
+  '4:3': '768x576',
+  '3:2': '768x512',
+  '1:1': '670x670',
+  '2:3': '512x768',
+  '3:4': '576x768',
+  '9:16': '508x902',
+  '9:21': '438x1024',
+  // Legacy support for 'Square' key for backwards compatibility
+  'Square': '670x670',
+};
+
+// LTX models produce significantly better results at higher resolutions.
+// Community consensus: 1080p minimum for good quality, 720p absolute minimum.
+// These are ~2x the base resolutions, targeting ~720p–1080p range.
+export const LTX_ASPECT_RATIO_TO_RESOLUTION: { [key: string]: string } = {
+  '21:9': '1792x768',
+  '16:9': '1280x720',
+  '4:3': '1024x768',
+  '3:2': '1152x768',
+  '1:1': '1024x1024',
+  '2:3': '768x1152',
+  '3:4': '768x1024',
+  '9:16': '720x1280',
+  '9:21': '768x1792',
+  'Square': '1024x1024',
+};
+
+/**
+ * Parses a "W:H" string into a numerical ratio (W / H).
+ * @param ratioStr The aspect ratio string (e.g., "16:9").
+ * @returns The numerical ratio, or NaN if the format is invalid.
+ */
+export const parseRatio = (ratioStr: string | undefined | null): number => {
+  if (!ratioStr) return NaN;
+  if (ratioStr === 'Square') return 1;
+  const parts = ratioStr.split(':');
+  if (parts.length === 2) {
+    const w = parseInt(parts[0], 10);
+    const h = parseInt(parts[1], 10);
+    if (!isNaN(w) && !isNaN(h) && h !== 0) {
+      return w / h;
+    }
+  }
+  return NaN;
+};
+
+/**
+ * Finds the closest predefined aspect ratio string from ASPECT_RATIO_TO_RESOLUTION.
+ * @param targetRatio The numerical aspect ratio to match (width / height).
+ * @returns The closest matching aspect ratio string (e.g., "16:9").
+ */
+export function findClosestAspectRatio(targetRatio: number): string {
+  const ratioKeys = Object.keys(ASPECT_RATIO_TO_RESOLUTION);
+  if (ratioKeys.length === 0) {
+    return '1:1'; // Fallback
+  }
+
+  let closestRatioKey: string = ratioKeys[0];
+  let minDiff = Infinity;
+
+  for (const ratioStr of ratioKeys) {
+    const predefinedRatioValue = parseRatio(ratioStr);
+    if (isNaN(predefinedRatioValue)) continue;
+
+    const diff = Math.abs(targetRatio - predefinedRatioValue);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestRatioKey = ratioStr;
+    }
+  }
+
+  return closestRatioKey;
+}
+
+/**
+ * Get preview dimensions constrained to a max height, maintaining aspect ratio.
+ * Used for video scrubbing previews and similar floating popups.
+ * @param aspectRatioStr The aspect ratio string (e.g., "16:9"). Falls back to 16:9 if invalid.
+ * @param maxHeight Maximum height in pixels (default: 200)
+ */
+export function getPreviewDimensions(
+  aspectRatioStr: string | undefined | null,
+  maxHeight: number = 200
+): { width: number; height: number } {
+  const defaultDims = { width: Math.round(maxHeight * 16 / 9), height: maxHeight };
+  if (!aspectRatioStr) return defaultDims;
+  const [w, h] = aspectRatioStr.split(':').map(Number);
+  if (w && h) {
+    return { width: Math.round(maxHeight * (w / h)), height: maxHeight };
+  }
+  return defaultDims;
+}

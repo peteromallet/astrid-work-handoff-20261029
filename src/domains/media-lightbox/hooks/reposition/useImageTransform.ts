@@ -1,0 +1,119 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import {
+  ImageTransform,
+  DEFAULT_TRANSFORM,
+  decodeImageTransform,
+  type ImageTransformControls,
+} from './types';
+import { hasImageTransformChanges } from '@/shared/lib/media/imageTransform';
+
+interface UseImageTransformProps {
+  /** Active variant ID or generation ID for cache key */
+  activeVariantId?: string | null;
+  /** Media/generation ID as fallback cache key */
+  mediaId: string;
+  /** Active variant's params - for loading saved transform data */
+  activeVariantParams?: Record<string, unknown> | null;
+}
+
+interface UseImageTransformReturn extends ImageTransformControls {
+  transform: ImageTransform;
+  hasTransformChanges: boolean;
+}
+
+/**
+ * Hook for managing image transform state with per-variant caching.
+ * Handles translateX/Y, scale, rotation, flipH/V with preservation across variant switches.
+ */
+export function useImageTransform({
+  activeVariantId,
+  mediaId,
+  activeVariantParams,
+}: UseImageTransformProps): UseImageTransformReturn {
+  const [transform, setTransform] = useState<ImageTransform>(DEFAULT_TRANSFORM);
+
+  // Track if user has made any transform changes
+  const hasTransformChanges = hasImageTransformChanges(transform);
+
+  // Per-variant transform cache (preserves transforms when switching variants)
+  const transformCacheRef = useRef<Map<string, ImageTransform>>(new Map());
+
+  const getCacheKey = useCallback(() => {
+    // Use variant ID if available, otherwise use generation ID
+    return activeVariantId || mediaId;
+  }, [activeVariantId, mediaId]);
+
+  const prevCacheKeyRef = useRef(getCacheKey());
+
+  // Cache transform when variant/media changes
+  useEffect(() => {
+    const currentCacheKey = getCacheKey();
+    if (prevCacheKeyRef.current !== currentCacheKey) {
+      // Save current transform for old variant/media
+      if (prevCacheKeyRef.current) {
+        transformCacheRef.current.set(prevCacheKeyRef.current, transform);
+      }
+
+      // Try to load transform in order of priority:
+      // 1. From session cache (user's current edits)
+      // 2. From variant params (only if explicitly saved as restorable transform)
+      // 3. Default transform
+      // Note: repositioned variants use 'transform_applied' (history only), not 'transform' (restorable)
+      const cachedTransform = transformCacheRef.current.get(currentCacheKey);
+      const savedTransform = decodeImageTransform(activeVariantParams?.transform);
+
+      if (cachedTransform) {
+        setTransform(cachedTransform);
+      } else if (savedTransform) {
+        // Load validated transform from variant params.
+        setTransform(savedTransform);
+      } else {
+        setTransform(DEFAULT_TRANSFORM);
+      }
+
+      prevCacheKeyRef.current = currentCacheKey;
+    }
+  }, [getCacheKey, transform, activeVariantParams]);
+
+  // Individual transform setters
+  const setTranslateX = useCallback((value: number) => {
+    setTransform(prev => ({ ...prev, translateX: value }));
+  }, []);
+
+  const setTranslateY = useCallback((value: number) => {
+    setTransform(prev => ({ ...prev, translateY: value }));
+  }, []);
+
+  const setScale = useCallback((value: number) => {
+    setTransform(prev => ({ ...prev, scale: value }));
+  }, []);
+
+  const setRotation = useCallback((value: number) => {
+    setTransform(prev => ({ ...prev, rotation: value }));
+  }, []);
+
+  const toggleFlipH = useCallback(() => {
+    setTransform(prev => ({ ...prev, flipH: !prev.flipH }));
+  }, []);
+
+  const toggleFlipV = useCallback(() => {
+    setTransform(prev => ({ ...prev, flipV: !prev.flipV }));
+  }, []);
+
+  // Reset transform to default
+  const resetTransform = useCallback(() => {
+    setTransform(DEFAULT_TRANSFORM);
+  }, []);
+
+  return {
+    transform,
+    hasTransformChanges,
+    setTranslateX,
+    setTranslateY,
+    setScale,
+    setRotation,
+    toggleFlipH,
+    toggleFlipV,
+    resetTransform,
+  };
+}

@@ -1,0 +1,38 @@
+{
+  "fixture_version": "light-study-v1",
+  "label": "Scripted example",
+  "logical_key": "light-study-script-v1",
+  "result_logical_key": "light-study-result-v1",
+  "request": "Arrange these three light studies into a quiet 28-second sequence. Keep the middle scene longer and let the final frame settle.",
+  "response": "The example uses an 8-second opening, a 12-second middle scene and an 8-second finish. The last frame holds for two seconds.",
+  "steps": [
+    {
+      "id": "source-media",
+      "asset_ids": [
+        "first-light",
+        "passing-shapes",
+        "quiet-finish"
+      ]
+    },
+    {
+      "id": "sequence",
+      "clip_ids": [
+        "light-study-01",
+        "light-study-02",
+        "light-study-03"
+      ]
+    },
+    {
+      "id": "timing",
+      "clip_ids": [
+        "light-study-01",
+        "light-study-02",
+        "light-study-03"
+      ]
+    },
+    {
+      "id": "result",
+      "result_logical_key": "light-study-result-v1"
+    }
+  ]
+}

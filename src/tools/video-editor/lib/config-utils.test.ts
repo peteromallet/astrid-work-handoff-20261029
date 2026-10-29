@@ -1,0 +1,309 @@
+import { describe, expect, it } from 'vitest';
+import {
+  getConfigSignature,
+  getClipDurationInFrames,
+  getClipTimelineDuration,
+  getSanitizedAssetFile,
+  getSanitizedMediaSrc,
+  getSanitizedMediaTrimProps,
+  getSanitizedPlaybackRate,
+  getStableConfigSignature,
+  getSanitizedVolume,
+  getTimelineDurationInFrames,
+  resolveTimelineConfig,
+  type StableTimelineConfigSignatureInput,
+  type TimelineConfigSignatureInput,
+} from '@/tools/video-editor/lib/config-utils';
+import {
+  getConfigSignature as getSdkConfigSignature,
+  getStableConfigSignature as getSdkStableConfigSignature,
+} from '@astrid/editor-sdk';
+import {
+  canonicalizeTimelineConfigSnapshot,
+  canonicalizeTimelinePair,
+  getConfigTimelineClipDuration,
+  getPairTimelineClipDuration,
+} from '@/tools/video-editor/lib/timeline-domain';
+
+describe('config-utils media sanitizers', () => {
+  it.each([
+    ['hold-plain', { id: 'hold-plain', at: 0.125, track: 'V1', hold: 0.5, speed: 1 }, 0.5, 15],
+    ['duration-ms-fast', { id: 'duration-ms-fast', at: 0.001, track: 'V1', hold: 0.017, speed: 2 }, 0.0085, 1],
+    ['trim-slow', { id: 'trim-slow', at: 0.1, track: 'V1', from: 2, to: 3, speed: 0.5 }, 2, 60],
+    ['trim-fast', { id: 'trim-fast', at: 0.1, track: 'V1', from: 2, to: 6, speed: 2 }, 2, 60],
+    ['hold-fast-clipped', { id: 'hold-fast-clipped', at: 0.25, track: 'V1', hold: 1.5, speed: 2 }, 0.75, 23],
+    ['hold-slow-clipped', { id: 'hold-slow-clipped', at: 0, track: 'V1', hold: 0.625, speed: 0.5 }, 1.25, 38],
+  ] as const)('matches shared visible-time vector %s', (_vectorId, clip, expectedDuration, expectedDurationFrames) => {
+    expect(getClipTimelineDuration(clip)).toBe(expectedDuration);
+    expect(getClipDurationInFrames(clip, 30)).toBe(expectedDurationFrames);
+  });
+
+  it('uses renderer-owned independent start/duration rounding for the final boundary', () => {
+    const config = {
+      output: { file: 'out.mp4', resolution: '1920x1080', fps: 30 },
+      tracks: [{ id: 'V1', kind: 'visual' as const, label: 'V1' }],
+      clips: [{ id: 'half-frame', at: 0.25, track: 'V1', hold: 1.5, speed: 2 }],
+      registry: {},
+    };
+    expect(getTimelineDurationInFrames(config, 30)).toBe(31);
+  });
+
+  it('omits trimAfter when source out is not greater than source in', () => {
+    expect(getSanitizedMediaTrimProps({ from: 4, to: 4 }, 30)).toEqual({ trimBefore: 120 });
+    expect(getSanitizedMediaTrimProps({ from: 4, to: 3 }, 30)).toEqual({ trimBefore: 120 });
+  });
+
+  it('clamps invalid trim, speed, and volume values to safe playback props', () => {
+    expect(getSanitizedMediaTrimProps({ from: -2, to: Number.NaN }, 30)).toEqual({ trimBefore: 0 });
+    expect(getSanitizedPlaybackRate(0)).toBe(1);
+    expect(getSanitizedPlaybackRate(Number.NaN)).toBe(1);
+    expect(getSanitizedVolume(-3)).toBe(0);
+    expect(getSanitizedVolume(Number.NaN)).toBe(1);
+  });
+
+  it('accepts only non-empty string media sources', () => {
+    expect(getSanitizedMediaSrc('https://example.com/video.mp4')).toBe('https://example.com/video.mp4');
+    expect(getSanitizedMediaSrc(' https://example.com/video.mp4 ')).toBe('https://example.com/video.mp4');
+    expect(getSanitizedMediaSrc('https://example.com/storage/v1/object/public/timeline-assets/')).toBeNull();
+    expect(getSanitizedMediaSrc('')).toBeNull();
+    expect(getSanitizedMediaSrc(undefined)).toBeNull();
+  });
+
+  it('accepts only non-empty asset file references', () => {
+    expect(getSanitizedAssetFile(' uploads/test.mp4 ')).toBe('uploads/test.mp4');
+    expect(getSanitizedAssetFile('')).toBeNull();
+    expect(getSanitizedAssetFile('   ')).toBeNull();
+    expect(getSanitizedAssetFile(undefined)).toBeNull();
+  });
+
+  it('drops clips whose asset entries resolve to invalid sources', async () => {
+    const resolved = await resolveTimelineConfig(
+      {
+        output: { file: 'out.mp4', resolution: '1920x1080' },
+        clips: [
+          {
+            id: 'clip-1',
+            at: 0,
+            track: 'track-1',
+            asset: 'asset-1',
+          },
+        ],
+        tracks: [
+          {
+            id: 'track-1',
+            kind: 'audio',
+            label: 'Audio',
+          },
+        ],
+      },
+      {
+        assets: {
+          'asset-1': {
+            file: '',
+            type: 'audio/mpeg',
+          },
+        },
+      },
+      async (file: string) => `https://example.com/${file}`,
+    );
+
+    expect(resolved.registry).toEqual({});
+    expect(resolved.clips[0].assetEntry).toBeUndefined();
+  });
+
+  it('resolves managed media_id-only entries and passes identity context', async () => {
+    const entry = { media_id: 'media-runaway', type: 'audio/mpeg' };
+    const resolveUrl = vi.fn(async (file: string) => `https://bridge.test/${file}`);
+    const resolved = await resolveTimelineConfig(
+      {
+        output: { file: 'out.mp4', resolution: '1920x1080' },
+        clips: [{ id: 'audio-1', at: 0, track: 'A1', clipType: 'media', asset: 'source_audio' }],
+        tracks: [{ id: 'A1', kind: 'audio', label: 'Audio' }],
+      },
+      { assets: { source_audio: entry } },
+      resolveUrl,
+    );
+
+    expect(resolveUrl).toHaveBeenCalledWith('media-runaway', entry, 'source_audio');
+    expect(resolved.registry.source_audio).toMatchObject({ ...entry, src: 'https://bridge.test/media-runaway' });
+    expect(resolved.clips[0].assetEntry?.media_id).toBe('media-runaway');
+  });
+
+  it('lets managed media identity override a stale remote compatibility locator', async () => {
+    const entry = { file: 'https://stale.example/audio.wav', media_id: 'media-runaway' };
+    const resolveUrl = vi.fn(async () => 'https://bridge.test/projects/demo/assets/source_audio');
+    const resolved = await resolveTimelineConfig(
+      {
+        output: { file: 'out.mp4', resolution: '1920x1080' },
+        clips: [{ id: 'audio-1', at: 0, track: 'A1', clipType: 'media', asset: 'source_audio' }],
+        tracks: [{ id: 'A1', kind: 'audio', label: 'Audio' }],
+      },
+      { assets: { source_audio: entry } },
+      resolveUrl,
+    );
+
+    expect(resolveUrl).toHaveBeenCalledWith(entry.media_id, entry, 'source_audio');
+    expect(resolved.registry.source_audio?.src).toBe('https://bridge.test/projects/demo/assets/source_audio');
+  });
+
+  it('carries optional timeline theme extras into resolved config', async () => {
+    const resolved = await resolveTimelineConfig(
+      {
+        output: { file: 'out.mp4', resolution: '1920x1080', fps: 30 },
+        tracks: [{ id: 'V1', kind: 'visual', label: 'Visual' }],
+        clips: [{ id: 'clip-1', at: 0, track: 'V1', clipType: 'hold', hold: 2 }],
+        theme: '2rp',
+        theme_overrides: { visual: { canvas: { fps: 24 } } },
+        generation_defaults: { model: 'sequence-v1' },
+      },
+      { assets: {} },
+      async (file: string) => `https://example.com/${file}`,
+    );
+
+    expect(resolved.theme).toBe('2rp');
+    expect(resolved.theme_overrides).toEqual({ visual: { canvas: { fps: 24 } } });
+    expect(resolved.generation_defaults).toEqual({ model: 'sequence-v1' });
+  });
+
+  it('keeps host and SDK config signature exports aligned', async () => {
+    const resolved = await resolveTimelineConfig(
+      {
+        output: { file: 'out.mp4', resolution: '1920x1080', fps: 30 },
+        tracks: [{ id: 'V1', kind: 'visual', label: 'Visual' }],
+        clips: [{ id: 'clip-1', at: 0, track: 'V1', clipType: 'hold', hold: 2 }],
+      },
+      { assets: {} },
+      async (file: string) => `https://example.com/${file}`,
+    );
+
+    const hostInput: TimelineConfigSignatureInput = resolved;
+    expect(getConfigSignature(hostInput)).toBe(getSdkConfigSignature(hostInput));
+  });
+
+  it('keeps host and SDK stable config signature exports aligned', () => {
+    const input: StableTimelineConfigSignatureInput = {
+      config: {
+        output: { file: 'out.mp4', resolution: '1920x1080', fps: 30 },
+        tracks: [{ id: 'V1', kind: 'visual', label: 'Visual' }],
+        clips: [{ id: 'clip-1', at: 0, track: 'V1', clipType: 'hold', hold: 2 }],
+      },
+      registry: {
+        assets: {
+          'asset-1': {
+            file: 'asset.mp4',
+            type: 'video/mp4',
+            metadata: {
+              provenance: {
+                sourceProvider: 'demo',
+                sourceUrl: 'https://example.com/asset.mp4',
+              },
+            },
+          },
+        },
+      },
+    };
+
+    expect(getStableConfigSignature(input.config, input.registry)).toBe(
+      getSdkStableConfigSignature(input.config, input.registry),
+    );
+  });
+
+  it('keeps config-only malformed non-hold trims at zero duration but repairs pair-aware trims from registry duration', () => {
+    const malformedClip = {
+      id: 'clip-1',
+      at: 0,
+      track: 'V1',
+      clipType: 'media' as const,
+      asset: 'asset-1',
+    };
+
+    expect(getClipTimelineDuration(malformedClip)).toBe(0);
+    expect(getConfigTimelineClipDuration(malformedClip)).toBe(0);
+    expect(getPairTimelineClipDuration(malformedClip, {
+      assets: { 'asset-1': { file: 'video.mp4', duration: 2.25 } },
+    })).toBe(2.25);
+
+    const configOnly = canonicalizeTimelineConfigSnapshot({
+      output: { file: 'out.mp4', fps: 30, resolution: '1920x1080' },
+      tracks: [{ id: 'V1', kind: 'visual', label: 'V1' }],
+      clips: [malformedClip],
+    });
+    expect(configOnly.config.clips[0]).toEqual(malformedClip);
+    expect(configOnly.issues.map((issue) => issue.code)).toContain('malformed_non_hold_trim_zero_duration');
+
+    const pairAware = canonicalizeTimelinePair(configOnly.config, {
+      assets: { 'asset-1': { file: 'video.mp4', duration: 2.25 } },
+    });
+    expect(pairAware.config.clips[0]).toMatchObject({ from: 0, to: 2.25 });
+    expect(pairAware.issues.map((issue) => issue.code)).toContain('malformed_non_hold_trim_repaired');
+  });
+
+  it('emits a structured zero-duration issue when malformed non-hold trims have no registry duration', () => {
+    const pairAware = canonicalizeTimelinePair({
+      output: { file: 'out.mp4', fps: 30, resolution: '1920x1080' },
+      tracks: [{ id: 'V1', kind: 'visual', label: 'V1' }],
+      clips: [{
+        id: 'clip-1',
+        at: 0,
+        track: 'V1',
+        clipType: 'media',
+        asset: 'asset-1',
+      }],
+    }, {
+      assets: { 'asset-1': { file: 'video.mp4' } },
+    });
+
+    expect(pairAware.config.clips[0]).not.toHaveProperty('from');
+    expect(pairAware.config.clips[0]).not.toHaveProperty('to');
+    expect(getPairTimelineClipDuration(pairAware.config.clips[0], pairAware.registry)).toBe(0);
+    expect(pairAware.issues).toContainEqual(expect.objectContaining({
+      code: 'malformed_non_hold_trim_zero_duration',
+      clipId: 'clip-1',
+      level: 'pair-aware',
+      repairApplied: false,
+    }));
+  });
+});
+
+describe('end-spanning-layer managed card overrides', () => {
+  const config = {
+    output: { file: 'out.mp4', resolution: '1920x1080', fps: 30 },
+    tracks: [{ id: 'FX', kind: 'visual' as const, label: 'FX' }],
+    clips: [{ id: 'ending', clipType: 'end-spanning-layer', at: 0, hold: 10, track: 'FX', params: { cardAssets: { card4: 'replacement' } } }],
+  };
+  it('resolves managed identity and leaves authored params unchanged', async () => {
+    const result = await resolveTimelineConfig(config, {
+      assets: { replacement: { media_id: 'sha256:replacement', file: 'stale.png', type: 'image/png' } },
+    }, async (token) => `https://runtime.test/${token}`);
+    expect(result.clips[0].params).toEqual({
+      cardAssets: { card4: 'replacement' },
+      __astridAssets: { card4: 'https://runtime.test/sha256:replacement' },
+    });
+    expect(config.clips[0].params).toEqual({ cardAssets: { card4: 'replacement' } });
+    expect(result.clips[0].params?.__astridAssets).not.toHaveProperty('card0');
+  });
+  it('reports missing overrides instead of silently showing an obsolete default', async () => {
+    await expect(resolveTimelineConfig(config, { assets: {} }, async (file) => file)).rejects.toThrow('unresolved asset');
+  });
+  it('keeps legacy clips without card overrides unchanged', async () => {
+    const legacy = { ...config, clips: [{ ...config.clips[0], params: {} }] };
+    const result = await resolveTimelineConfig(legacy, { assets: {} }, async (file) => file);
+    expect(result.clips[0].params).toEqual({});
+  });
+});
+
+
+describe('current App preservation', () => {
+  it('resolves media without dropping app intent and opaque config values', async () => {
+    const config = {
+      output: { file: 'preserve.mp4', resolution: '1920x1080' },
+      tracks: [], clips: [],
+      app: { astrid: { intent: { pacing: 'deliberate' } }, other: { opaque: ['keep', 7] } },
+      future_config: { owner: 'another-client' },
+    };
+    const resolved = await resolveTimelineConfig(config, { assets: {} }, async (file) => file);
+    expect(resolved).toHaveProperty('app', config.app);
+    expect(resolved).toHaveProperty('future_config', config.future_config);
+    expect(config.app.other.opaque).toEqual(['keep', 7]);
+  });
+});

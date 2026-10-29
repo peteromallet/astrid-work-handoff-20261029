@@ -1,0 +1,1 @@
+export { GenerationDetails } from './GenerationDetails';

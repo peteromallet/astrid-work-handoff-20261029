@@ -1,0 +1,66 @@
+/* The run-mode choice's two minks: a 74 x 46 art-pixel scene per frame, frames side by side in one sheet
+   (each under 3 KB, inlined by Vite). Shown at an exact multiple (--px) so every art pixel stays square:
+   1x in a narrow option, 2x once the option is wide enough to sit the scene beside its text. Frames are
+   held for different lengths, so each keyframe holds its frame (steps(1, end)) until the next one. */
+.run-mode-mink {
+  --px: 1px;
+  --frame-w: calc(74 * var(--px));
+  display: block;
+  flex: none;
+  width: var(--frame-w);
+  height: calc(46 * var(--px));
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  image-rendering: pixelated;
+  transition: opacity 200ms ease-out, filter 200ms ease-out;
+}
+@container (min-width: 26rem) {
+  .run-mode-mink { --px: 2px; }
+}
+.run-mode-mink[data-scene="beach"] { background-image: url('./runmode-mink-beach.png'); background-size: calc(9 * var(--frame-w)) 100%; }
+.run-mode-mink[data-scene="desk"] { background-image: url('./runmode-mink-desk.png'); background-size: calc(16 * var(--frame-w)) 100%; }
+.run-mode-mink[data-motion="play"][data-scene="beach"] { animation: run-mode-mink-beach 8.9s steps(1, end) infinite; }
+.run-mode-mink[data-motion="play"][data-scene="desk"] { animation: run-mode-mink-desk 6.4s steps(1, end) infinite; }
+/* Hovering an option (its label is the .group) plays that option's mink too, for fine pointers only. */
+@media (hover: hover) and (prefers-reduced-motion: no-preference) {
+  .group:hover .run-mode-mink[data-scene="beach"] { animation: run-mode-mink-beach 8.9s steps(1, end) infinite; }
+  .group:hover .run-mode-mink[data-scene="desk"] { animation: run-mode-mink-desk 6.4s steps(1, end) infinite; }
+}
+
+/* A slow, lazy loop, about 9 s: straight into a long sip through the straw, eyes closed (the still frame is the
+   idle pose, so a hover starts her drinking at once); then an unhurried tail wag (up, curled over, up, out the
+   other way, up), a long rest, a slow blink. */
+@keyframes run-mode-mink-beach {
+  0% { background-position-x: calc(-1 * var(--frame-w)); }
+  3.37% { background-position-x: calc(-2 * var(--frame-w)); }
+  6.74% { background-position-x: calc(-3 * var(--frame-w)); }
+  31.46% { background-position-x: calc(-4 * var(--frame-w)); }
+  39.33% { background-position-x: calc(-6 * var(--frame-w)); }
+  43.6% { background-position-x: calc(-7 * var(--frame-w)); }
+  49.44% { background-position-x: calc(-6 * var(--frame-w)); }
+  53.26% { background-position-x: calc(-8 * var(--frame-w)); }
+  59.1% { background-position-x: calc(-6 * var(--frame-w)); }
+  63.37% { background-position-x: calc(-4 * var(--frame-w)); }
+  88.09% { background-position-x: calc(-5 * var(--frame-w)); }
+  89.89%, 100% { background-position-x: calc(-4 * var(--frame-w)); }
+}
+/* One character a frame, paws alternating, a pause at each line's end; the code scrolls up, and the
+   glasses catch the light once. */
+@keyframes run-mode-mink-desk {
+  0% { background-position-x: 0; }
+  10.94% { background-position-x: calc(-1 * var(--frame-w)); }
+  14.37% { background-position-x: calc(-2 * var(--frame-w)); }
+  25.31% { background-position-x: calc(-3 * var(--frame-w)); }
+  28.75% { background-position-x: calc(-4 * var(--frame-w)); }
+  39.69% { background-position-x: calc(-5 * var(--frame-w)); }
+  43.13% { background-position-x: calc(-6 * var(--frame-w)); }
+  46.56% { background-position-x: calc(-7 * var(--frame-w)); }
+  50% { background-position-x: calc(-8 * var(--frame-w)); }
+  60.94% { background-position-x: calc(-9 * var(--frame-w)); }
+  64.38% { background-position-x: calc(-10 * var(--frame-w)); }
+  75.31% { background-position-x: calc(-11 * var(--frame-w)); }
+  78.75% { background-position-x: calc(-12 * var(--frame-w)); }
+  82.19% { background-position-x: calc(-13 * var(--frame-w)); }
+  93.12% { background-position-x: calc(-14 * var(--frame-w)); }
+  96.56%, 100% { background-position-x: calc(-15 * var(--frame-w)); }
+}

@@ -1,0 +1,70 @@
+import { TOOL_IDS } from '@/shared/lib/tooling/toolIds';
+import { MediaGallery } from '@/shared/components/MediaGallery';
+import { SkeletonGallery } from '@/shared/components/ui/composed/skeleton-gallery';
+import { SKELETON_COLUMNS } from '@/shared/components/MediaGallery/utils';
+import {
+  buildVideoResultsGalleryConfig,
+  getVideoGalleryItemsPerPage,
+  VIDEO_ONLY_GALLERY_FILTERS,
+} from '@/shared/components/MediaGallery/videoGalleryDefaults';
+import type { GenerationsPaginatedResponse } from '@/shared/hooks/projects/useProjectGenerations';
+
+interface JoinClipsResultsProps {
+  videosData: GenerationsPaginatedResponse | undefined;
+  videosLoading: boolean;
+  videosFetching: boolean;
+  projectAspectRatio: string | undefined;
+  isMobile: boolean;
+}
+
+export function JoinClipsResults({
+  videosData,
+  videosLoading,
+  videosFetching,
+  projectAspectRatio,
+  isMobile,
+}: JoinClipsResultsProps) {
+  const hasValidData = videosData?.items && videosData.items.length > 0;
+  const isLoadingOrFetching = videosLoading || videosFetching;
+  const shouldShowSkeleton = isLoadingOrFetching && !hasValidData;
+
+  if (shouldShowSkeleton) {
+    const skeletonCount = videosData?.items?.length || 6;
+    return (
+      <div className="space-y-4 pt-4 border-t">
+        <h2 className="text-xl font-medium">Loading Results...</h2>
+        <SkeletonGallery
+          count={skeletonCount}
+          columns={SKELETON_COLUMNS[3]}
+          showControls
+          projectAspectRatio={projectAspectRatio}
+        />
+      </div>
+    );
+  }
+
+  if (hasValidData) {
+    const itemsPerPage = getVideoGalleryItemsPerPage(isMobile);
+    return (
+      <div className="space-y-4 pt-4 border-t">
+        <h2 className="text-xl font-medium">Previous Results ({videosData.items.length})</h2>
+        <MediaGallery
+          images={videosData.items || []}
+          allShots={[]}
+          onAddToLastShot={async () => false}
+          onAddToLastShotWithoutPosition={async () => false}
+          currentToolType={TOOL_IDS.JOIN_CLIPS}
+          defaultFilters={VIDEO_ONLY_GALLERY_FILTERS}
+          columnsPerRow={3}
+          pagination={{ itemsPerPage }}
+          config={buildVideoResultsGalleryConfig(videosData.items.length, isMobile, {
+            hideBottomPagination: true,
+            hideMediaTypeFilter: true,
+          })}
+        />
+      </div>
+    );
+  }
+
+  return null;
+}

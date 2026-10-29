@@ -1,0 +1,12 @@
+{
+  "sources": {
+    "inter": {
+      "package": "@fontsource/inter@5.3.0",
+      "license": "OFL-1.1 (inter/LICENSE)",
+      "subset": "latin"
+    }
+  },
+  "files": {
+    "inter/inter-latin-500-normal.woff2": "f3779f1efccc4bdcdf9c0a02ab95bf6bd092ed09c48c08cedc725889edd1d19f"
+  }
+}

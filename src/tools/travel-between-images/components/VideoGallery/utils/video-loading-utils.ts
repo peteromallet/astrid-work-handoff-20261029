@@ -1,0 +1,38 @@
+/**
+ * Video loading phase determination
+ */
+export const determineVideoPhase = (
+  shouldLoad: boolean,
+  videoPosterLoaded: boolean,
+  _videoMetadataLoaded: boolean,
+  thumbnailLoaded: boolean,
+  hasThumbnail: boolean
+): { phase: string; readyToShow: boolean } => {
+  let phase = 'INITIAL';
+  let readyToShow = false;
+  
+  if (hasThumbnail && thumbnailLoaded && !videoPosterLoaded && !shouldLoad) {
+    phase = 'THUMBNAIL_READY';
+    readyToShow = true;
+  } else if (!hasThumbnail && !shouldLoad) {
+    phase = 'WAITING_TO_LOAD';
+  } else if (shouldLoad && !videoPosterLoaded && !hasThumbnail) {
+    phase = 'VIDEO_LOADING';
+  } else if (shouldLoad && !videoPosterLoaded && hasThumbnail && thumbnailLoaded) {
+    phase = 'VIDEO_LOADING_WITH_THUMBNAIL';
+  } else if (videoPosterLoaded) {
+    phase = 'VIDEO_READY';
+    readyToShow = true;
+  }
+  
+  return { phase, readyToShow };
+};
+
+/**
+ * Create loading summary for debugging
+ */
+export const createLoadingSummary = (hasThumbnail: boolean, thumbnailLoaded: boolean, videoPosterLoaded: boolean, shouldLoad: boolean): string => {
+  return hasThumbnail 
+    ? `Thumbnail: ${thumbnailLoaded ? '✅' : '⏳'} | Video: ${videoPosterLoaded ? '✅' : '⏳'}`
+    : `Video: ${videoPosterLoaded ? '✅' : shouldLoad ? '⏳' : '⏸️'}`;
+};

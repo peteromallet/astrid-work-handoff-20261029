@@ -1,0 +1,113 @@
+import React, {useEffect} from 'react';
+import {act, cleanup, fireEvent, render, screen} from '@testing-library/react';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
+import {ReadinessImage} from '@astrid/packs/rendering/shared/readiness-image';
+import {ReadinessVideo} from './ReadinessVideo.tsx';
+
+const state = vi.hoisted(() => ({environment: {isRendering: false, isClientSideRendering: false}, timelineFrame: 0, imageProps: {} as any,
+  videoProps: {} as any, unmounted: vi.fn(), throwVideo: false}));
+vi.mock('remotion', () => ({
+  useRemotionEnvironment: () => state.environment,
+  Internals: {useTimelinePosition: () => state.timelineFrame},
+  Img: (props: any) => {state.imageProps = props; return <img alt="owned still" src={props.src} onError={props.onError} />;},
+}));
+vi.mock('@remotion/media', () => ({Video: (props: any) => {
+  state.videoProps = props;
+  useEffect(() => () => {state.unmounted();}, []);
+  if (state.throwVideo) throw new Error('Video decoder failed');
+  return <div data-testid="native-video"><button onClick={() => props.fallbackOffthreadVideoProps?.onError?.(new Error('404'))}>Fail native fallback</button></div>;
+}}));
+beforeEach(() => {vi.useFakeTimers();});
+afterEach(() => {cleanup(); state.environment = {isRendering: false, isClientSideRendering: false}; state.timelineFrame = 0; state.throwVideo = false; vi.clearAllMocks(); vi.useRealTimers();});
+
+describe('owned media preview and export policy', () => {
+  it('reports readiness only after a decoded frame, resets it on source change, and forwards the callback', () => {
+    const onVideoFrame = vi.fn();
+    const view = render(<ReadinessVideo clipId="video" src="/movie.mp4" onVideoFrame={onVideoFrame} />);
+    expect(view.container.querySelector('[data-preview-decoded-frame="true"]')).toBeNull();
+    const frame = {};
+    act(() => state.videoProps.onVideoFrame(frame));
+    expect(view.container.querySelector('[data-preview-decoded-frame="true"]')).not.toBeNull();
+    expect(onVideoFrame).toHaveBeenCalledWith(frame);
+    view.rerender(<ReadinessVideo clipId="video" src="/replacement.mp4" />);
+    expect(view.container.querySelector('[data-preview-decoded-frame="true"]')).toBeNull();
+    fireEvent.click(screen.getByText('Fail native fallback'));
+    expect(view.container.querySelector('[data-preview-decoded-frame="true"]')).toBeNull();
+  });
+
+  it('reports the player frame that was current when the decoder drew, and clears it with the frame on a failure', () => {
+    const view = render(<ReadinessVideo clipId="video" src="/movie.mp4" />);
+    const presented = () => view.container.querySelector('[data-preview-media-src="/movie.mp4"]')?.getAttribute('data-preview-presented-frame') ?? null;
+    expect(presented()).toBeNull();
+    state.timelineFrame = 90;
+    view.rerender(<ReadinessVideo clipId="video" src="/movie.mp4" />);
+    expect(presented(), 'the playhead moving alone presents nothing').toBeNull();
+    act(() => state.videoProps.onVideoFrame({}));
+    expect(presented()).toBe('90');
+    state.timelineFrame = 150;
+    view.rerender(<ReadinessVideo clipId="video" src="/movie.mp4" />);
+    expect(presented(), 'the frame on screen stays 90 until the decoder draws the next one').toBe('90');
+    act(() => state.videoProps.onVideoFrame({}));
+    expect(presented()).toBe('150');
+    fireEvent.click(screen.getByText('Fail native fallback'));
+    expect(view.container.querySelector('[data-preview-presented-frame]')).toBeNull();
+  });
+
+  it.each(['isRendering', 'isClientSideRendering'] as const)('retains strict native image/video errors during %s', (environmentKey) => {
+    state.environment[environmentKey] = true;
+    render(<><ReadinessImage src="/still.png" mediaId="still" /><ReadinessVideo clipId="video" src="/movie.mp4" /></>);
+    expect(state.imageProps.pauseWhenLoading).toBe(true);
+    expect(state.imageProps.onError).toBeUndefined();
+    expect(state.imageProps.mediaId).toBeUndefined();
+    expect(state.videoProps.fallbackOffthreadVideoProps?.onError).toBeUndefined();
+    expect(screen.queryByTestId('preview-media-error')).toBeNull();
+    expect(screen.queryByTestId('preview-media-loading')).toBeNull();
+  });
+
+  it('distinguishes a failed image from loading and resets failure for a changed source', () => {
+    const view = render(<ReadinessImage src="/still.png" mediaId="still" />);
+    act(() => {vi.advanceTimersByTime(150);});
+    expect(screen.getByTestId('preview-media-loading')).toHaveAttribute('data-clip-id', 'still');
+    fireEvent.error(screen.getByAltText('owned still'));
+    expect(screen.queryByTestId('preview-media-loading')).toBeNull();
+    expect(screen.getByTestId('preview-media-error')).toHaveTextContent('Image failed to load');
+    view.rerender(<ReadinessImage src="/replacement.png" mediaId="still" />);
+    act(() => {vi.advanceTimersByTime(150);});
+    expect(screen.queryByTestId('preview-media-error')).toBeNull();
+    expect(screen.getByTestId('preview-media-loading')).toHaveAttribute('data-media-src', '/replacement.png');
+    expect(screen.getByAltText('owned still')).toHaveAttribute('src', '/replacement.png');
+  });
+
+  it('keeps video native readiness and codec fallback, then unmounts a terminal fallback failure and supports retry', () => {
+    render(<ReadinessVideo clipId="video" src="/movie.mp4" trimBefore={9} volume={0.5} />);
+    expect(state.videoProps).toMatchObject({src: '/movie.mp4', trimBefore: 9, volume: 0.5});
+    expect(state.videoProps.pauseWhenBuffering).toBeUndefined();
+    expect(state.videoProps.onError).toBeUndefined();
+    fireEvent.click(screen.getByText('Fail native fallback'));
+    expect(state.unmounted).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId('native-video')).toBeNull();
+    expect(screen.getByTestId('preview-media-error')).toHaveAttribute('data-clip-id', 'video');
+    expect(screen.getByTestId('preview-media-error')).toHaveStyle({zIndex: '30', pointerEvents: 'auto'});
+    fireEvent.click(screen.getByRole('button', {name: 'Retry video'}));
+    expect(screen.getByTestId('native-video')).toBeInTheDocument();
+    expect(screen.queryByTestId('preview-media-error')).toBeNull();
+  });
+
+  it('resets terminal video failure when source/trim identity changes', () => {
+    const view = render(<ReadinessVideo clipId="video" src="/movie.mp4" trimBefore={9} />);
+    fireEvent.click(screen.getByText('Fail native fallback'));
+    view.rerender(<ReadinessVideo clipId="video" src="/replacement.mp4" trimBefore={3} />);
+    expect(screen.queryByTestId('preview-media-error')).toBeNull();
+    expect(state.videoProps).toMatchObject({src: '/replacement.mp4', trimBefore: 3});
+  });
+
+  it('makes React video decoder failures visible with a retry while previewing', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    state.throwVideo = true;
+    render(<ReadinessVideo clipId="video" src="/movie.mp4" />);
+    expect(screen.getByTestId('preview-media-error')).toHaveTextContent('Video failed to load');
+    state.throwVideo = false;
+    fireEvent.click(screen.getByRole('button', {name: 'Retry video'}));
+    expect(screen.getByTestId('native-video')).toBeInTheDocument();
+  });
+});

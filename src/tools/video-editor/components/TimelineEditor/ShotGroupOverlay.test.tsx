@@ -1,0 +1,243 @@
+// @vitest-environment jsdom
+import { fireEvent, render } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { ShotGroupBorders, ShotGroupLabels, type PositionedShotGroup } from './ShotGroupOverlay';
+import {
+  ACTION_ID_ATTR,
+  SHOT_GROUP_DRAG_ANCHOR_CLIP_ID_ATTR,
+  SHOT_GROUP_DRAG_ANCHOR_ROW_ID_ATTR,
+  SHOT_GROUP_LABEL_ACTION_ID,
+} from '@/tools/video-editor/lib/timeline-dom';
+
+const positionedShotGroups: PositionedShotGroup[] = [{
+  key: 'shot-1:V1',
+  shotId: 'shot-1',
+  shotName: 'Shot 1',
+  clipIds: ['clip-1', 'clip-2'],
+  start: 0,
+  end: 4,
+  rowId: 'V1',
+  color: '#00a3ff',
+  hasFinalVideo: false,
+  hasStaleVideo: false,
+  hasActiveTask: false,
+  left: 10,
+  top: 20,
+  width: 120,
+  height: 30,
+}];
+
+describe('ShotGroupLabels', () => {
+  it('renders a read-only pending block without the missing-poster fallback', () => {
+    const group: PositionedShotGroup = {
+      ...positionedShotGroups[0], key: 'occ-1:V1:', shotName: 'chapter opening',
+      clipIds: [], color: '#14b8a6', pending: true,
+    };
+    const openShotGroupMenu = vi.fn();
+    const onSelectShotGroup = vi.fn();
+    const { container } = render(<>
+      <ShotGroupLabels
+        positionedShotGroups={[group]}
+        hidden={false}
+        showTouchActions={true}
+        scrollLeft={0}
+        scrollTop={0}
+        openShotGroupMenu={openShotGroupMenu}
+        onSelectShotGroup={onSelectShotGroup}
+      />
+      <ShotGroupBorders positionedShotGroups={[group]} hidden={false} />
+    </>);
+
+    const label = container.querySelector('[data-pending-shot-label]');
+    // A thin unlabelled strip: the shot's name is not known yet, and no raw id shows.
+    expect(label?.textContent).toBe('');
+    expect(label).toHaveAttribute('aria-hidden', 'true');
+    expect(label?.className).toContain('pointer-events-none');
+    expect(container.querySelector('[data-pending-shot-group]')).toBeTruthy();
+    // A light version of the group's own colour, not a neutral grey.
+    expect((container.querySelector('[data-pending-shot-group]') as HTMLElement).style.borderColor).toContain('rgb(20, 184, 166)');
+    expect((label as HTMLElement).style.background).toContain('rgb(20, 184, 166)');
+    expect(container.querySelector('[title="No canonical poster available"]')).toBeNull();
+    expect(container.querySelector('button')).toBeNull();
+    fireEvent.click(label!);
+    fireEvent.doubleClick(label!);
+    fireEvent.contextMenu(label!);
+    expect(onSelectShotGroup).not.toHaveBeenCalled();
+    expect(openShotGroupMenu).not.toHaveBeenCalled();
+  });
+
+  it('carries the drag-anchor attributes the clip drag machine resolves', () => {
+    const { getByTitle } = render(
+      <ShotGroupLabels
+        positionedShotGroups={positionedShotGroups}
+        hidden={false}
+        showTouchActions={false}
+        scrollLeft={0}
+        scrollTop={0}
+        openShotGroupMenu={vi.fn()}
+      />,
+    );
+    const label = getByTitle('Shot 1');
+
+    expect(label.getAttribute(ACTION_ID_ATTR)).toBe(SHOT_GROUP_LABEL_ACTION_ID);
+    expect(label.getAttribute(SHOT_GROUP_DRAG_ANCHOR_CLIP_ID_ATTR)).toBe('clip-1');
+    expect(label.getAttribute(SHOT_GROUP_DRAG_ANCHOR_ROW_ID_ATTR)).toBe('V1');
+    expect(label.className).toContain('opacity-70');
+    expect(label.classList.contains('h-1')).toBe(true);
+    expect(label.className).toContain('translate-y-[14px]');
+    expect(label.className).toContain('focus-within:h-[18px]');
+    expect(label.className).toContain('hover:opacity-100');
+    expect(label.className).toContain('z-[1]');
+    expect(label.className).toContain('hover:z-10');
+    expect(label.className).toContain('focus-within:z-10');
+    // An inline z-index would override the hover/focus utilities.
+    expect(label.style.zIndex).toBe('');
+  });
+
+  it('lets pointerdown bubble so label drags reach the shared drag listener', () => {
+    const parentPointerDown = vi.fn();
+    const { getByTitle } = render(
+      <div onPointerDown={parentPointerDown}>
+        <ShotGroupLabels
+          positionedShotGroups={positionedShotGroups}
+          hidden={false}
+          showTouchActions={false}
+          scrollLeft={0}
+          scrollTop={0}
+          openShotGroupMenu={vi.fn()}
+        />
+      </div>,
+    );
+
+    fireEvent.pointerDown(getByTitle('Shot 1'));
+
+    expect(parentPointerDown).toHaveBeenCalledTimes(1);
+  });
+
+  it('still stops click, double-click, and context-menu propagation on the label', () => {
+    const parentClick = vi.fn();
+    const parentDoubleClick = vi.fn();
+    const parentContextMenu = vi.fn();
+    const onSelectClips = vi.fn();
+    const onShotGroupNavigate = vi.fn();
+    const openShotGroupMenu = vi.fn();
+    const { getByTitle } = render(
+      <div onClick={parentClick} onDoubleClick={parentDoubleClick} onContextMenu={parentContextMenu}>
+        <ShotGroupLabels
+          positionedShotGroups={positionedShotGroups}
+          hidden={false}
+          showTouchActions={false}
+          scrollLeft={0}
+          scrollTop={0}
+          openShotGroupMenu={openShotGroupMenu}
+          onSelectClips={onSelectClips}
+          onShotGroupNavigate={onShotGroupNavigate}
+        />
+      </div>,
+    );
+    const label = getByTitle('Shot 1');
+
+    fireEvent.click(label);
+    fireEvent.doubleClick(label);
+    fireEvent.contextMenu(label);
+
+    expect(onSelectClips).toHaveBeenCalledWith(['clip-1', 'clip-2']);
+    expect(onShotGroupNavigate).toHaveBeenCalledWith('shot-1');
+    expect(openShotGroupMenu).toHaveBeenCalledTimes(1);
+    expect(parentClick).not.toHaveBeenCalled();
+    expect(parentDoubleClick).not.toHaveBeenCalled();
+    expect(parentContextMenu).not.toHaveBeenCalled();
+  });
+
+  it('selects a canonical shot on click and opens it on double-click', () => {
+    const onShotGroupOpen = vi.fn();
+    const onSelectClips = vi.fn();
+    const onSelectShotGroup = vi.fn();
+    const canonicalIdentity = {
+      projectId: 'project-1',
+      occurrenceId: 'occ-1',
+      parentDocumentId: 'timeline-1',
+      shotId: 'shot-1',
+      revisionId: 'rev-1',
+      ordinal: 0,
+      atMs: 0,
+      durationMs: 1000,
+      stableDeepLink: 'project/project-1/document/timeline-1/shot/shot-1/revision/rev-1/occurrence/occ-1',
+      outputIdentity: 'project/project-1/document/timeline-1/occurrence/occ-1/output/final-video',
+      revision: {},
+    } as const;
+    const { getByTitle } = render(
+      <ShotGroupLabels
+        positionedShotGroups={[{ ...positionedShotGroups[0], shotName: 'Opening', canonicalIdentity }]}
+        hidden={false}
+        showTouchActions={false}
+        scrollLeft={0}
+        scrollTop={0}
+        openShotGroupMenu={vi.fn()}
+        onSelectClips={onSelectClips}
+        onSelectShotGroup={onSelectShotGroup}
+        onShotGroupOpen={onShotGroupOpen}
+      />,
+    );
+
+    fireEvent.click(getByTitle('Opening'));
+    expect(onSelectShotGroup).toHaveBeenCalledTimes(1);
+    expect(onSelectShotGroup.mock.calls[0][0].canonicalIdentity).toBe(canonicalIdentity);
+    expect(onShotGroupOpen).not.toHaveBeenCalled();
+
+    onSelectClips.mockClear();
+    fireEvent.doubleClick(getByTitle('Opening'));
+    expect(onSelectClips).not.toHaveBeenCalled();
+    expect(onSelectShotGroup).toHaveBeenCalledTimes(2);
+    expect(onShotGroupOpen).toHaveBeenCalledWith(canonicalIdentity);
+  });
+
+  it('selects and anchors an empty canonical group by occurrence identity', () => {
+    const onSelectClips = vi.fn();
+    const onSelectTrack = vi.fn();
+    const canonicalIdentity = {
+      projectId: 'project-1',
+      occurrenceId: 'opening7',
+      parentDocumentId: 'timeline-1',
+      shotId: 'shot-7',
+      revisionId: 'rev-1',
+      ordinal: 6,
+      atMs: 0,
+      durationMs: 1000,
+      stableDeepLink: 'shot/opening7',
+      outputIdentity: 'output-opening7',
+      revision: {},
+    } as const;
+    const { getByTitle } = render(
+      <ShotGroupLabels
+        positionedShotGroups={[{
+          ...positionedShotGroups[0],
+          key: 'opening7:V1',
+          shotId: 'shot-7',
+          shotName: 'Opening 7',
+          clipIds: [],
+          rowId: 'V1',
+          canonicalIdentity,
+        }]}
+        hidden={false}
+        showTouchActions={false}
+        scrollLeft={0}
+        scrollTop={0}
+        openShotGroupMenu={vi.fn()}
+        onSelectClips={onSelectClips}
+        onSelectTrack={onSelectTrack}
+        selectedCanonicalOccurrenceId="opening7"
+      />,
+    );
+    const label = getByTitle('Opening 7');
+
+    expect(label.getAttribute(SHOT_GROUP_DRAG_ANCHOR_CLIP_ID_ATTR)).toBe('opening7');
+    expect(label.getAttribute('aria-pressed')).toBe('true');
+    expect(label.classList.contains('h-1')).toBe(true);
+    fireEvent.click(label);
+
+    expect(onSelectTrack).toHaveBeenCalledWith('V1');
+    expect(onSelectClips).toHaveBeenCalledWith(['opening7']);
+  });
+
+});

@@ -1,0 +1,193 @@
+/**
+ * ShotBatchItemMobile - Mobile-optimized batch view image item
+ *
+ * Touch-based selection with tap-to-select, no drag support.
+ * Uses shared utilities for aspect ratio and progressive loading.
+ */
+
+import React from 'react';
+import { Button } from '@/shared/components/ui/button';
+import { Trash2, Copy, Check, Maximize2 } from 'lucide-react';
+import { cn } from '@/shared/components/ui/contracts/cn';
+import { useBatchImageLoading } from '@/shared/hooks/ui-image/useBatchImageLoading';
+import { getImageAspectRatioStyle } from '@/shared/lib/media/imageAspectRatio';
+import { ShotBatchItemMobileProps } from './types';
+import { VariantBadge } from '@/shared/components/VariantBadge';
+import { mediaCrossOrigin } from '@/shared/lib/media/mediaCrossOrigin';
+
+export const ShotBatchItemMobile: React.FC<ShotBatchItemMobileProps> = ({
+  image,
+  isSelected,
+  index,
+  onMobileTap,
+  onDelete,
+  onDuplicate,
+  onOpenLightbox,
+  duplicatingImageId,
+  duplicateSuccessImageId,
+  shouldLoad = true,
+  projectAspectRatio,
+  frameNumber,
+  readOnly = false,
+  onMarkAllViewed,
+}) => {
+  const isUploadedReference = image.type === 'uploaded-reference';
+  const fullImageUrl = image.imageUrl ?? image.location ?? image.thumbUrl ?? '';
+
+  // Progressive loading setup
+  const { displayImageUrl, progressiveRef } = useBatchImageLoading({
+    thumbUrl: image.thumbUrl ?? image.location ?? undefined,
+    imageUrl: fullImageUrl,
+    shouldLoad,
+  });
+
+  // Calculate aspect ratio for consistent sizing
+  const aspectRatioStyle = getImageAspectRatioStyle(
+    image as unknown as Parameters<typeof getImageAspectRatioStyle>[0],
+    projectAspectRatio
+  );
+
+  // Check if an event originated from inside a button using composedPath (more reliable on touch devices)
+  const isEventInsideButton = (e: React.MouseEvent | React.TouchEvent): boolean => {
+    const path = e.nativeEvent?.composedPath?.() as HTMLElement[] | undefined;
+    const result = path
+      ? path.some((el) => (el as HTMLElement)?.tagName === 'BUTTON' || (el as HTMLElement)?.closest?.('button'))
+      : !!(e.target as HTMLElement).closest('button');
+    return result;
+  };
+
+  const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isEventInsideButton(e)) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    onMobileTap();
+  };
+
+  const handleContainerTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (isEventInsideButton(e)) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    onMobileTap();
+  };
+
+  // image.id is shot_generations.id - unique per entry
+  const isDuplicating = duplicatingImageId === image.id;
+  const showSuccessIcon = duplicateSuccessImageId === image.id;
+
+  return (
+    <>
+      <div
+        className={cn(
+          "relative group cursor-pointer rounded-lg overflow-hidden border-4",
+          isSelected
+            ? "border-blue-500 ring-4 ring-blue-200 dark:ring-blue-800"
+            : "border-transparent"
+        )}
+        onClick={handleContainerClick}
+        onTouchEnd={handleContainerTouchEnd}
+        style={aspectRatioStyle}
+      >
+        {isUploadedReference && (
+          <div className="absolute left-1/2 top-1 z-10 -translate-x-1/2 rounded-full bg-emerald-500/90 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white pointer-events-none">
+            Reference
+          </div>
+        )}
+
+        {/* Image */}
+        <img
+          ref={progressiveRef}
+          src={shouldLoad ? displayImageUrl : undefined}
+          crossOrigin={mediaCrossOrigin(shouldLoad ? displayImageUrl : undefined)}
+          alt={`Generated image ${index + 1}`}
+          className={cn(
+            "w-full h-full object-cover",
+            !shouldLoad && "bg-gray-100 dark:bg-gray-800"
+          )}
+          loading="lazy"
+        />
+
+        {/* Variant Count + NEW badge - bottom center */}
+        <VariantBadge
+          derivedCount={image.derivedCount}
+          unviewedVariantCount={image.unviewedVariantCount}
+          hasUnviewedVariants={image.hasUnviewedVariants}
+          variant="overlay"
+          size="sm"
+          position="bottom-1 left-1/2 -translate-x-1/2"
+          onMarkAllViewed={onMarkAllViewed}
+        />
+
+        {/* Center lightbox button - shows when selected */}
+        {isSelected && onOpenLightbox && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <Button
+              size="icon"
+              variant="secondary"
+              className="h-9 w-9 rounded-full bg-background/90 hover:bg-background shadow-lg pointer-events-auto"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenLightbox();
+              }}
+              title="Open lightbox"
+            >
+              <Maximize2 className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
+
+        {/* Copy button - opposite side of video (even index: left, odd index: right) */}
+        {!readOnly && onDuplicate && !isSelected && (
+          <Button
+            size="icon"
+            variant="secondary"
+            className={cn(
+              "absolute top-1 h-8 w-8 bg-card/75 dark:bg-gray-800/75 hover:bg-card/90 dark:hover:bg-gray-800/90",
+              index % 2 === 0 ? "left-1" : "right-1"
+            )}
+            onClick={(e) => {
+              e.stopPropagation();
+              // Use id (shot_generations.id) for duplication
+              if (frameNumber !== undefined) {
+                onDuplicate(image.id, frameNumber);
+              }
+            }}
+            disabled={isDuplicating || image.id?.startsWith('temp-') || frameNumber === undefined}
+            title={image.id?.startsWith('temp-') ? "Please wait..." : "Duplicate"}
+          >
+            {showSuccessIcon ? (
+              <Check className="h-3 w-3 text-green-600" />
+            ) : isDuplicating ? (
+              <div className="h-3 w-3 border border-gray-400 border-t-transparent rounded-full animate-spin" />
+            ) : (
+              <Copy className="h-3 w-3" />
+            )}
+          </Button>
+        )}
+
+        {/* Delete button - opposite side of video (even index: left, odd index: right) */}
+        {!readOnly && isSelected && onDelete && (
+          <Button
+            size="icon"
+            variant="destructive"
+            className={cn(
+              "absolute top-1 h-8 w-8 bg-red-500/75 hover:bg-red-500/90",
+              index % 2 === 0 ? "left-1" : "right-1"
+            )}
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            disabled={image.id?.startsWith('temp-')}
+            title={image.id?.startsWith('temp-') ? "Please wait..." : "Delete"}
+          >
+            <Trash2 className="h-3 w-3" />
+          </Button>
+        )}
+      </div>
+    </>
+  );
+};

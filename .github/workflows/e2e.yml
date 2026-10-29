@@ -1,0 +1,120 @@
+# The three Playwright lanes (the third lane is three jobs, one per npm script) that used to run nowhere (config/testing/skipRegistry.mjs LANES:
+# playwright-default, playwright-timeline, playwright-extension-a11y-visual-cross-browser).
+# Every config attaches config/testing/playwrightSkipGuard.ts, so an undeclared skip fails the job.
+name: E2E
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  playwright-default:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.19.0", cache: npm }
+      - run: npm ci --legacy-peer-deps
+      - run: npx playwright install --with-deps chromium
+      # The browser-renderer parity test reads the exported MP4 with ffprobe.
+      - run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg
+      - run: npx playwright test --config playwright.config.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: playwright-default-results, path: test-results, if-no-files-found: ignore }
+
+  playwright-timeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.19.0", cache: npm }
+      - run: npm ci --legacy-peer-deps
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e:timeline
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: playwright-timeline-results, path: test-results, if-no-files-found: ignore }
+
+  # The timeline lane's second project: H.264 cases that need installed Google Chrome.
+  playwright-timeline-chrome-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.19.0", cache: npm }
+      - run: npm ci --legacy-peer-deps
+      - run: npx playwright install --with-deps chrome
+      # The H.264 export specs read frames with ffmpeg/ffprobe and compare pixels with ImageMagick 7's `magick`
+      # driver (Ubuntu ships 6, which has no `magick`), so the pinned upstream AppImage is installed.
+      - name: Install ffmpeg and ImageMagick 7
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg
+          curl -fsSL -o magick.AppImage https://github.com/ImageMagick/ImageMagick/releases/download/7.1.1-47/ImageMagick-82572af-gcc-x86_64.AppImage
+          echo "dcdd2e135dd5f0701d992ccbbf744f51624441b5bc8eedcabe21516996e210ab  magick.AppImage" | sha256sum -c -
+          chmod +x magick.AppImage
+          sudo mv magick.AppImage /opt/magick.AppImage
+          printf '#!/bin/sh\nexec /opt/magick.AppImage --appimage-extract-and-run "$@"\n' | sudo tee /usr/local/bin/magick > /dev/null
+          sudo chmod +x /usr/local/bin/magick
+          magick -version
+      - run: npm run test:e2e:chrome-export
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: playwright-timeline-chrome-export-results, path: test-results, if-no-files-found: ignore }
+
+  extension-accessibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.19.0", cache: npm }
+      - run: npm ci --legacy-peer-deps
+      - run: npx playwright install --with-deps chromium firefox webkit
+      - run: npm run test:e2e:extension-accessibility
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: extension-accessibility-results, path: artifacts, if-no-files-found: ignore }
+
+  extension-visual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.19.0", cache: npm }
+      - run: npm ci --legacy-peer-deps
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e:extension-visual
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: extension-visual-results, path: artifacts, if-no-files-found: ignore }
+
+  extension-cross-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.19.0", cache: npm }
+      - run: npm ci --legacy-peer-deps
+      - run: npx playwright install --with-deps chrome chromium firefox webkit
+      - run: npm run test:e2e:extension-cross-browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: extension-cross-browser-results, path: artifacts, if-no-files-found: ignore }

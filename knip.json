@@ -1,0 +1,22 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/app/main.tsx",
+    "src/app/App.tsx",
+    "src/app/routes.tsx",
+    "public/sw.js"
+  ],
+  "project": ["src/**/*.{ts,tsx}"],
+  "ignore": [
+    "src/**/*.test.{ts,tsx}",
+    "src/**/*.spec.{ts,tsx}",
+    "**/*.d.ts",
+    "src/types/database.ts"
+  ],
+  "ignoreDependencies": [
+    "@types/*",
+    "tailwindcss",
+    "autoprefixer",
+    "postcss"
+  ]
+}

@@ -1,0 +1,234 @@
+/**
+ * LoRA Display Utilities
+ *
+ * Shared utilities for LoRA display name resolution.
+ */
+
+const HF_SCHEME = 'https';
+const HF_HOST = 'huggingface.co';
+const HF_RESOLVE_MAIN = 'resolve/main';
+
+function buildHuggingFaceUrl(repo: string, path: string): string {
+  return `${HF_SCHEME}://${HF_HOST}/${repo}/${HF_RESOLVE_MAIN}/${path}`;
+}
+
+// Preset edit-mode LoRA URLs used in media lightbox edit hooks.
+const EDIT_MODE_LORA_URLS = {
+  "in-scene": buildHuggingFaceUrl(
+    'peteromallet/random_junk',
+    'in_scene_different_object_000010500.safetensors',
+  ),
+  "next-scene": buildHuggingFaceUrl(
+    'lovis93/next-scene-qwen-image-lora-2509',
+    'next-scene_lora-v2-3000.safetensors',
+  ),
+} as const;
+
+type EditModeLoraMode = 'none' | 'in-scene' | 'next-scene' | 'custom';
+type EditModeLoraSelection = Array<{ url: string; strength: number }>;
+
+export function resolveEditModeLoras(
+  loraMode: EditModeLoraMode,
+  customLoraUrl: string,
+): EditModeLoraSelection | undefined {
+  switch (loraMode) {
+    case 'in-scene':
+      return [{ url: EDIT_MODE_LORA_URLS['in-scene'], strength: 1.0 }];
+    case 'next-scene':
+      return [{ url: EDIT_MODE_LORA_URLS['next-scene'], strength: 1.0 }];
+    case 'custom':
+      return customLoraUrl.trim()
+        ? [{ url: customLoraUrl.trim(), strength: 1.0 }]
+        : undefined;
+    case 'none':
+    default:
+      return undefined;
+  }
+}
+
+// Pre-defined LoRA options for quick selection
+export const PREDEFINED_LORAS = [
+  {
+    name: "I2V High Noise (Seko V1)",
+    displayName: "I2V High Noise (Seko V1)",
+    url: buildHuggingFaceUrl(
+      'lightx2v/Wan2.2-Lightning',
+      'Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors',
+    ),
+    category: "Lightning Official I2V"
+  },
+  {
+    name: "I2V Low Noise (Seko V1)",
+    displayName: "I2V Low Noise (Seko V1)",
+    url: buildHuggingFaceUrl(
+      'lightx2v/Wan2.2-Lightning',
+      'Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors',
+    ),
+    category: "Lightning Official I2V"
+  },
+  {
+    name: "VACE High Noise (Seko V2.0)",
+    displayName: "VACE High Noise (Seko V2.0)",
+    url: buildHuggingFaceUrl(
+      'lightx2v/Wan2.2-Lightning',
+      'Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/high_noise_model.safetensors',
+    ),
+    category: "Lightning Official VACE"
+  },
+  {
+    name: "VACE Low Noise (Seko V2.0)",
+    displayName: "VACE Low Noise (Seko V2.0)",
+    url: buildHuggingFaceUrl(
+      'lightx2v/Wan2.2-Lightning',
+      'Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/low_noise_model.safetensors',
+    ),
+    category: "Lightning Official VACE"
+  },
+  {
+    name: "High Noise (Official 250928)",
+    displayName: "High Noise (Official 250928)",
+    url: buildHuggingFaceUrl(
+      'lightx2v/Wan2.2-Lightning',
+      'Wan2.2-T2V-A14B-4steps-lora-250928/high_noise_model.safetensors',
+    ),
+    category: "Lightning Official Legacy"
+  },
+  {
+    name: "Low Noise (Official 250928)",
+    displayName: "Low Noise (Official 250928)",
+    url: buildHuggingFaceUrl(
+      'lightx2v/Wan2.2-Lightning',
+      'Wan2.2-T2V-A14B-4steps-lora-250928/low_noise_model.safetensors',
+    ),
+    category: "Lightning Official Legacy"
+  },
+  {
+    name: "Fun InP - High Noise HPS2.1",
+    displayName: "Fun InP - High Noise HPS2.1",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Fun-A14B-InP-high-noise-HPS2.1.safetensors',
+    ),
+    category: "Fun InP"
+  },
+  {
+    name: "Fun InP - High Noise MPS",
+    displayName: "Fun InP - High Noise MPS",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Fun-A14B-InP-high-noise-MPS.safetensors',
+    ),
+    category: "Fun InP"
+  },
+  {
+    name: "Fun InP - Low Noise HPS2.1",
+    displayName: "Fun InP - Low Noise HPS2.1",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Fun-A14B-InP-low-noise-HPS2.1.safetensors',
+    ),
+    category: "Fun InP"
+  },
+  {
+    name: "Fun InP - Low Noise MPS",
+    displayName: "Fun InP - Low Noise MPS",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Fun-A14B-InP-low-noise-MPS.safetensors',
+    ),
+    category: "Fun InP"
+  },
+  {
+    name: "Lightning T2V HIGH (fp16)",
+    displayName: "Lightning T2V HIGH (fp16)",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Lightning_T2V-A14B-4steps-lora_HIGH_fp16.safetensors',
+    ),
+    category: "Lightning Accelerators"
+  },
+  {
+    name: "Lightning T2V v1.1 HIGH",
+    displayName: "Lightning T2V v1.1 HIGH",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Lightning_T2V-v1.1-A14B-4steps-lora_HIGH_fp16.safetensors',
+    ),
+    category: "Lightning Accelerators"
+  },
+  {
+    name: "Lightning T2V v1.1 LOW",
+    displayName: "Lightning T2V v1.1 LOW",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan2.2-Lightning_T2V-v1.1-A14B-4steps-lora_LOW_fp16.safetensors',
+    ),
+    category: "Lightning Accelerators"
+  },
+  {
+    name: "HIGH Lightning 250928 (rank128)",
+    displayName: "HIGH Lightning 250928 (rank128)",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan22_A14B_T2V_HIGH_Lightning_4steps_lora_250928_rank128_fp16.safetensors',
+    ),
+    category: "Lightning Accelerators"
+  },
+  {
+    name: "LOW Lightning 250928 (rank64)",
+    displayName: "LOW Lightning 250928 (rank64)",
+    url: buildHuggingFaceUrl(
+      'DeepBeepMeep/Wan2.2',
+      'loras_accelerators/Wan22_A14B_T2V_LOW_Lightning_4steps_lora_250928_rank64_fp16.safetensors',
+    ),
+    category: "Lightning Accelerators"
+  },
+];
+
+/**
+ * Clean up a filename to be more human-readable
+ * Removes extension, replaces underscores/hyphens with spaces
+ */
+function cleanFilename(filename: string): string {
+  if (!filename) return '';
+  return filename
+    .replace(/\.safetensors$/i, '')
+    .replace(/\.ckpt$/i, '')
+    .replace(/\.pt$/i, '')
+    .replace(/_/g, ' ')
+    .replace(/-/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Get display name from LoRA URL
+ * Checks predefined LoRAs first, then falls back to the given name, then to the cleaned filename
+ * @param url - The LoRA URL/path
+ * @param fallbackName - Optional name to use if URL doesn't match anything
+ */
+export function getDisplayNameFromUrl(url: string, fallbackName?: string): string {
+  // Check if this is a predefined LoRA
+  if (url) {
+    const predefinedLora = PREDEFINED_LORAS.find(lora => lora.url === url);
+    if (predefinedLora?.displayName) {
+      return predefinedLora.displayName;
+    }
+  }
+
+  // Use fallback name if provided and not empty
+  if (fallbackName && fallbackName.trim()) {
+    return fallbackName;
+  }
+
+  // Otherwise, extract and clean filename from URL
+  if (url) {
+    const parts = url.split('/');
+    const filename = parts[parts.length - 1];
+    if (filename) {
+      return cleanFilename(filename);
+    }
+  }
+
+  return '';
+}

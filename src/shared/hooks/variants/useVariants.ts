@@ -1,0 +1,227 @@
+/**
+ * useVariants Hook
+ *
+ * Centralized hook for fetching and managing variants for a generation.
+ * Allows switching between variants and setting the primary variant.
+ * Supports realtime updates via RealtimeProvider.
+ *
+ * Used by: MediaLightbox, InlineEditView, and other components that display variants.
+ */
+
+import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { getProjectSelectionFallbackId } from '@/shared/contexts/projectSelectionStore';
+import { bridgeMediaUrl } from '@/shared/lib/media/bridgeMediaUrl';
+import { bridgeCapabilityUnavailable } from '@/integrations/astrid/capability';
+import { useAuthSafe } from '@/shared/contexts/AuthContext';
+import { useRuntimeAuthority } from '@/app/runtime/runtimeAuthority';
+import {
+  fetchRuntimeGenerationSnapshot,
+} from '@/integrations/runtime/generationAccess';
+import { AstridRuntimeClient } from '@/integrations/runtime/client';
+import { coerceVariantType, type VariantType } from '@/shared/constants/variantTypes';
+import { generationQueryKeys } from '@/shared/lib/queryKeys/generations';
+import { useAppEventListener } from '@/shared/lib/typedEvents';
+import { fetchGenerationDetailQuery } from '@/shared/hooks/generations/useGenerationDetail';
+
+/**
+ * A variant of a generation (from generation_variants table)
+ */
+export interface GenerationVariant {
+  id: string;
+  generation_id: string;
+  location: string;
+  thumbnail_url: string | null;
+  params: Record<string, unknown> | null;
+  is_primary: boolean;
+  starred: boolean;
+  variant_type: VariantType | null;
+  name: string | null;
+  created_at: string;
+  viewed_at: string | null;
+}
+
+/**
+ * Return type for useVariants hook
+ */
+interface UseVariantsReturn {
+  variants: GenerationVariant[];
+  primaryVariant: GenerationVariant | null;
+  activeVariant: GenerationVariant | null;
+  isLoading: boolean;
+  error: Error | null;
+  refetch: () => void;
+  setActiveVariantId: (variantId: string | null) => void;
+  setPrimaryVariant: (variantId: string) => Promise<void>;
+  deleteVariant: (variantId: string) => Promise<void>;
+}
+
+interface UseVariantsProps {
+  generationId: string | null;
+  enabled?: boolean;
+}
+
+export const useVariants = ({
+  generationId,
+  enabled = true,
+}: UseVariantsProps): UseVariantsReturn => {
+  const { isAuthenticated } = useAuthSafe();
+  const queryClient = useQueryClient();
+  const [activeVariantId, setActiveVariantIdInternal] = useState<string | null>(null);
+  const { runtimeAuthority, runtimeProjectId } = useRuntimeAuthority();
+  
+  // Stable callback - no deps needed since we just forward to internal setter
+  const setActiveVariantId = useCallback((variantId: string | null) => {
+    setActiveVariantIdInternal(variantId);
+  }, []);
+
+  // Fetch variants for this generation
+  const { data: variants = [], isLoading, error, refetch } = useQuery({
+    queryKey: generationId
+      ? runtimeProjectId
+        ? ['runtime', 'generation-variants', runtimeProjectId, generationId]
+        : generationQueryKeys.variants(generationId)
+      : ['generation-variants', null],
+    queryFn: async () => {
+      if (!generationId) return [];
+
+      if (runtimeAuthority) {
+        if (!runtimeProjectId) return [];
+        const runtimeClient = new AstridRuntimeClient();
+        const snapshot = await fetchRuntimeGenerationSnapshot(generationId, runtimeClient);
+        if (!snapshot || snapshot.generation.project_id !== runtimeProjectId) return [];
+        const primary = snapshot.variants.find((variant) => variant.metadata.is_primary === true)
+          ?? snapshot.variants.find((variant) => variant.variant_type === 'original');
+        return snapshot.variants.map((variant) => {
+          const thumbnail = variant.thumbnail;
+          const thumbnailUrl = thumbnail
+            && thumbnail.source_object_id === variant.object_id
+            ? runtimeClient.objectContentUrl(thumbnail.object_id)
+            : null;
+          const variantMetadata = variant.metadata ?? {};
+          const variantParams = variantMetadata.params && typeof variantMetadata.params === 'object'
+            ? variantMetadata.params as Record<string, unknown>
+            : {};
+          const mediaType = typeof variantMetadata.media_type === 'string'
+            ? variantMetadata.media_type
+            : typeof variantMetadata.content_type === 'string'
+              ? variantMetadata.content_type
+              : undefined;
+          return {
+            id: variant.variant_id,
+            generation_id: variant.generation_id,
+            location: variant.object_id ? runtimeClient.objectContentUrl(variant.object_id) : '',
+            thumbnail_url: thumbnailUrl,
+            params: Object.keys(variantParams).length > 0 || mediaType
+              ? { ...variantParams, ...(mediaType ? { media_type: mediaType } : {}) }
+              : null,
+            is_primary: variant.variant_id === primary?.variant_id,
+            starred: variantMetadata.starred === true,
+            variant_type: coerceVariantType(variant.variant_type),
+            name: typeof variantMetadata.name === 'string' ? variantMetadata.name : null,
+            created_at: variant.created_at,
+            viewed_at: variant.viewed_at ?? null,
+          };
+        }) as GenerationVariant[];
+      }
+
+      const detail = await fetchGenerationDetailQuery(queryClient, generationId);
+      if (!detail) return [];
+
+      const projectSlug = getProjectSelectionFallbackId();
+      if (!projectSlug) return [];
+
+      // Wire order is recency-first; the content route doubles as the
+      // thumbnail address (no separate thumb media on the wire).
+      return detail.variants.map((variant) => ({
+        id: variant.id,
+        generation_id: variant.generation_id,
+        location: bridgeMediaUrl(projectSlug, variant.media_id),
+        thumbnail_url: bridgeMediaUrl(projectSlug, variant.media_id),
+        params: variant.params ?? null,
+        is_primary: variant.is_primary,
+        starred: variant.starred,
+        variant_type: coerceVariantType(variant.variant_type),
+        name: variant.name ?? null,
+        created_at: variant.created_at,
+        viewed_at: variant.viewed_at ?? null,
+      })) as GenerationVariant[];
+    },
+    enabled: enabled && !!generationId
+      && (runtimeAuthority ? Boolean(runtimeProjectId) : isAuthenticated),
+    staleTime: 30000,
+  });
+
+  // Listen for realtime variant changes and refetch when our generationId is affected
+  const handleVariantChange = useCallback((detail: { affectedGenerationIds: string[] }) => {
+    if (!generationId || !enabled || !isAuthenticated) return;
+    const affectedIds = detail?.affectedGenerationIds || [];
+    if (affectedIds.includes(generationId)) {
+      refetch();
+    }
+  }, [generationId, enabled, isAuthenticated, refetch]);
+
+  useAppEventListener('realtime:variant-change-batch', handleVariantChange);
+
+  // Find the primary variant
+  const primaryVariant = useMemo(() => {
+    return variants.find((v) => v.is_primary) || null;
+  }, [variants]);
+
+  // Get the active variant (selected or primary, fallback to first variant)
+  const activeVariant = useMemo(() => {
+    if (activeVariantId) {
+      const found = variants.find((v) => v.id === activeVariantId);
+      if (found) {
+        return found;
+      }
+    }
+    // Fall back to primary, then first variant if no primary exists
+    return primaryVariant || variants[0] || null;
+  }, [variants, activeVariantId, primaryVariant]);
+
+  // Initialize active variant to primary (or first variant) when variants load
+  // NOTE: Using useEffect, not useMemo - side effects should not be in useMemo
+  useEffect(() => {
+    if (!activeVariantId && variants.length > 0) {
+      const variantToSelect = primaryVariant || variants[0];
+      if (variantToSelect) {
+        setActiveVariantIdInternal(variantToSelect.id);
+      }
+    }
+  }, [primaryVariant, variants, activeVariantId]);
+
+  const setPrimaryVariant = useCallback(
+    async (variantId: string) => {
+      void variantId;
+      throw bridgeCapabilityUnavailable(
+        'set primary generation variant',
+        'Use an Astrid pack command after variant mutation routes are installed.',
+      );
+    },
+    []
+  );
+
+  const deleteVariant = useCallback(
+    async (variantId: string) => {
+      void variantId;
+      throw bridgeCapabilityUnavailable(
+        'delete generation variant',
+        'Use an Astrid pack command after variant mutation routes are installed.',
+      );
+    },
+    []
+  );
+
+  return {
+    variants,
+    primaryVariant,
+    activeVariant,
+    isLoading,
+    error: error as Error | null,
+    refetch,
+    setActiveVariantId,
+    setPrimaryVariant,
+    deleteVariant,
+  };
+};

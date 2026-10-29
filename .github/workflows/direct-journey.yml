@@ -1,0 +1,246 @@
+# Same-machine "direct" journey (Plan A, card A0.3): a production build on a hosted-style HTTPS origin,
+# a real Runtime daemon on throwaway SQLite serving it through its own browser door, and Chromium.
+# Local equivalent: npm run test:e2e:direct (tests/e2e/local/support/harness.ts).
+#
+# Runtime checkout: the Runtime repo is private, so actions/checkout needs a token that can read it. Add a
+# repository secret RUNTIME_READ_TOKEN (a fine-grained PAT, or a deploy-key-backed token, with read access
+# to banodoco/astrid-runtime). When the secret is not set, the job falls back to github.token,
+# which only works if the Runtime repo is readable by this repository. Pull requests from forks get no
+# secrets, so this lane cannot run for them.
+#
+# Pass rule (a skip means a missing harness, R-9): exactly M tests expected to fail (M is the journey
+# file's budget in scripts/quality/check-known-failures.mjs), none unexpected, none flaky, none skipped.
+name: Direct Journey
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/direct-journey.yml"
+      - "scripts/runtime-discovery-proxy.mjs"
+      - "scripts/dev-local-workspace*"
+      - "src/integrations/runtime/**"
+      - "src/shared/lib/media/**"
+      - "tests/e2e/local/**"
+      - "tests/e2e/support/**"
+      - "playwright.direct.config.ts"
+      - "playwright.three-products.config.ts"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: direct-journey-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-journey:
+    runs-on: ubuntu-latest
+    steps:
+      # The harness finds the Runtime at ../astrid-runtime (ASTRID_RUNTIME_CHECKOUT overrides),
+      # so both repos are checked out as siblings under $GITHUB_WORKSPACE/..: App in astrid-app, Runtime beside it.
+      - uses: actions/checkout@v4
+        with:
+          path: astrid-app
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-runtime
+          ref: main
+          path: astrid-runtime
+          token: ${{ secrets.RUNTIME_READ_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.0"
+          cache: npm
+          cache-dependency-path: astrid-app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build the Runtime venv
+        working-directory: astrid-runtime
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e .
+          .venv/bin/python -m runtime_protocol.cli --help > /dev/null
+
+      - name: Install App dependencies, Chromium and ffmpeg
+        working-directory: astrid-app
+        run: |
+          npm ci --legacy-peer-deps
+          npx playwright install --with-deps chromium
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Run the journey
+        working-directory: astrid-app
+        env:
+          # Written by the JSON reporter itself: the config's globalSetup prints to stdout, so a shell redirect would corrupt the file.
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ runner.temp }}/direct-journey.json
+          PLAYWRIGHT_OUTPUT_DIR: ${{ runner.temp }}/direct-results
+          NODE_OPTIONS: --max-old-space-size=4096
+          ASTRID_APP_DIRECT_DOOR_PORT: "17341"
+          # A missing dependency in this job is a failure, never a skip (config/testing/skipRegistry.mjs).
+          ASTRID_REQUIRE_LANES: direct-journey
+        run: npx playwright test -c playwright.direct.config.ts --reporter=json,list,./config/testing/playwrightSkipGuard.ts
+
+      - name: Check the outcome counts
+        if: ${{ !cancelled() }}
+        working-directory: astrid-app
+        env:
+          REPORT: ${{ runner.temp }}/direct-journey.json
+        run: |
+          jq '
+            [.. | objects | select(has("expectedStatus") and has("results"))] as $tests
+            | {
+                total: ($tests | length),
+                expected_failures: ($tests | map(select(.expectedStatus == "failed")) | length),
+                expected_failures_that_failed: ($tests | map(select(.expectedStatus == "failed" and .status == "expected")) | length),
+                unexpected: .stats.unexpected,
+                flaky: .stats.flaky,
+                skipped: .stats.skipped
+              }
+            | . as $r | $r, (
+                if $r.total > 0 and $r.expected_failures == 0 and $r.expected_failures_that_failed == 0
+                   and $r.unexpected == 0 and $r.flaky == 0 and $r.skipped == 0
+                then empty else error("direct journey: want 0 expected failures, 0 unexpected, 0 flaky, 0 skipped; got \($r)") end)
+          ' "$REPORT"
+
+      - name: Collect artifacts
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/direct-artifacts"
+          cp "${{ runner.temp }}/direct-journey.json" "$RUNNER_TEMP/direct-artifacts/" || true
+          find "${{ runner.temp }}/direct-results" -name 'direct-measurements.json' -exec cp {} "$RUNNER_TEMP/direct-artifacts/" \; || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: direct-journey
+          path: ${{ runner.temp }}/direct-artifacts/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: direct-journey-traces
+          path: ${{ runner.temp }}/direct-results/
+          if-no-files-found: ignore
+
+  # Three products on one realm (testing plan F2, thin slice): the same hosted build and real Runtime (with its browser door) as the
+  # job above, plus the real Astrid CLI as a second client. Local equivalent: npm run test:e2e:three-products.
+  # Astrid is private to this lane's token: add a repository secret ASTRID_READ_TOKEN (a fine-grained PAT with read access to
+  # banodoco/astrid-agent, or whichever repository holds Astrid). Without it the job falls back to github.token, which
+  # only reads Astrid if this repository can. A missing checkout or interpreter fails the job by name (R-9); it never skips.
+  # Until the Astrid branch carrying astrid/core/dev/cross_client.py (tidy-w2) merges to its main, this job checks out an Astrid
+  # without that module, so any PR touching tests/e2e/local/** (or the paths above) is red here until that merge.
+  three-products:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: three-products-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      # The harness finds Astrid at ../astrid-agent (ASTRID_CHECKOUT overrides) and the Runtime at ../astrid-runtime,
+      # so all three checkouts are siblings under $GITHUB_WORKSPACE.
+      - uses: actions/checkout@v4
+        with:
+          path: astrid-app
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-runtime
+          ref: main
+          path: astrid-runtime
+          token: ${{ secrets.RUNTIME_READ_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: main
+          path: astrid-agent
+          token: ${{ secrets.ASTRID_READ_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.0"
+          cache: npm
+          cache-dependency-path: astrid-app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build the Runtime venv
+        working-directory: astrid-runtime
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e .
+          .venv/bin/python -m runtime_protocol.cli --help > /dev/null
+
+      - name: Build the Astrid venv
+        working-directory: astrid-agent
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e .
+          # Astrid imports runtime_protocol but does not declare it: the installer puts the Runtime beside it with --no-deps
+          # (astrid/installer/backend.py, scripts/ci_install_runtime.py). Here the Runtime under test is the sibling checkout.
+          .venv/bin/python -m pip install --no-deps -e ../astrid-runtime
+          .venv/bin/python -m astrid.core.dev.cross_client --help > /dev/null
+
+      # Chrome, not Chromium: the render case plays an H.264 film (the bundled Chromium cannot decode it) and a missing Chrome
+      # fails at browser launch. ffmpeg makes the case's real VP8 and Opus media, and the host's ffmpeg renderer makes the render.
+      - name: Install App dependencies, Chrome and ffmpeg
+        working-directory: astrid-app
+        run: |
+          npm ci --legacy-peer-deps
+          npx playwright install --with-deps chrome
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Run the three-product journey
+        working-directory: astrid-app
+        env:
+          ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
+          ASTRID_REQUIRE_LANES: direct-journey
+          ASTRID_PYTHON: ${{ github.workspace }}/astrid-agent/.venv/bin/python
+          # Written by the JSON reporter itself (the globalSetup prints to stdout, so a shell redirect would corrupt the file).
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ runner.temp }}/three-products.json
+          PLAYWRIGHT_OUTPUT_DIR: ${{ runner.temp }}/three-products-results
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run test:e2e:three-products -- --reporter=json,list,./config/testing/playwrightSkipGuard.ts
+
+      # Pass rule (R-9, same as the direct journey): no quarantined cases exist for this spec, so every case must pass. Durations are
+      # written to three-products-summary.json and recorded, never judged (R-10).
+      - name: Check the outcome counts
+        if: ${{ !cancelled() }}
+        working-directory: astrid-app
+        env:
+          REPORT: ${{ runner.temp }}/three-products.json
+        run: |
+          jq '
+            [.. | objects | select(has("expectedStatus") and has("results"))] as $tests
+            | {
+                total: ($tests | length),
+                expected_failures: ($tests | map(select(.expectedStatus == "failed")) | length),
+                expected_failures_that_failed: ($tests | map(select(.expectedStatus == "failed" and .status == "expected")) | length),
+                unexpected: .stats.unexpected,
+                flaky: .stats.flaky,
+                skipped: .stats.skipped
+              }
+            | . as $r | $r, (
+                if $r.total > 0 and $r.expected_failures == 0 and $r.expected_failures_that_failed == 0
+                   and $r.unexpected == 0 and $r.flaky == 0 and $r.skipped == 0
+                then empty else error("three-product journey: want cases, 0 expected failures, 0 unexpected, 0 flaky, 0 skipped; got \($r)") end)
+          ' "$REPORT"
+
+      - name: Collect artifacts
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/three-products-artifacts"
+          cp "${{ runner.temp }}/three-products.json" "$RUNNER_TEMP/three-products-artifacts/" || true
+          find "${{ runner.temp }}/three-products-results" -name 'three-products-summary.json' -exec cp {} "$RUNNER_TEMP/three-products-artifacts/" \; || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: three-products
+          path: ${{ runner.temp }}/three-products-artifacts/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: three-products-traces
+          path: ${{ runner.temp }}/three-products-results/
+          if-no-files-found: ignore

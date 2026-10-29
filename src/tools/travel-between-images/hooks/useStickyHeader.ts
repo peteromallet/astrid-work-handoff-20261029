@@ -1,0 +1,134 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  attachRafStickyObserver,
+  getElementDocumentTop,
+} from '@/shared/lib/sticky/rafStickyObserver';
+
+interface UseStickyHeaderProps {
+  headerRef: React.RefObject<HTMLDivElement>;
+  isMobile: boolean;
+  isEditingName?: boolean;
+  enabled?: boolean;
+}
+
+interface UseStickyHeaderReturn {
+  isSticky: boolean;
+  headerBounds: { left: number; width: number };
+  stableBounds: { left: number; width: number };
+  updateHeaderBounds: () => void;
+}
+
+/**
+ * Hook to manage sticky header visibility based on scroll position
+ * Uses RAF-based scroll detection for smooth performance
+ */
+export const useStickyHeader = ({
+  headerRef,
+  isMobile,
+  isEditingName = false,
+  enabled = true
+}: UseStickyHeaderProps): UseStickyHeaderReturn => {
+  const [isSticky, setIsSticky] = useState(false);
+  const isStickyRef = useRef(isSticky);
+  const [headerBounds, setHeaderBounds] = useState({ left: 0, width: 0 });
+  const [stableBounds, setStableBounds] = useState({ left: 0, width: 0 });
+
+  // No ref-sync effect needed: attachRafStickyObserver manages isStickyRef.current directly
+
+  const updateHeaderBounds = useCallback(() => {
+    const containerEl = headerRef.current;
+    if (!containerEl) return;
+
+    const rect = containerEl.getBoundingClientRect();
+    const newBounds = { left: rect.left, width: rect.width };
+    setHeaderBounds(newBounds);
+    setStableBounds(newBounds);
+  }, [headerRef]);
+
+  // RAF-based scroll detection for sticky header
+  useEffect(() => {
+    if (!enabled) return;
+
+    const containerEl = headerRef.current;
+    if (!containerEl) return;
+
+    const globalHeaderHeight = isMobile ? 60 : 96;
+    const buffer = isMobile ? 5 : 10;
+
+    return attachRafStickyObserver({
+      element: containerEl,
+      isStickyRef,
+      setSticky: setIsSticky,
+      computeThresholdY: () => getElementDocumentTop(containerEl) - globalHeaderHeight - buffer,
+      // Avoid immediate sticky check while editing to prevent instant blur
+      shouldRunInitialCheck: !isEditingName,
+    });
+  }, [isMobile, isEditingName, enabled, headerRef]);
+
+  // Update header bounds during scroll and resize
+  useEffect(() => {
+    if (!enabled) return;
+
+    const containerEl = headerRef.current;
+    if (!containerEl) return;
+
+    let rafId: number | null = null;
+    let lastUpdateTime = 0;
+    const THROTTLE_MS = 16; // ~60fps
+
+    const updateBounds = () => {
+      const now = performance.now();
+      // Only update if enough time has passed (throttle) or if sticky is not visible
+      if (now - lastUpdateTime >= THROTTLE_MS || !isSticky) {
+        updateHeaderBounds();
+        lastUpdateTime = now;
+      }
+      rafId = null;
+    };
+
+    const scheduleUpdate = () => {
+      // When sticky header is visible, throttle updates more aggressively
+      if (isSticky) {
+        // Only update on resize when sticky, not on scroll
+        return;
+      }
+      if (rafId) return;
+      rafId = requestAnimationFrame(updateBounds);
+    };
+
+    const handleScroll = () => scheduleUpdate();
+    const handleResize = () => {
+      updateHeaderBounds();
+    };
+
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('resize', handleResize);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [updateHeaderBounds, isSticky, enabled, headerRef]);
+
+  // Initial bounds calculation
+  useEffect(() => {
+    if (enabled) {
+      updateHeaderBounds();
+    }
+  }, [updateHeaderBounds, enabled]);
+
+  // Capture stable bounds when sticky header becomes visible
+  useEffect(() => {
+    if (isSticky && headerBounds.width > 0) {
+      setStableBounds(headerBounds);
+    }
+  }, [isSticky, headerBounds]);
+
+  return {
+    isSticky,
+    headerBounds,
+    stableBounds,
+    updateHeaderBounds
+  };
+};

@@ -1,0 +1,31 @@
+/**
+ * Managed-media content addressing (`GET|HEAD /projects/:slug/media/:id/content`).
+ * The route serves verified managed bytes with Range/ETag
+ * semantics, so consumers build URLs for `<video>`/`<img>`/`<audio>` elements
+ * instead of fetching JSON — this module only fixes the address form.
+ */
+
+import { bridgeMediaContentUrl } from '@/tools/video-editor/data/bridgeContract.ts';
+import type { AstridBridgeTransport } from './transport.ts';
+
+export class AstridLocalMediaRoutes {
+  private readonly transport: AstridBridgeTransport;
+  private readonly projectSlug: string;
+
+  constructor(transport: AstridBridgeTransport, options: { projectSlug: string }) {
+    this.transport = transport;
+    this.projectSlug = options.projectSlug;
+  }
+
+  /**
+   * Same-origin URL for one managed media object's bytes. Absolute URLs pass
+   * through untouched is the CALLER'S job (see `bridgeMediaUrl`
+   * helper); here every id becomes a content-route address.
+   */
+  contentUrl(mediaId: string): string {
+    if (mediaId.startsWith('sha256:')) {
+      return `${this.transport.baseUrl.replace(/\/+$/, '')}/v1/objects/${encodeURIComponent(mediaId)}`;
+    }
+    return bridgeMediaContentUrl(this.transport.baseUrl, this.projectSlug, mediaId);
+  }
+}

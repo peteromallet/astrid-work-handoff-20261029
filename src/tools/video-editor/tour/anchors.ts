@@ -1,0 +1,31 @@
+/** DOM anchors the editor tour spotlights. Prefixed so they never match the old `data-tour` selectors. */
+
+export const EDITOR_TOUR_ANCHOR_ATTRIBUTE = 'data-editor-tour';
+export const EDITOR_TOUR_TRACK_ATTRIBUTE = 'data-editor-tour-track';
+
+export const EDITOR_TOUR_ANCHORS = Object.freeze({
+  chatComposer: 'chat-composer',
+  chatSend: 'chat-send',
+  chatTranscript: 'chat-transcript',
+  /** The act's reply and its actions, in the tour's own chat. */
+  chatReply: 'chat-reply',
+  timeline: 'timeline',
+  preview: 'preview',
+} as const);
+
+export type EditorTourAnchor = (typeof EDITOR_TOUR_ANCHORS)[keyof typeof EDITOR_TOUR_ANCHORS];
+
+/** Track ids on the demo timeline; track rows carry them in `data-editor-tour-track`. */
+export const EDITOR_TOUR_TRACK_IDS = Object.freeze({
+  scene: 'tour-scene',
+  stills: 'tour-stills',
+  videos: 'tour-videos',
+} as const);
+
+export function editorTourSelector(anchor: EditorTourAnchor): string {
+  return `[${EDITOR_TOUR_ANCHOR_ATTRIBUTE}="${anchor}"]`;
+}
+
+export function editorTourTrackSelector(trackId: string): string {
+  return `[${EDITOR_TOUR_TRACK_ATTRIBUTE}="${trackId}"]`;
+}

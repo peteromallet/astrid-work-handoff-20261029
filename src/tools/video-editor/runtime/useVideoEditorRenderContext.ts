@@ -1,0 +1,110 @@
+import { useMemo } from 'react';
+import { useVideoEditorRuntime } from '@/tools/video-editor/contexts/VideoEditorRuntimeContext.tsx';
+import {
+  useTimelineChromeContext,
+  useTimelineEditorData,
+  useTimelineEditorOps,
+  useTimelinePlaybackContext,
+} from '@/tools/video-editor/hooks/timelineStore.ts';
+import type { ResolvedTimelineOverlayDescriptor } from '@astrid/editor-sdk';
+import type {
+  ResolvedVideoEditorPanelRegistry,
+  VideoEditorExtensionRuntimeConfig,
+  VideoEditorRenderContext,
+  VideoEditorRuntimeSlices,
+} from '@/tools/video-editor/runtime/extensionSurface.ts';
+import { resolveVideoEditorPanelRegistry } from '@/tools/video-editor/runtime/extensionSurface.ts';
+
+export function buildVideoEditorRenderContext(
+  runtime: ReturnType<typeof useVideoEditorRuntime>,
+  slices: VideoEditorRuntimeSlices,
+): VideoEditorRenderContext {
+  return {
+    provider: runtime.provider,
+    timelineId: runtime.timelineId,
+    timelineName: runtime.timelineName ?? null,
+    userId: runtime.userId ?? '',
+    extensions: runtime.extensions,
+    ...slices,
+  };
+}
+
+export function useVideoEditorExtensionRuntime(): VideoEditorExtensionRuntimeConfig {
+  return useVideoEditorRuntime().extensions;
+}
+
+export function useVideoEditorRuntimeSlices(): VideoEditorRuntimeSlices {
+  const data = useTimelineEditorData();
+  const ops = useTimelineEditorOps();
+  const chrome = useTimelineChromeContext();
+  const playback = useTimelinePlaybackContext();
+
+  return useMemo(() => ({
+    data,
+    ops,
+    chrome,
+    playback,
+  }), [chrome, data, ops, playback]);
+}
+
+export function useVideoEditorRenderContext(): VideoEditorRenderContext {
+  const runtime = useVideoEditorRuntime();
+  const slices = useVideoEditorRuntimeSlices();
+
+  return useMemo(
+    () => buildVideoEditorRenderContext(runtime, slices),
+    [runtime, slices],
+  );
+}
+
+export function useVideoEditorSlotRenderers() {
+  return useVideoEditorExtensionRuntime().slots;
+}
+
+/**
+ * Resolved timeline overlays for the active extension runtime.
+ *
+ * Returns only descriptors whose owning extension registered a renderer via
+ * `ctx.ui.registerRenderer()` (reconciled by `resolveRegisteredRenderers`);
+ * overlays without a registered renderer are omitted. Manifest `when` clauses
+ * are not evaluated here — the overlay contract has no `when`.
+ */
+export function useVideoEditorTimelineOverlays(): readonly ResolvedTimelineOverlayDescriptor[] {
+  return useVideoEditorExtensionRuntime().overlays as readonly ResolvedTimelineOverlayDescriptor[];
+}
+
+export function useVideoEditorDialogDescriptors() {
+  return useVideoEditorExtensionRuntime().dialogHost.dialogs;
+}
+
+export function useVideoEditorPanelRegistry() {
+  return useVideoEditorExtensionRuntime().registry;
+}
+
+export function useResolvedVideoEditorPanelRegistry(): ResolvedVideoEditorPanelRegistry {
+  const registry = useVideoEditorPanelRegistry();
+  const renderContext = useVideoEditorRenderContext();
+
+  return useMemo(
+    () => resolveVideoEditorPanelRegistry(registry, renderContext),
+    [registry, renderContext],
+  );
+}
+
+export function useVideoEditorAssetPanels() {
+  return useResolvedVideoEditorPanelRegistry().assetPanels;
+}
+
+export function useVideoEditorInspectorSections(placement?: 'before-default' | 'after-default') {
+  const registry = useResolvedVideoEditorPanelRegistry();
+
+  if (placement === 'before-default') {
+    return registry.inspectorSections.beforeDefault;
+  }
+
+  if (placement === 'after-default') {
+    return registry.inspectorSections.afterDefault;
+  }
+
+  return registry.inspectorSections.all;
+}

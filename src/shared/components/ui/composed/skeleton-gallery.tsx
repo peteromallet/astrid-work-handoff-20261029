@@ -1,0 +1,136 @@
+import React from 'react';
+import { cn } from '@/shared/components/ui/contracts/cn';
+import { parseRatio } from '@/shared/lib/media/aspectRatios';
+
+interface SkeletonGalleryProps {
+  /** Number of skeleton items to show */
+  count?: number;
+  /** Number of columns for the grid (responsive breakpoints) */
+  columns?: {
+    base?: number;
+    sm?: number;
+    md?: number;
+    lg?: number;
+    xl?: number;
+    '2xl'?: number;
+  };
+  /** Fixed column count - overrides responsive columns when provided */
+  fixedColumns?: number;
+  /** Custom gap classes (e.g. "gap-2 sm:gap-3 md:gap-4") - defaults to "gap-4" */
+  gapClasses?: string;
+  /** Whether to use white text/styling (for dark panes) */
+  darkSurface?: boolean;
+  /** Custom className for the container */
+  className?: string;
+  /** Whether to show skeleton controls at the top (pagination, filters, search) */
+  showControls?: boolean;
+  /** Project aspect ratio (e.g. "16:9", "4:3", "1:1") to match project dimensions */
+  projectAspectRatio?: string;
+}
+
+/**
+ * A reusable skeleton loading component for gallery layouts.
+ * Provides consistent skeleton styling across different tools and pages.
+ */
+function SkeletonGalleryComponent({
+  count = 20,
+  columns = { base: 2, sm: 3, md: 4, lg: 5, xl: 6 },
+  fixedColumns,
+  gapClasses = 'gap-4',
+  darkSurface = false,
+  className,
+  showControls = false,
+  projectAspectRatio
+}: SkeletonGalleryProps) {
+  
+  const colsLookup: Record<number, string> = { 1: 'grid-cols-1', 2: 'grid-cols-2', 3: 'grid-cols-3', 4: 'grid-cols-4', 5: 'grid-cols-5', 6: 'grid-cols-6' };
+  const prefixedCols = (prefix: string, n?: number) => n ? `${prefix}${colsLookup[n] ?? ''}` : undefined;
+
+  const gridCols = cn(
+    'grid',
+    gapClasses,
+    columns.base && colsLookup[columns.base],
+    prefixedCols('sm:', columns.sm),
+    prefixedCols('md:', columns.md),
+    prefixedCols('lg:', columns.lg),
+    prefixedCols('xl:', columns.xl),
+    prefixedCols('2xl:', columns['2xl']),
+  );
+
+  const skeletonBg = darkSurface ? 'bg-zinc-700/60' : 'bg-muted';
+
+  // Calculate aspect ratio for skeleton items
+  let aspectRatioPadding = '100%'; // Default to square (1:1)
+  
+  if (projectAspectRatio) {
+    const ratio = parseRatio(projectAspectRatio);
+    if (!isNaN(ratio)) {
+      const calculatedPadding = (1 / ratio) * 100; // height/width * 100
+      // Ensure reasonable aspect ratio bounds
+      const minPadding = 60; // Minimum 60% height (for very wide images)
+      const maxPadding = 200; // Maximum 200% height (for very tall images)
+      aspectRatioPadding = `${Math.min(Math.max(calculatedPadding, minPadding), maxPadding)}%`;
+    }
+  }
+
+  return (
+    <div className={cn('space-y-6 pb-8', className)}>
+      {showControls && (
+        <div className="mt-0 space-y-3">
+          {/* Pagination row - matches MediaGallery pagination section */}
+          <div className="flex justify-between items-center">
+            {/* Left side - Pagination controls skeleton */}
+            <div className="flex items-center gap-2">
+              <div className={cn('h-8 w-16 rounded animate-pulse', skeletonBg)} />
+              <div className={cn('h-4 w-40 rounded animate-pulse', skeletonBg)} />
+              <div className={cn('h-8 w-16 rounded animate-pulse', skeletonBg)} />
+            </div>
+
+            {/* Right side - Starred filter skeleton */}
+            <div className="flex items-center gap-x-2">
+              <div className={cn('h-4 w-4 rounded animate-pulse', skeletonBg)} />
+              <div className={cn('h-4 w-12 rounded animate-pulse', skeletonBg)} />
+            </div>
+          </div>
+
+          {/* Filters row - matches MediaGallery filters section */}
+          <div className="flex justify-between items-center flex-wrap gap-y-2">
+            {/* Left side - Filters skeleton */}
+            <div className="flex items-center gap-3">
+              {/* Shot Filter skeleton */}
+              <div className={cn('h-8 w-[140px] rounded animate-pulse', skeletonBg)} />
+              
+              {/* Search skeleton */}
+              <div className={cn('h-8 w-8 rounded animate-pulse', skeletonBg)} />
+            </div>
+            
+            {/* Right side - Media Type Filter skeleton */}
+            <div className="flex items-center gap-x-1.5">
+              <div className={cn('h-4 w-8 rounded animate-pulse', skeletonBg)} />
+              <div className={cn('h-8 w-[100px] rounded animate-pulse', skeletonBg)} />
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Gallery grid skeleton */}
+      <div
+        className={fixedColumns ? cn('grid', gapClasses) : gridCols}
+        style={fixedColumns ? { gridTemplateColumns: `repeat(${fixedColumns}, minmax(0, 1fr))` } : undefined}
+      >
+        {Array.from({ length: count }).map((_, idx) => (
+          <div
+            key={idx}
+            className={cn(
+              'animate-pulse rounded-lg relative',
+              skeletonBg
+            )}
+            style={{ paddingBottom: aspectRatioPadding }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export const SkeletonGallery = React.memo(SkeletonGalleryComponent);

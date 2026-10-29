@@ -1,0 +1,36 @@
+{
+  "files": {
+    "config/astrid-cli-surface/cli-surface.json": {
+      "from": "cli-surface.json",
+      "sha256": "sha256:0fd5a4564e4497aba7ab1218dd17596e1cbf15763e8afb73fdd216079d7993e7"
+    },
+    "config/astrid-public-boundary/README.md": {
+      "from": "schemas/public-boundary/README.md",
+      "sha256": "sha256:5569e1ab7b115ae280a2d62913e9e71b3d92e1ebb2cdf5124066c67d92ad96ab"
+    },
+    "config/astrid-public-boundary/bundle.json": {
+      "from": "schemas/public-boundary/bundle.json",
+      "sha256": "sha256:4113040c9f6375b67667b42056e8008e9f2457811682d7c60211634b6340ced7"
+    },
+    "config/astrid-public-boundary/diagnostic.schema.json": {
+      "from": "schemas/public-boundary/diagnostic.schema.json",
+      "sha256": "sha256:b6083b778888edfb39ae455f4ce6285831abcf0c3f8f1f8793275ea8a8a6261b"
+    },
+    "config/astrid-public-boundary/fixtures/command-effects.json": {
+      "from": "schemas/public-boundary/fixtures/command-effects.json",
+      "sha256": "sha256:c030169046f7085a3d14d34f5c312ab8ad20ebd1dd87c84fff1f14fac2f87dcd"
+    },
+    "config/astrid-public-boundary/fixtures/diagnostics.json": {
+      "from": "schemas/public-boundary/fixtures/diagnostics.json",
+      "sha256": "sha256:a8298f95aaa7ff85df2abb401dbd1b298fef2611b273c07322c44c2402e47763"
+    },
+    "config/astrid-public-boundary/fixtures/redaction.json": {
+      "from": "schemas/public-boundary/fixtures/redaction.json",
+      "sha256": "sha256:d827821a8b1c1bd9b50fa695550deeb770175e283b9949635d1c85ee03bece46"
+    }
+  },
+  "manifest": "artifacts.json",
+  "producer": "astrid-agent",
+  "producer_version": "sha256:703a53e6569e9aaf800758ff516d32db65a0d74ae3a357e882d12d6d7e605eb0",
+  "source_commit": "5dec5dc6a4eb6683cd8a9a7e7f2048fbb18d9681"
+}

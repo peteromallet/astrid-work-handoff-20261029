@@ -1,0 +1,255 @@
+import { useCallback, useMemo } from 'react';
+import type { Shot } from '@/domains/generation/types';
+import type { ActiveLora } from '@/domains/lora/types/lora';
+import { useProjectCrudContext, useProjectSelectionContext } from '@/shared/contexts/ProjectContext';
+import { usePanesStore } from '@/shared/state/panesStore';
+import { useShotNavigation } from '@/shared/hooks/shots/useShotNavigation';
+import { useShotSettings } from '../../hooks/settings/useShotSettings';
+import { coerceSelectedModel } from '@/tools/travel-between-images/settings';
+import { useShotImages } from '@/shared/hooks/shots/useShotImages';
+import { isPositioned, isVideoGeneration } from '@/shared/lib/typeGuards';
+import { findClosestAspectRatio } from '@/shared/lib/media/aspectRatios';
+import { useProjectGenerationModesCache } from '@/shared/hooks/projects/useProjectGenerationModesCache';
+import {
+  DEFAULT_STRUCTURE_GUIDANCE_CONTROLS,
+  DEFAULT_STRUCTURE_VIDEO,
+  resolveTravelStructureState,
+} from '@/shared/lib/tasks/travelBetweenImages';
+import type {
+  StructureGuidanceConfig,
+  TravelGuidance,
+} from '@/shared/lib/tasks/travelBetweenImages/taskTypes';
+import type { TravelGuidanceMode } from '@/shared/lib/tasks/travelGuidance';
+import {
+  BUILTIN_DEFAULT_I2V_ID,
+  BUILTIN_DEFAULT_VACE_ID,
+} from '../MotionControl.constants';
+import { useVideoUiSettings } from './useVideoUiSettings';
+
+const knownPresetIds = [
+  BUILTIN_DEFAULT_I2V_ID,
+  BUILTIN_DEFAULT_VACE_ID,
+];
+
+function resolveGuidanceKind(
+  guidance?: TravelGuidance | StructureGuidanceConfig,
+): TravelGuidanceMode | undefined {
+  if (guidance && 'target' in guidance) {
+    if (guidance.target === 'uni3c') {
+      return 'uni3c';
+    }
+    return guidance.preprocessing === 'none' ? 'raw' : guidance.preprocessing;
+  }
+
+  const travelGuidance = guidance;
+  if (!travelGuidance || travelGuidance.kind === 'none') {
+    return undefined;
+  }
+
+  if (travelGuidance.kind === 'uni3c') {
+    return 'uni3c';
+  }
+
+  return travelGuidance.mode;
+}
+
+function resolveEffectiveAspectRatio(
+  projectAspectRatio: string,
+  positionedImages: Array<{ metadata?: Record<string, unknown> | null }>,
+): string {
+  if (positionedImages.length === 0) {
+    return projectAspectRatio;
+  }
+
+  const firstImage = positionedImages[0];
+  const metadata = firstImage.metadata || {};
+  const width = typeof metadata.width === 'number' ? metadata.width : null;
+  const height = typeof metadata.height === 'number' ? metadata.height : null;
+  if (!width || !height) {
+    return projectAspectRatio;
+  }
+
+  return findClosestAspectRatio(width / height);
+}
+
+function mapSelectedLorasToActiveLoras(
+  settingsLoras: Array<{
+    id: string;
+    name: string;
+    path: string;
+    strength: number;
+    previewImageUrl?: string;
+    trigger_word?: string;
+  }> | undefined,
+): ActiveLora[] {
+  return (settingsLoras || []).map((lora) => ({
+    id: lora.id,
+    name: lora.name,
+    path: lora.path,
+    strength: lora.strength,
+    previewImageUrl: lora.previewImageUrl,
+    trigger_word: lora.trigger_word,
+  }));
+}
+
+// --- Extracted hooks: only where there's a genuine independent boundary ---
+
+/** Handlers for the LoRAs already selected in the shot settings. */
+function useVideoGenerationLoras(
+  settings: ReturnType<typeof useShotSettings>['settings'],
+  updateField: ReturnType<typeof useShotSettings>['updateField'],
+) {
+  const handleRemoveLora = useCallback(
+    (loraId: string) => {
+      updateField(
+        'loras',
+        (settings.loras || []).filter((lora) => lora.id !== loraId),
+      );
+    },
+    [settings.loras, updateField],
+  );
+
+  const handleLoraStrengthChange = useCallback(
+    (loraId: string, strength: number) => {
+      updateField(
+        'loras',
+        (settings.loras || []).map((lora) =>
+          lora.id === loraId ? { ...lora, strength } : lora,
+        ),
+      );
+    },
+    [settings.loras, updateField],
+  );
+
+  const handleAddTriggerWord = useCallback(
+    (word: string) => {
+      const currentPrompt = settings.prompt || '';
+      if (!currentPrompt.includes(word)) {
+        const newPrompt = currentPrompt ? `${currentPrompt}, ${word}` : word;
+        updateField('prompt', newPrompt);
+      }
+    },
+    [settings.prompt, updateField],
+  );
+
+  return {
+    handleRemoveLora,
+    handleLoraStrengthChange,
+    handleAddTriggerWord,
+  };
+}
+
+// --- Main controller ---
+
+export function useVideoGenerationModalController({ isOpen, onClose, shot }: {
+  isOpen: boolean;
+  onClose: () => void;
+  shot: Shot;
+}) {
+  const { selectedProjectId } = useProjectSelectionContext();
+  const { projects } = useProjectCrudContext();
+  const { navigateToShot } = useShotNavigation();
+  const isShotsPaneLocked = usePanesStore((state) => state.isShotsPaneLocked);
+  const setIsShotsPaneLocked = usePanesStore((state) => state.setIsShotsPaneLocked);
+  const { updateShotMode } = useProjectGenerationModesCache(selectedProjectId ?? '');
+
+  // Data
+  const uiSettings = useVideoUiSettings(isOpen, shot.id);
+
+  const { settings, status, updateField } = useShotSettings(
+    isOpen ? shot.id : null,
+    selectedProjectId,
+  );
+
+  const { data: shotGenerations, isLoading: generationsLoading } = useShotImages(
+    isOpen ? shot.id : null,
+  );
+
+  const positionedImages = useMemo(() => {
+    if (!shotGenerations) return [];
+    return shotGenerations
+      .filter((gen) => !isVideoGeneration(gen) && isPositioned(gen))
+      .sort((a, b) => (a.timeline_frame ?? 0) - (b.timeline_frame ?? 0));
+  }, [shotGenerations]);
+
+  const currentProject = projects.find((p) => p.id === selectedProjectId);
+  const projectAspectRatio = currentProject?.aspectRatio || '16:9';
+
+  const effectiveAspectRatio = useMemo(
+    () => resolveEffectiveAspectRatio(projectAspectRatio, positionedImages),
+    [positionedImages, projectAspectRatio],
+  );
+
+  const selectedLoras = useMemo(
+    () => mapSelectedLorasToActiveLoras(settings.loras),
+    [settings.loras],
+  );
+  const structureState = useMemo(
+    () => resolveTravelStructureState(settings, {
+      defaultEndFrame: settings.batchVideoFrames || 61,
+      defaultVideoTreatment: DEFAULT_STRUCTURE_VIDEO.treatment,
+      defaultMotionStrength: DEFAULT_STRUCTURE_GUIDANCE_CONTROLS.motionStrength,
+      defaultStructureType: DEFAULT_STRUCTURE_GUIDANCE_CONTROLS.structureType,
+      defaultUni3cEndPercent: DEFAULT_STRUCTURE_GUIDANCE_CONTROLS.uni3cEndPercent,
+    }),
+    [settings],
+  );
+  const hasStructureVideo = structureState.structureVideos.length > 0;
+  const guidanceKind = useMemo(
+    () => resolveGuidanceKind(structureState.structureGuidance),
+    [structureState.structureGuidance],
+  );
+
+  const validPresetId = useMemo(() => {
+    const presetId = settings.selectedPhasePresetId;
+    if (!presetId) return undefined;
+    return knownPresetIds.includes(presetId) ? presetId : undefined;
+  }, [settings.selectedPhasePresetId]);
+
+  const isLoading =
+    (status !== 'ready' && status !== 'saving' && status !== 'error') || generationsLoading;
+
+  // LoRA management (extracted)
+  const loras = useVideoGenerationLoras(settings, updateField);
+
+  // Navigation callbacks
+  const handleNavigateToShot = useCallback(() => {
+    if (isShotsPaneLocked) {
+      setIsShotsPaneLocked(false);
+    }
+    onClose();
+    navigateToShot(shot);
+  }, [isShotsPaneLocked, setIsShotsPaneLocked, navigateToShot, onClose, shot]);
+
+  const handleDialogOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open) {
+        onClose();
+      }
+    },
+    [onClose],
+  );
+
+  return {
+    projects,
+    selectedProjectId,
+    settings,
+    status,
+    updateField,
+    positionedImages,
+    isLoading,
+    isDisabled: isLoading || positionedImages.length < 1,
+    hasStructureVideo,
+    guidanceKind,
+    structureState,
+    ...uiSettings,
+    validPresetId,
+    selectedLoras,
+    ...loras,
+    effectiveAspectRatio,
+    shotGenerations: shotGenerations || [],
+    handleNavigateToShot,
+    handleDialogOpenChange,
+    updateShotMode,
+  };
+}

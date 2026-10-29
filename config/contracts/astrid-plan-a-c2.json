@@ -1,0 +1,280 @@
+{
+  "schemaVersion": 2,
+  "kind": "astrid-contract-diagnostic-projection",
+  "revision": "C2",
+  "issuedOn": "2026-09-24",
+  "status": "frozen-local-contract",
+  "digest": "sha256:396d117206670e7ed9cf44582317a5a9396761793024e74f55823e448e77ffb3",
+  "predecessor": {
+    "path": "config/contracts/astrid-plan-a-c1.json",
+    "revision": "C1",
+    "canonicalDigest": "sha256:e74a88b718861d100e64c1212f1caa7f36ded5d280e44f5cb6d9a424412a8559",
+    "rawFileSha256": "4cf8b1b5cd8c2563b72d48aed2fd1f0adcb4adf8df207c610e78f2e96cf26873",
+    "immutable": true
+  },
+  "authority": {
+    "contractOwner": "CF",
+    "runtimeWire": "workspace.v1",
+    "runtimeWireOwner": "astrid-runtime",
+    "publicProjectionOwner": "astrid-agent",
+    "appConsumerOwner": "astrid-app",
+    "rules": [
+      "C2 is a projection contract and never a Runtime wire schema, task store, binding store, queue, or supervisor.",
+      "Runtime remains sole workspace, admission, attempt, fence, event, cancellation, retry, and settlement authority.",
+      "Astrid projects observed Runtime and local lifecycle facts; it must not infer missing facts or mint Runtime truth.",
+      "Generated clients derive only from the reconciled Runtime contract and generator; C2 does not generate a competing client."
+    ]
+  },
+  "diagnostic": {
+    "schemaPath": "config/contracts/astrid-plan-a-diagnostic-c2.schema.json",
+    "schemaSha256": "0aa8f9b9329935641d977d3af5f5304d315e9065527f4c97654340ae44a70809",
+    "totalObservationDeadlineMs": 5000,
+    "deadlineScope": "total-including-all-helpers",
+    "collectionEffects": [
+      "observe"
+    ],
+    "limits": {
+      "maxEvents": 200,
+      "maxLogBytes": 65536,
+      "maxBundleBytes": 1048576
+    },
+    "healthySemantics": {
+      "problemCode": null,
+      "failureBoundary": null,
+      "rule": "A checked scope with no observed problem has both values null. Null/non-null or non-null/null is invalid."
+    },
+    "failureSemantics": {
+      "paired": true,
+      "rule": "An observed problem has both a normalized problemCode and the boundary at which it was observed."
+    },
+    "unknownSemantics": {
+      "rule": "Every independent fact that was not observed is recorded as observed=false, value=null, observedAt=null, with a non-empty unavailableReason. Healthy observed facts do not make independent facts ready.",
+      "independentFacts": [
+        "workspace",
+        "runtime",
+        "computeWorker",
+        "selectedCapability",
+        "authorization",
+        "taskState",
+        "contact",
+        "progress",
+        "terminalResult",
+        "providerExecution",
+        "providerBilling",
+        "optionalContributionAuth",
+        "hostedSessionAndGrants"
+      ]
+    },
+    "problemCodes": [
+      "workspace_missing",
+      "workspace_ambiguous",
+      "workspace_identity_mismatch",
+      "workspace_configured_runtime_not_ready",
+      "runtime_unavailable",
+      "runtime_identity_mismatch",
+      "permission_limited",
+      "active_work_requires_authorization",
+      "capability_unavailable",
+      "authorization_required",
+      "provider_state_unknown",
+      "observation_stale",
+      "observation_timeout",
+      "hosted_session_required",
+      "contributor_link_unavailable"
+    ],
+    "failureBoundaries": [
+      "workspace-selection",
+      "runtime-process-identity",
+      "runtime-contact",
+      "runtime-permission",
+      "runtime-schema",
+      "compute-readiness",
+      "execution-authorization",
+      "task-admission",
+      "attempt-execution",
+      "provider-observation",
+      "diagnostic-observation"
+    ],
+    "modes": {
+      "local": {
+        "redacted": false,
+        "pathPolicy": "Useful absolute paths may be present only in local inspection."
+      },
+      "shared": {
+        "redacted": true,
+        "pathPolicy": "Private absolute paths, credentials, tokens, prompts, environment values, signed URL material, and media content are absent or replaced by inert redaction markers."
+      }
+    },
+    "actionRules": {
+      "actionsExecutedMustBeEmpty": true,
+      "collectionMayStart": false,
+      "collectionMayRepair": false,
+      "collectionMayUpload": false,
+      "collectionMaySpend": false,
+      "effectfulSuggestionsRequireAuthorization": true,
+      "redactedPlaceholderExecutable": false,
+      "commandEffectsSource": "config/contracts/astrid-plan-a-c1.json#commands",
+      "exactCommandEffectsRequired": true,
+      "allowedEffects": [
+        "observe",
+        "configure-install",
+        "start-stop-local-service",
+        "interrupt-work",
+        "may-spend-money",
+        "write-relocate-change-data",
+        "share-diagnostics"
+      ]
+    }
+  },
+  "sourceApplicability": [
+    {
+      "repository": "astrid-app",
+      "head": "a062e825ed3b335a6eb4175c0bf2a020e036120c",
+      "path": "config/contracts/astrid-plan-a-c1.json",
+      "sha256": "4cf8b1b5cd8c2563b72d48aed2fd1f0adcb4adf8df207c610e78f2e96cf26873",
+      "role": "immutable-predecessor",
+      "status": "applicable"
+    },
+    {
+      "repository": "astrid-app",
+      "head": "a062e825ed3b335a6eb4175c0bf2a020e036120c",
+      "path": "scripts/quality/check-astrid-contract-freeze.mjs",
+      "sha256": "e0bb65543bcd1f42de0c18dd63089d374ec9394b670b74cfaffd299bd7f5ffbd",
+      "role": "C1-validator-and-C2-gap-source",
+      "status": "applicable-with-C2-successor"
+    },
+    {
+      "repository": "astrid-agent",
+      "head": "6c989a8602a189a3b080d05dcc0d18fecf138fcd",
+      "path": "astrid/core/gateway/dispatch.py",
+      "sha256": "3ce0eb8fbc14712c5402493ebe8aa7998f2f4e64d33defa54bc7703b34074f11",
+      "role": "public-doctor-consumer",
+      "status": "downstream-I-07-I-08-conformance-required"
+    },
+    {
+      "repository": "astrid-agent",
+      "head": "6c989a8602a189a3b080d05dcc0d18fecf138fcd",
+      "path": "astrid/sdk/workspace_client.py",
+      "sha256": "d088d220ec239f545bba5403321093b74e840f6cfe873779f53fcbb429e08a08",
+      "role": "Runtime-client-consumer",
+      "status": "applicable-runtime-authority-preserved"
+    },
+    {
+      "repository": "astrid-runtime",
+      "head": "3b21334366fa8124f1a7b0d371cc4295821616f5",
+      "path": "contract/schemas/doctor.json",
+      "sha256": "d0caac9e7bf6a81d68abb52e757b321f7a45d4f2afff43bd4880089ea8dcc243",
+      "role": "Runtime-doctor-wire",
+      "status": "input-only-not-replaced-by-C2"
+    },
+    {
+      "repository": "astrid-runtime",
+      "head": "3b21334366fa8124f1a7b0d371cc4295821616f5",
+      "path": "runtime_protocol/service.py",
+      "sha256": "f1f611e4f9ad424e2104249ce7fd6d5c7ff932f41677a1a1b1b914f0b47a6897",
+      "role": "Runtime-execution-authority",
+      "status": "held-primary-overlay-pending-I-04-I-05"
+    }
+  ],
+  "generatedClientCompatibility": {
+    "runtimeSchemaDigest": "sha256:ec06fbc6567fe28065d22626b040cad81bb2e5318623586ae9187c713794f6b9",
+    "authorityStatus": "held-primary-overlay-pending-I-04-I-05",
+    "clients": [
+      {
+        "repository": "astrid-runtime",
+        "language": "python",
+        "generatedPath": "packages/python/astrid_runtime_client/generated.py",
+        "generatedSha256": "e1bb3018128ea51355324a230b83be921c550a01586959274baf2c0e2b5955a3",
+        "metadataPath": "packages/python/astrid_runtime_client/contract_metadata.py",
+        "metadataSha256": "3b141ab4bebd723a0721b3ae56fabd9cafed658c2245066f2c072ce4cae87663",
+        "status": "canonical-candidate-input"
+      },
+      {
+        "repository": "astrid-runtime",
+        "language": "typescript",
+        "generatedPath": "packages/typescript/src/generated.ts",
+        "generatedSha256": "82f1b330a257a8414f49f852a8604ed2692ee70c3482a9a45ff51df18bd77325",
+        "metadataPath": "packages/typescript/src/contract-metadata.ts",
+        "metadataSha256": "bf852360f57c15e41a06037d5e78191128d98b5d4909882e06c0e9d40a3479c8",
+        "status": "canonical-candidate-input"
+      },
+      {
+        "repository": "astrid-agent",
+        "language": "python-vendored",
+        "generatedPath": "astrid_runtime_client/generated.py",
+        "generatedSha256": "e1bb3018128ea51355324a230b83be921c550a01586959274baf2c0e2b5955a3",
+        "metadataPath": "astrid_runtime_client/contract_metadata.py",
+        "metadataSha256": "3b141ab4bebd723a0721b3ae56fabd9cafed658c2245066f2c072ce4cae87663",
+        "status": "generated-byte-parity-metadata-adds-provenance-only"
+      }
+    ],
+    "nonClientConsumers": [
+      {
+        "repository": "astrid-app",
+        "status": "typed-task-route-adapter-is-lane-input-not-generated-authority"
+      }
+    ]
+  },
+  "acknowledgements": [
+    {
+      "id": "SL-C2-input-ack",
+      "consumer": "SL",
+      "status": "pending-exact-consumer-ack",
+      "evidencePath": "evidence/I-03-contract-freeze/acks/sl-input-ack.json",
+      "limitations": "Draft applicability record only; coordinator must obtain exact consumer ACK after oracle ruling and final C2 digest."
+    },
+    {
+      "id": "EW-C2-input-ack",
+      "consumer": "EW",
+      "status": "pending-exact-consumer-ack",
+      "evidencePath": "evidence/I-03-contract-freeze/acks/ew-input-ack.json",
+      "limitations": "Draft applicability record only; coordinator must obtain exact consumer ACK after oracle ruling and final C2 digest."
+    }
+  ],
+  "fixtures": {
+    "positive": [
+      "tests/fixtures/astrid-plan-a/c2/healthy.json",
+      "tests/fixtures/astrid-plan-a/c2/runtime-unavailable.json",
+      "tests/fixtures/astrid-plan-a/c2/unknown-independent-facts.json"
+    ],
+    "negative": [
+      "tests/fixtures/astrid-plan-a/c2/negative/unpaired-healthy.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/deadline-exceeded.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/unobserved-with-value.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/shared-secret.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/action-executed.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/redacted-placeholder-executable.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/unknown-top-level-field.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/unknown-nested-field.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/malformed-fact-value.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/unknown-command.json",
+      "tests/fixtures/astrid-plan-a/c2/negative/command-effect-mismatch.json"
+    ]
+  },
+  "gates": {
+    "C03Contract": "validator-and-fixture-gate-only",
+    "C03Diagnostic": "not-claimed-until-I-07-I-08-actual-public-output-evidence",
+    "installedAcceptance": false,
+    "hostedAcceptance": false,
+    "liveProviderAcceptance": false
+  },
+  "unresolvedAuthority": [
+    {
+      "id": "runtime-primary-overlay",
+      "decisionMemo": "evidence/I-03-contract-freeze/astra-decision-memo.md",
+      "status": "waiting-for-Astra",
+      "blockedWork": [
+        "I-04-runtime-lifecycle-migration-final-authority",
+        "I-05-runtime-execution-generated-client-final-authority"
+      ]
+    },
+    {
+      "id": "held-top-level-h3-workflow-group",
+      "decisionMemo": "evidence/I-03-contract-freeze/astra-decision-memo.md",
+      "status": "waiting-for-Astra-or-I-10-owner-intent",
+      "blockedWork": [
+        "staging-or-publication-of-held-workflow-bytes"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,201 @@
+import React, { useState } from 'react';
+import { Play, ImageIcon, ExternalLink, FolderOpen } from 'lucide-react';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/shared/components/ui/tooltip';
+import { cn } from '@/shared/components/ui/contracts/cn';
+import { Task } from '@/types/tasks';
+import { GenerationRow } from '@/domains/generation/types';
+
+// Orchestrator task types don't have their own video output - they spawn subtasks
+const ORCHESTRATOR_TASK_TYPES = [
+  'travel_orchestrator',
+  'wan_2_2_i2v', // This is also an orchestrator that spawns individual segments
+] as const;
+
+/** Event type for action handlers - supports both mouse and touch events */
+type ActionEvent = React.MouseEvent | React.TouchEvent;
+
+interface TaskItemActionsProps {
+  task: Task;
+  isMobile: boolean;
+  // Task type info
+  isCompletedVideoTask: boolean;
+  isImageTask: boolean;
+  // Data availability
+  generationData: GenerationRow | null;
+  // Loading states
+  isLoadingVideoGen: boolean;
+  waitingForVideoToOpen: boolean;
+  // Handlers - accept both mouse and touch events for mobile support
+  onViewVideo: (e: ActionEvent) => void;
+  onViewImage: (e: ActionEvent) => void;
+  onVisitShot: (e: ActionEvent) => void;
+  // Project indicator
+  showProjectIndicator?: boolean;
+  projectName?: string;
+  selectedProjectId?: string;
+  onSwitchProject?: (projectId: string) => void;
+  // Shot ID for visit shot button
+  shotId: string | null;
+}
+
+export const TaskItemActions: React.FC<TaskItemActionsProps> = ({
+  task,
+  isMobile,
+  isCompletedVideoTask,
+  isImageTask,
+  generationData,
+  isLoadingVideoGen,
+  waitingForVideoToOpen,
+  onViewVideo,
+  onViewImage,
+  onVisitShot,
+  showProjectIndicator = false,
+  projectName,
+  selectedProjectId,
+  onSwitchProject,
+  shotId,
+}) => {
+  const [idCopied, setIdCopied] = useState(false);
+
+  return (
+    <div className="flex items-center flex-shrink-0 ml-auto gap-0">
+      {/* ID copy button - always visible */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              navigator.clipboard.writeText(task.id);
+              setIdCopied(true);
+              setTimeout(() => setIdCopied(false), 2000);
+            }}
+            className={cn(
+              "text-xs rounded transition-colors",
+              isMobile ? "px-1.5 py-0.5" : "px-1 py-0.5",
+              idCopied
+                ? "text-green-400"
+                : "text-muted-foreground hover:text-foreground hover:bg-accent"
+            )}
+          >
+            {idCopied ? 'copied' : 'id'}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          {idCopied ? 'Copied!' : 'Copy task ID'}
+        </TooltipContent>
+      </Tooltip>
+      
+      {/* Project indicator - shown in "All Projects" mode (except current project) */}
+      {showProjectIndicator && projectName && task.projectId !== selectedProjectId && onSwitchProject && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                onSwitchProject(task.projectId);
+              }}
+              onTouchEnd={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onSwitchProject(task.projectId);
+              }}
+              className={cn(
+                "rounded transition-colors text-muted-foreground hover:text-foreground hover:bg-accent",
+                isMobile ? "p-1" : "p-0.5"
+              )}
+              title={`Go to project: ${projectName}`}
+            >
+              <FolderOpen className={cn(isMobile ? "w-3 h-3" : "w-2.5 h-2.5")} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs">
+            <span className="">{projectName}</span>
+          </TooltipContent>
+        </Tooltip>
+      )}
+      
+      {/* Open Video button - hidden for orchestrator tasks that don't have their own video */}
+      {isCompletedVideoTask && !(ORCHESTRATOR_TASK_TYPES as readonly string[]).includes(task.taskType) && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              onClick={onViewVideo}
+              onTouchEnd={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!(isLoadingVideoGen && waitingForVideoToOpen)) {
+                  onViewVideo(e);
+                }
+              }}
+              className={cn(
+                "rounded transition-colors text-muted-foreground hover:text-foreground hover:bg-accent",
+                isMobile ? "p-1" : "p-0.5"
+              )}
+              disabled={isLoadingVideoGen && waitingForVideoToOpen}
+            >
+              <Play className={cn(isMobile ? "w-3 h-3" : "w-2.5 h-2.5", isLoadingVideoGen && waitingForVideoToOpen && "animate-pulse")} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs">
+            {isLoadingVideoGen && waitingForVideoToOpen ? 'Loading...' : 'Open Video'}
+          </TooltipContent>
+        </Tooltip>
+      )}
+
+      {/* Open Image button */}
+      {isImageTask && generationData && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              onClick={onViewImage}
+              onTouchEnd={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onViewImage(e);
+              }}
+              className={cn(
+                "rounded transition-colors text-muted-foreground hover:text-foreground hover:bg-accent",
+                isMobile ? "p-1" : "p-0.5"
+              )}
+            >
+              <ImageIcon className={isMobile ? "w-3 h-3" : "w-2.5 h-2.5"} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs">
+            Open Image
+          </TooltipContent>
+        </Tooltip>
+      )}
+
+      {/* Visit Shot button */}
+      {shotId && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              onClick={onVisitShot}
+              onTouchEnd={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onVisitShot(e);
+              }}
+              className={cn(
+                "rounded transition-colors text-muted-foreground hover:text-foreground hover:bg-accent",
+                isMobile ? "p-1" : "p-0.5"
+              )}
+            >
+              <ExternalLink className={isMobile ? "w-3 h-3" : "w-2.5 h-2.5"} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs">
+            Visit Shot
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </div>
+  );
+};

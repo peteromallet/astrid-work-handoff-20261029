@@ -1,0 +1,444 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { renderHook, act } from '@testing-library/react';
+
+vi.mock('@/shared/hooks/mobile', () => ({
+  useIsMobile: vi.fn(() => false),
+  useIsTablet: vi.fn(() => false),
+}));
+
+vi.mock('react-router-dom', () => ({
+  useLocation: vi.fn(() => ({ pathname: '/travel' })),
+}));
+
+vi.mock('@/shared/config/panes', () => ({
+  PANE_CONFIG: {
+    timing: { HOVER_DELAY: 300, ANIMATION_DURATION: 300 },
+  },
+}));
+
+vi.mock('@/shared/lib/typedEvents', () => ({
+  dispatchAppEvent: vi.fn(),
+  useAppEventListener: vi.fn(),
+}));
+
+import { useSlidingPane } from '../useSlidingPane';
+import { useIsMobile, useIsTablet } from '@/shared/hooks/mobile';
+import { acquirePaneControlsHost } from '@/shared/state/paneControlsHost';
+
+describe('useSlidingPane', () => {
+  const mockToggleLock = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('keeps a peek open moving from rail to pane, then closes after leaving both', () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useSlidingPane({ side: 'right', isLocked: false, onToggleLock: mockToggleLock }));
+    act(() => result.current.openPane());
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(100));
+    act(() => result.current.handlePaneEnter());
+    act(() => vi.advanceTimersByTime(1000));
+    expect(result.current.isOpen).toBe(true);
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(300));
+    expect(result.current.isOpen).toBe(false);
+    expect(mockToggleLock).not.toHaveBeenCalled();
+  });
+
+  it('does not drop a leave during the opening animation', () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useSlidingPane({ side: 'right', isLocked: false, onToggleLock: mockToggleLock }));
+    act(() => result.current.openPane());
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(600));
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it('keeps a peek open while an overlay owns it, then closes after the viewer is closed', () => {
+    vi.useFakeTimers();
+    const { result, rerender } = renderHook(
+      ({ overlayOpen }: { overlayOpen: boolean }) => useSlidingPane({
+        side: 'bottom',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+        overlayOpen,
+      }),
+      { initialProps: { overlayOpen: true } },
+    );
+
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(1000));
+    expect(result.current.isOpen).toBe(true);
+
+    rerender({ overlayOpen: false });
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(300));
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it('cancels a pending leave when a viewer opens and restores normal leave behavior when it closes', () => {
+    vi.useFakeTimers();
+    const { result, rerender } = renderHook(
+      ({ overlayOpen }: { overlayOpen: boolean }) => useSlidingPane({
+        side: 'bottom',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+        overlayOpen,
+      }),
+      { initialProps: { overlayOpen: false } },
+    );
+
+    act(() => result.current.openPane());
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(100));
+    rerender({ overlayOpen: true });
+    act(() => vi.advanceTimersByTime(1000));
+    expect(result.current.isOpen).toBe(true);
+
+    rerender({ overlayOpen: false });
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(300));
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it('returns expected shape', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(typeof result.current.isOpen).toBe('boolean');
+    expect(typeof result.current.isLocked).toBe('boolean');
+    expect(typeof result.current.toggleLock).toBe('function');
+    expect(typeof result.current.openPane).toBe('function');
+    expect(typeof result.current.handlePaneEnter).toBe('function');
+    expect(typeof result.current.handlePaneLeave).toBe('function');
+    expect(typeof result.current.transformClass).toBe('string');
+    expect(result.current.paneProps).toBeDefined();
+    expect(typeof result.current.showBackdrop).toBe('boolean');
+    expect(typeof result.current.closePane).toBe('function');
+  });
+
+  it('starts closed when not locked', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it('starts open when locked', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: true,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(result.current.isOpen).toBe(true);
+  });
+
+  it('openPane opens the pane', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'right',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    act(() => {
+      result.current.openPane();
+    });
+
+    expect(result.current.isOpen).toBe(true);
+  });
+
+  it('closePane closes the pane', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'right',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    act(() => {
+      result.current.openPane();
+    });
+
+    expect(result.current.isOpen).toBe(true);
+
+    act(() => {
+      result.current.closePane();
+    });
+
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it('toggleLock calls onToggleLock', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    act(() => {
+      result.current.toggleLock();
+    });
+
+    expect(mockToggleLock).toHaveBeenCalled();
+  });
+
+  it('toggleLock with force=true calls toggle when state differs', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    act(() => {
+      result.current.toggleLock(true);
+    });
+
+    expect(mockToggleLock).toHaveBeenCalled();
+  });
+
+  it('toggleLock with force matching current state does not call toggle', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    act(() => {
+      result.current.toggleLock(false);
+    });
+
+    expect(mockToggleLock).not.toHaveBeenCalled();
+  });
+
+  it('returns correct transform class for left pane (hidden)', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(result.current.transformClass).toBe('-translate-x-full');
+  });
+
+  it('returns correct transform class for left pane (visible)', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: true,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(result.current.transformClass).toBe('translate-x-0');
+  });
+
+  it('returns correct transform class for right pane (hidden)', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'right',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(result.current.transformClass).toBe('translate-x-full');
+  });
+
+  it('returns correct transform class for bottom pane (hidden)', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'bottom',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    expect(result.current.transformClass).toBe('translate-y-full');
+  });
+
+  it('programmaticOpen opens the pane', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+        programmaticOpen: true,
+      })
+    );
+
+    expect(result.current.isOpen).toBe(true);
+  });
+
+  it('keeps an unpinned pane open while its floating overlay is open, then releases it', () => {
+    vi.useFakeTimers();
+    const { result, rerender } = renderHook(
+      ({ overlayOpen }: { overlayOpen: boolean }) => useSlidingPane({
+        side: 'right',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+        overlayOpen,
+      }),
+      { initialProps: { overlayOpen: true } },
+    );
+
+    act(() => result.current.handlePaneLeave());
+    act(() => vi.advanceTimersByTime(300));
+    expect(result.current.isOpen).toBe(true);
+
+    rerender({ overlayOpen: false });
+    expect(result.current.isOpen).toBe(false);
+    expect(result.current.isLocked).toBe(false);
+  });
+
+  it('does not show backdrop on desktop', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    act(() => {
+      result.current.openPane();
+    });
+
+    expect(result.current.showBackdrop).toBe(false);
+  });
+
+  it('gives a tablet transient panes while the page hosts the pane entry points', () => {
+    vi.useFakeTimers();
+    vi.mocked(useIsMobile).mockReturnValue(true);
+    vi.mocked(useIsTablet).mockReturnValue(true);
+    const release = acquirePaneControlsHost();
+    try {
+      const { result } = renderHook(() => useSlidingPane({ side: 'right', isLocked: false, onToggleLock: mockToggleLock }));
+      act(() => result.current.openPane());
+      // A backdrop takes the tap outside; a pointer leaving does not close it.
+      expect(result.current.showBackdrop).toBe(true);
+      act(() => result.current.handlePaneLeave());
+      act(() => vi.advanceTimersByTime(1000));
+      expect(result.current.isOpen).toBe(true);
+      act(() => result.current.closePane());
+      expect(result.current.isOpen).toBe(false);
+    } finally {
+      release();
+      vi.mocked(useIsMobile).mockReturnValue(false);
+      vi.mocked(useIsTablet).mockReturnValue(false);
+    }
+  });
+
+  it('calls onOpenChange when state changes', () => {
+    const onOpenChange = vi.fn();
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+        onOpenChange,
+      })
+    );
+
+    act(() => {
+      result.current.openPane();
+    });
+
+    expect(onOpenChange).toHaveBeenCalledWith(true);
+  });
+
+  it('hover-open survives unrelated re-renders', () => {
+    const isLocked = false;
+    const { result, rerender } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    // Hover open
+    act(() => {
+      result.current.openPane();
+    });
+    expect(result.current.isOpen).toBe(true);
+
+    // Re-render with same props (simulates unrelated parent re-render)
+    rerender();
+    expect(result.current.isOpen).toBe(true);
+  });
+
+  it('locking clears hover state so unlocking closes pane', () => {
+    let isLocked = false;
+    const { result, rerender } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked,
+        onToggleLock: mockToggleLock,
+      })
+    );
+
+    // Hover open
+    act(() => {
+      result.current.openPane();
+    });
+    expect(result.current.isOpen).toBe(true);
+
+    // Lock — pane stays open via isLocked, hover state gets cleared
+    isLocked = true;
+    rerender();
+    expect(result.current.isOpen).toBe(true);
+
+    // Unlock — pane closes because hover was cleared when locked
+    isLocked = false;
+    rerender();
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it('programmatic open keeps pane open even after hover-leave', () => {
+    const { result } = renderHook(() =>
+      useSlidingPane({
+        side: 'left',
+        isLocked: false,
+        onToggleLock: mockToggleLock,
+        programmaticOpen: true,
+      })
+    );
+
+    expect(result.current.isOpen).toBe(true);
+
+    // Attempt to close via closePane (simulates hover leave)
+    act(() => {
+      result.current.closePane();
+    });
+
+    // Should stay open because programmaticOpen is true
+    expect(result.current.isOpen).toBe(true);
+  });
+});

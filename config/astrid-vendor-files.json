@@ -1,0 +1,152 @@
+{
+  "schema": "astrid-vendor-files/v1",
+  "comment": "Declared file set copied from an Astrid commit into vendor/astrid-browser by scripts/astrid-landing/refresh-vendor.mjs. Paths are Astrid-repo-relative and are kept as-is under the destination.",
+  "license": "LICENSE",
+  "directories": [
+    {
+      "path": "astrid/packs/local/rendering/elements",
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".yaml"
+      ]
+    },
+    {
+      "path": "astrid/packs/local/shared",
+      "extensions": [
+        ".ts",
+        ".tsx"
+      ]
+    },
+    {
+      "path": "astrid/packs/astrid_motion/rendering/elements",
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".yaml"
+      ]
+    },
+    {
+      "path": "astrid/packs/rendering/rendering/elements",
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".yaml"
+      ]
+    },
+    {
+      "path": "astrid/packs/rendering/shared",
+      "extensions": [
+        ".ts",
+        ".tsx"
+      ]
+    },
+    {
+      "path": "astrid/packs/rendering/editor",
+      "extensions": [
+        ".ts",
+        ".tsx"
+      ]
+    },
+    {
+      "path": "astrid/packs/rendering/ui",
+      "extensions": [
+        ".ts",
+        ".tsx"
+      ]
+    }
+  ],
+  "files": [
+    "astrid/packs/rendering/elements/catalog.ts",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-0.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-1.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-2.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-3.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-4.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-5.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-0-canonical-mink.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-4-canonical-mink.png",
+    "astrid/packs/local/rendering/elements/effects/end-spanning-layer/assets/card-5-canonical-mink.png",
+    "astrid/packs/local/rendering/elements/effects/frame-overlay/assets/frame.png",
+    "remotion/src/fonts.ts",
+    "remotion/public/fonts/DepartureMono-Regular.woff2",
+    "remotion/public/fonts/Gelasio-Regular.woff2",
+    "remotion/public/fonts/Gelasio-Italic.woff2",
+    "remotion/public/fonts/Gelasio-Bold.woff2",
+    "remotion/public/fonts/Gelasio-BoldItalic.woff2",
+    "remotion/public/fonts/Inter-Regular.woff2",
+    "remotion/public/fonts/Inter-Bold.woff2",
+    "remotion/public/fonts/JetBrainsMono-Regular.woff2",
+    "remotion/public/fonts/JetBrainsMono-Bold.woff2",
+    "remotion/public/fonts/Sixtyfour.woff2",
+    "remotion/public/fonts/OFL-1.1.txt",
+    "remotion/public/fonts/FONT_PROVENANCE.md"
+  ],
+  "tool_catalog": "astrid/tools/catalog.json",
+  "public_catalog": {
+    "output": "astrid/packs/rendering/elements/public-catalog.ts",
+    "source": "astrid/packs/rendering/elements/catalog.ts",
+    "selections": [
+      {
+        "packId": "rendering",
+        "kind": "animation",
+        "id": "fade"
+      },
+      {
+        "packId": "rendering",
+        "kind": "animation",
+        "id": "fade-up"
+      },
+      {
+        "packId": "rendering",
+        "kind": "animation",
+        "id": "scale-in"
+      },
+      {
+        "packId": "rendering",
+        "kind": "animation",
+        "id": "slide-left"
+      },
+      {
+        "packId": "rendering",
+        "kind": "animation",
+        "id": "slide-up"
+      },
+      {
+        "packId": "rendering",
+        "kind": "animation",
+        "id": "type-on"
+      },
+      {
+        "packId": "rendering",
+        "kind": "effect",
+        "id": "audio-reactive-colour"
+      },
+      {
+        "packId": "rendering",
+        "kind": "effect",
+        "id": "text-card"
+      },
+      {
+        "packId": "rendering",
+        "kind": "transition",
+        "id": "cross-fade"
+      },
+      {
+        "packId": "rendering",
+        "kind": "transition",
+        "id": "fade"
+      },
+      {
+        "packId": "local",
+        "kind": "effect",
+        "id": "end-spanning-layer"
+      },
+      {
+        "packId": "local",
+        "kind": "effect",
+        "id": "frame-overlay"
+      }
+    ]
+  }
+}

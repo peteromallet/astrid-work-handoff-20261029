@@ -1,0 +1,146 @@
+import { useCallback, type ChangeEvent } from 'react';
+
+import { requireCloudBackend } from '@/shared/lib/cloudBackend';
+import type { CharacterAnimateBaseState } from './useCharacterAnimateBaseState';
+import {
+  isSupportedImageType,
+  isSupportedVideoType,
+  withFirstFile,
+} from './fileValidation';
+
+export function useCharacterAnimateHandlers(state: CharacterAnimateBaseState) {
+  const {
+    toast,
+    selectedProjectId,
+    localMode,
+    updateField,
+    updateFields,
+    imageUpload,
+    videoUpload,
+    setLocalMode,
+    setCharacterImageLoaded,
+    setCharacterImage,
+    setMotionVideoLoaded,
+    setMotionVideoPlaying,
+    setMotionVideo,
+    setIsDraggingOverImage,
+    setIsDraggingOverVideo,
+    characterImage,
+    motionVideo,
+    generateModel,
+    setPrompt,
+    attemptCloudBackend,
+  } = state;
+
+  const handleModeChange = useCallback((newMode: 'animate' | 'replace') => {
+    setLocalMode(newMode);
+    updateField('mode', newMode);
+  }, [setLocalMode, updateField]);
+
+  const processImageUpload = useCallback(async (file: File) => {
+    await imageUpload.execute(async () => {
+      const uploadedUrl = await attemptCloudBackend<string>(() => requireCloudBackend('character-animate upload'));
+      if (!uploadedUrl) return;
+      setCharacterImageLoaded(false);
+      setCharacterImage({ url: uploadedUrl, file });
+      if (selectedProjectId) {
+        updateField('inputImageUrl', uploadedUrl);
+      }
+    }, { context: 'CharacterAnimate', toastTitle: 'Upload Failed' });
+  }, [imageUpload, attemptCloudBackend, selectedProjectId, setCharacterImageLoaded, setCharacterImage, updateField]);
+
+  const processVideoUpload = useCallback(async (file: File) => {
+    await videoUpload.execute(async () => {
+      const uploaded = await attemptCloudBackend<{ videoUrl: string; posterUrl: string }>(
+        () => requireCloudBackend('character-animate upload'),
+      );
+      if (!uploaded) return;
+      const { videoUrl, posterUrl } = uploaded;
+      setMotionVideoLoaded(false);
+      setMotionVideoPlaying(false);
+      setMotionVideo({ url: videoUrl, posterUrl, file });
+      if (selectedProjectId) {
+        updateFields({ inputVideoUrl: videoUrl, inputVideoPosterUrl: posterUrl });
+      }
+    }, { context: 'CharacterAnimate', toastTitle: 'Upload Failed' });
+  }, [videoUpload, attemptCloudBackend, setMotionVideoLoaded, setMotionVideoPlaying, setMotionVideo, selectedProjectId, updateFields]);
+
+  const handleCharacterImageUpload = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    await withFirstFile(event.target.files, async (file) => {
+      if (!isSupportedImageType(file.type)) {
+        toast({
+          title: 'Invalid file type',
+          description: 'Please upload a PNG or JPG image (avoid WEBP)',
+          variant: 'destructive',
+        });
+        return;
+      }
+
+      await processImageUpload(file);
+    });
+  }, [toast, processImageUpload]);
+
+  const handleMotionVideoSelect = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    await withFirstFile(event.target.files, async (file) => {
+      if (!isSupportedVideoType(file.type)) {
+        toast({ title: 'Invalid file type', description: 'Please upload a video file', variant: 'destructive' });
+        return;
+      }
+
+      await processVideoUpload(file);
+    });
+  }, [toast, processVideoUpload]);
+
+  const handleGenerate = useCallback(() => {
+    if (localMode !== 'animate') {
+      toast({
+        title: 'Mode unavailable',
+        description: 'The current Astrid profile supports animate mode only.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    if (!characterImage) {
+      toast({ title: 'Missing character image', description: 'Please upload a character image first', variant: 'destructive' });
+      return;
+    }
+    if (!motionVideo) {
+      toast({ title: 'Missing motion video', description: 'Please select a motion video', variant: 'destructive' });
+      return;
+    }
+    generateModel.handleGenerate();
+  }, [characterImage, localMode, motionVideo, toast, generateModel]);
+
+  const clearCharacterImage = useCallback(() => {
+    setCharacterImage(null);
+    setCharacterImageLoaded(false);
+    setIsDraggingOverImage(false);
+    if (selectedProjectId) {
+      updateField('inputImageUrl', undefined);
+    }
+  }, [setCharacterImage, setCharacterImageLoaded, setIsDraggingOverImage, selectedProjectId, updateField]);
+
+  const clearMotionVideo = useCallback(() => {
+    setMotionVideo(null);
+    setMotionVideoLoaded(false);
+    setMotionVideoPlaying(false);
+    setIsDraggingOverVideo(false);
+    if (selectedProjectId) {
+      updateFields({ inputVideoUrl: undefined, inputVideoPosterUrl: undefined });
+    }
+  }, [setMotionVideo, setMotionVideoLoaded, setMotionVideoPlaying, setIsDraggingOverVideo, selectedProjectId, updateFields]);
+
+  return {
+    handleModeChange,
+    processImageUpload,
+    processVideoUpload,
+    handleCharacterImageUpload,
+    handleMotionVideoSelect,
+    handleGenerate,
+    clearCharacterImage,
+    clearMotionVideo,
+    setPrompt,
+  };
+}
+
+export type CharacterAnimateHandlers = ReturnType<typeof useCharacterAnimateHandlers>;

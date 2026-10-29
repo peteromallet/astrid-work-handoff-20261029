@@ -1,0 +1,547 @@
+/**
+ * flagship-local-extension — Flagship trusted-local extension example.
+ *
+ * Demonstrates the full SDK surface using only the public @astrid/editor-sdk
+ * entrypoint:
+ *
+ *   - Activation / deactivation lifecycle with diagnostics
+ *   - Toolbar and status-bar slot contributions
+ *   - Settings with manifest-declared defaults
+ *   - Diagnostics service (report + read-back)
+ *   - Chrome toast/progress scaffolding
+ *   - Trusted-local safety-warning copy emitted on activation
+ *   - Command palette, keybinding, and clip context-menu contributions
+ *   - Patch-backed command behavior through public creative timeline APIs
+ *   - trusted component-effect registration with parameter schema
+ *   - trusted component-transition registration with pure renderer
+ *   - Future inactive contribution declarations (clipType, parser, agentTool)
+ *     in the manifest for forward-compatibility testing
+ *
+ * This file must NOT import from editor internals (src/tools/video-editor/*).
+ * It imports exclusively from @astrid/editor-sdk, the public SDK entrypoint.
+ *
+ * @publicContract
+ */
+
+import { defineExtension } from '@astrid/editor-sdk';
+import type {
+  AstridExtension,
+  ExtensionManifestContribution,
+  ExtensionContext,
+  DisposeHandle,
+  CommandRunContext,
+  TimelinePatch,
+  EffectContribution,
+  EffectComponent,
+  EffectParameterSchema,
+  TransitionContribution,
+  TransitionParameterSchema,
+  TransitionRegistrationOptions,
+} from '@astrid/editor-sdk';
+
+import { FlagshipEffectComponent } from './FlagshipEffectComponent';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+const flagshipEffectRegistration: EffectComponent = (...args: unknown[]): unknown => {
+  const rawProps = args[0];
+  if (!isRecord(rawProps) || !('children' in rawProps)) {
+    return null;
+  }
+  return FlagshipEffectComponent({
+    // Derive the renderer's child contract from the local component so this
+    // extension entrypoint stays SDK-only (the component itself owns its
+    // React/Remotion runtime imports).
+    children: rawProps.children as Parameters<typeof FlagshipEffectComponent>[0]['children'],
+    durationInFrames: typeof rawProps.durationInFrames === 'number'
+      ? rawProps.durationInFrames
+      : 1,
+    ...(typeof rawProps.effectFrames === 'number' ? { effectFrames: rawProps.effectFrames } : {}),
+    ...(typeof rawProps.intensity === 'number' ? { intensity: rawProps.intensity } : {}),
+    ...(isRecord(rawProps.params) ? { params: rawProps.params } : {}),
+  });
+};
+
+const FLAGSHIP_EXTENSION_ID = 'haus.astrid.examples.flagship-local';
+const FLAGSHIP_MARK_REVIEW_COMMAND =
+  `${FLAGSHIP_EXTENSION_ID}.markClipReview`;
+
+// ---------------------------------------------------------------------------
+// Trusted component-effect parameter schema
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema for the Flagship Glow effect.
+ *
+ * Demonstrates all supported parameter types:
+ *  - number (with min, max, step, default)
+ *  - select (with options)
+ *  - boolean (with default)
+ *  - color (with default)
+ */
+const FLAGSHIP_GLOW_SCHEMA: EffectParameterSchema = [
+  {
+    name: 'intensity',
+    label: 'Glow Intensity',
+    description: 'How strong the glow appears (0–1).',
+    type: 'number',
+    default: 0.5,
+    min: 0,
+    max: 1,
+    step: 0.05,
+  },
+  {
+    name: 'color',
+    label: 'Glow Color',
+    description: 'CSS color for the glow overlay.',
+    type: 'color',
+    default: '#ff6b6b',
+  },
+  {
+    name: 'style',
+    label: 'Glow Style',
+    description: 'Visual style of the overlay.',
+    type: 'select',
+    default: 'glow',
+    options: [
+      { label: 'Glow', value: 'glow' },
+      { label: 'Vignette', value: 'vignette' },
+      { label: 'Both', value: 'both' },
+    ],
+  },
+  {
+    name: 'animate',
+    label: 'Animate',
+    description: 'Pulse the glow over time.',
+    type: 'boolean',
+    default: true,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Trusted component-transition parameter schema
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema for the Flagship Wipe transition.
+ *
+ * Demonstrates parameterized contributed transitions with a small schema:
+ *  - select: direction (left, right)
+ *  - number: softness (0–1 edge feathering)
+ */
+const FLAGSHIP_WIPE_SCHEMA: TransitionParameterSchema = [
+  {
+    name: 'direction',
+    label: 'Wipe Direction',
+    description: 'Which way the wipe travels across the frame.',
+    type: 'select',
+    default: 'right',
+    options: [
+      { label: 'Left to Right', value: 'right' },
+      { label: 'Right to Left', value: 'left' },
+    ],
+  },
+  {
+    name: 'softness',
+    label: 'Edge Softness',
+    description: 'Amount of edge feathering (0 = hard edge, 1 = fully blurred).',
+    type: 'number',
+    default: 0,
+    min: 0,
+    max: 1,
+    step: 0.05,
+  },
+];
+
+/**
+ * Pure renderer for the Flagship Wipe transition.
+ *
+ * Returns CSS properties for a directional wipe based on progress and params.
+ * This is a simple pure function — no React, no Remotion imports needed.
+ */
+function flagshipWipeRenderer(...args: unknown[]): Record<string, unknown> {
+  const progress = typeof args[0] === 'number' ? args[0] : 0;
+  const params = isRecord(args[1]) ? args[1] : undefined;
+  const direction = typeof params?.direction === 'string' ? params.direction : 'right';
+  const softness = typeof params?.softness === 'number' ? params.softness : 0;
+
+  const clipPercent = (1 - progress) * 100;
+  const blurPx = softness > 0 ? softness * progress * 20 : 0;
+
+  const clipPath =
+    direction === 'left'
+      ? `inset(0 0 0 ${clipPercent}%)`
+      : `inset(0 ${clipPercent}% 0 0)`;
+
+  const style: Record<string, unknown> = { clipPath };
+  if (blurPx > 0) {
+    style.filter = `blur(${blurPx}px)`;
+  }
+
+  return style;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Read a settings value with a strongly-typed fallback. */
+function setting<T>(
+  ctx: ExtensionContext,
+  key: string,
+  fallback: T,
+): T {
+  const val = ctx.services.settings.get<T>(key);
+  return val !== undefined ? val : fallback;
+}
+
+/** Report an info diagnostic through the extension's scoped service. */
+function info(ctx: ExtensionContext, code: string, message: string): void {
+  ctx.services.diagnostics.report({ severity: 'info', code, message });
+}
+
+/** Report a warning diagnostic through the extension's scoped service. */
+function warn(ctx: ExtensionContext, code: string, message: string): void {
+  ctx.services.diagnostics.report({ severity: 'warning', code, message });
+}
+
+/** Report an error diagnostic through the extension's scoped service. */
+function error(ctx: ExtensionContext, code: string, message: string): void {
+  ctx.services.diagnostics.report({ severity: 'error', code, message });
+}
+
+/** Build a small extension-owned patch that records the latest command run. */
+function buildFlagshipReviewPatch(
+  ctx: ExtensionContext,
+  run: CommandRunContext,
+): TimelinePatch {
+  const snapshot = ctx.creative.reader.snapshot();
+  const targetClipId = run.target?.target === 'clip'
+    ? run.target.clipId
+    : snapshot.clips[0]?.id ?? null;
+
+  return {
+    version: snapshot.baseVersion,
+    source: ctx.extension.id as string,
+    meta: { kind: 'flagship-review-marker' },
+    operations: [
+      {
+        op: 'project-data.write',
+        target: ctx.extension.id as string,
+        payload: {
+          key: 'flagship.lastReviewMarker',
+          value: {
+            commandId: run.commandId,
+            targetClipId,
+            clipCount: snapshot.clips.length,
+            trackCount: snapshot.tracks.length,
+            snapshotVersion: snapshot.currentVersion,
+          },
+          mode: 'replace',
+        },
+      },
+    ],
+  };
+}
+
+const commandContributions: readonly ExtensionManifestContribution[] = [
+  {
+    id: 'flagship-mark-review-command' as any,
+    kind: 'command',
+    command: FLAGSHIP_MARK_REVIEW_COMMAND,
+    label: 'Flagship: Mark Clip for Review',
+    category: 'Flagship',
+    order: 10,
+  },
+  {
+    id: 'flagship-mark-review-keybinding' as any,
+    kind: 'keybinding',
+    command: FLAGSHIP_MARK_REVIEW_COMMAND,
+    key: 'CtrlOrCmd+Alt+F',
+    order: 10,
+  },
+  {
+    id: 'flagship-mark-review-menu' as any,
+    kind: 'contextMenuItem',
+    command: FLAGSHIP_MARK_REVIEW_COMMAND,
+    label: 'Flagship: Mark Clip for Review',
+    target: 'clip',
+    when: 'target.clipId != null',
+    order: 10,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Extension definition
+// ---------------------------------------------------------------------------
+
+export const flagshipLocalExtension: AstridExtension = defineExtension({
+  manifest: {
+    id: FLAGSHIP_EXTENSION_ID as any,
+    version: '1.0.0',
+    label: 'Flagship Local Extension',
+    description:
+      'Flagship trusted-local extension example demonstrating the full M1 SDK surface.',
+    apiVersion: 1,
+
+    // ---- Slot contributions ------------------------------------
+    contributions: [
+      ...commandContributions,
+      {
+        id: 'flagship-toolbar-button' as any,
+        kind: 'slot',
+        slot: 'toolbar',
+        order: 200,
+        label: 'Flagship toolbar',
+      },
+      {
+        id: 'flagship-status' as any,
+        kind: 'slot',
+        slot: 'statusBar',
+        order: 100,
+        label: 'Flagship status',
+      },
+
+      // ---- trusted component-effect contribution ------------------------
+      {
+        id: 'flagship-effect-glow' as any,
+        kind: 'effect',
+        label: 'Flagship Glow',
+        effectId: 'haus.astrid.flagship.effect.glow',
+        // Preview-only: browser and worker export are blocked until a
+        // future milestone lifts the restriction.
+        allowBrowserExport: false,
+        allowWorkerExport: false,
+        order: 10,
+      } satisfies EffectContribution,
+
+      // ---- Active transition contribution ----------------------------------
+      {
+        id: 'flagship-transition-wipe' as any,
+        kind: 'transition',
+        label: 'Flagship Wipe',
+        transitionId: 'haus.astrid.flagship.transition.wipe',
+        allowBrowserExport: false,
+        allowWorkerExport: false,
+        order: 10,
+        // Example/test material slot declaration — not a production SDK
+        // constant.  Descriptor projection tests use this slot to validate
+        // the TransitionMaterialSlotDeclaration → VideoEditorTransitionMaterialSlotDescriptor
+        // normalization path.
+        materialSlots: [{ name: 'transition-mask', label: 'Transition Mask' }],
+      } satisfies TransitionContribution,
+
+      // ---- Future inactive contribution declarations -----------------------
+      // These are reserved for later milestones; the runtime will emit
+      // info-level diagnostics noting they are not yet bridged.
+      {
+        id: 'flagship-effect-second-future' as any,
+        kind: 'effect',
+        label: 'Flagship custom effect (reserved for M3)',
+        effectId: 'haus.astrid.flagship.effect.second',
+      },
+      {
+        id: 'flagship-cliptype-future' as any,
+        kind: 'clipType',
+        label: 'Flagship custom clip type (reserved for M3)',
+        clipTypeId: 'haus.astrid.flagship.cliptype.annotation',
+      },
+      {
+        id: 'flagship-parser-future' as any,
+        kind: 'parser',
+        label: 'Flagship custom parser (reserved for M4)',
+      },
+      {
+        id: 'flagship-agent-tool-future' as any,
+        kind: 'agentTool',
+        label: 'Flagship agent tool (reserved for M5)',
+      },
+    ],
+
+    // ---- Settings defaults (fall back when localStorage has no value) ------
+    settingsDefaults: {
+      'toolbar.label': 'Flagship',
+      'toolbar.enabled': true,
+      'status.showTimelineName': true,
+      'status.pollIntervalMs': 5000,
+    },
+
+    // ---- i18n message bundle (resolved via ctx.services.i18n.t()) ----------
+    messages: {
+      'activation.started':
+        'Flagship local extension v{{version}} activating…',
+      'activation.ready':
+        'Flagship local extension v{{version}} ready.',
+      'activation.disposed':
+        'Flagship local extension disposed.',
+      'warning.trustedLocal':
+        '⚠️ Trusted-local extension: this extension executes with full ' +
+        'browser-renderer privileges. Review the extension source before ' +
+        'enabling it in a shared project.',
+      'progress.label': 'Chrome progress scaffold',
+      'toast.error':
+        'Flagship encountered an error: {{error}}',
+      'toast.info':
+        'Flagship status update: {{message}}',
+      'command.markReview.ready':
+        'Flagship review marker command registered.',
+      'command.markReview.done':
+        'Flagship review marker stored.',
+    },
+  },
+
+  // -----------------------------------------------------------------------
+  // activate
+  // -----------------------------------------------------------------------
+  activate(ctx: ExtensionContext): DisposeHandle {
+    // --- Emit the trusted-local warning on every activation --------------
+    const trustedWarning = ctx.services.i18n.t('warning.trustedLocal');
+    warn(ctx, 'flagship/trusted-local-warning', trustedWarning);
+
+    // --- Activation-start diagnostic ------------------------------------
+    const startedMsg = ctx.services.i18n.t('activation.started', {
+      version: ctx.extension.version,
+    });
+    info(ctx, 'flagship/activation-started', startedMsg);
+
+    // --- Chrome toast scaffolding ---------------------------------------
+    ctx.chrome.toast(startedMsg, 'info');
+
+    // --- Settings demonstration -----------------------------------------
+    const toolbarLabel = setting(ctx, 'toolbar.label', 'Flagship');
+    const toolbarEnabled = setting(ctx, 'toolbar.enabled', true);
+    const showTimelineName = setting(ctx, 'status.showTimelineName', true);
+    const pollIntervalMs = setting(ctx, 'status.pollIntervalMs', 5000);
+
+    info(
+      ctx,
+      'flagship/settings-loaded',
+      `Settings loaded: toolbar.label="${toolbarLabel}", ` +
+        `toolbar.enabled=${toolbarEnabled}, ` +
+        `status.showTimelineName=${showTimelineName}, ` +
+        `status.pollIntervalMs=${pollIntervalMs}`,
+    );
+
+    // Persist a setting so the lifecycle cleanup hook can remove it later
+    ctx.services.settings.set('flagship.lastActivatedAt', Date.now());
+
+    // --- Chrome progress scaffolding ------------------------------------
+    ctx.chrome.progress(0, ctx.services.i18n.t('progress.label'));
+    ctx.chrome.progress(50, ctx.services.i18n.t('progress.label'));
+    ctx.chrome.progress(100, ctx.services.i18n.t('progress.label'));
+
+    // --- Command contribution handler ------------------------------------
+    const commandHandle = ctx.commands.registerCommand(
+      FLAGSHIP_MARK_REVIEW_COMMAND,
+      (run: CommandRunContext): void => {
+        const patch = buildFlagshipReviewPatch(ctx, run);
+        ctx.creative.timeline.apply(patch);
+        const doneMsg = ctx.services.i18n.t('command.markReview.done');
+        info(ctx, 'flagship/mark-review-command-ran', doneMsg);
+        ctx.chrome.toast(doneMsg, 'info');
+      },
+      {
+        label: 'Flagship: Mark Clip for Review',
+        category: 'Flagship',
+      },
+    );
+
+    info(
+      ctx,
+      'flagship/mark-review-command-ready',
+      ctx.services.i18n.t('command.markReview.ready'),
+    );
+
+    // --- Trusted component-effect registration ----------------------
+    const effectHandle = ctx.effects.registerComponent(
+      'haus.astrid.flagship.effect.glow',
+      flagshipEffectRegistration,
+      {
+        label: 'Flagship Glow',
+        parameterSchema: FLAGSHIP_GLOW_SCHEMA,
+      },
+    );
+
+    info(
+      ctx,
+      'flagship/effect-registered',
+      'Flagship Glow component effect registered (preview-only).',
+    );
+
+    // --- Trusted component-transition registration ------------------
+    const transitionHandle = ctx.transitions.registerRenderer(
+      'haus.astrid.flagship.transition.wipe',
+      flagshipWipeRenderer,
+      {
+        label: 'Flagship Wipe',
+        parameterSchema: FLAGSHIP_WIPE_SCHEMA,
+      } satisfies TransitionRegistrationOptions,
+    );
+
+    info(
+      ctx,
+      'flagship/transition-registered',
+      'Flagship Wipe transition renderer registered (preview-only).',
+    );
+
+    // --- Chrome event subscriptions -------------------------------------
+    // Subscribe to toast events to demonstrate the subscribe API
+    const toastSub = ctx.chrome.subscribe('toast', (payload) => {
+      // Log incoming toast events for debugging/demo purposes
+      if (typeof console !== 'undefined') {
+        console.log(
+          `[Flagship] toast event received: severity=${payload.severity} message="${payload.message}"`,
+        );
+      }
+    });
+
+    // Subscribe to render status events as a scaffold for future use
+    const renderSub = ctx.chrome.subscribe('renderStatus', (payload) => {
+      if (typeof console !== 'undefined') {
+        console.log(
+          `[Flagship] render status: ${payload.status}` +
+            (payload.error ? ` (error: ${payload.error})` : ''),
+        );
+      }
+    });
+
+    // --- Activation-ready diagnostic ------------------------------------
+    const readyMsg = ctx.services.i18n.t('activation.ready', {
+      version: ctx.extension.version,
+    });
+    info(ctx, 'flagship/activation-ready', readyMsg);
+    ctx.chrome.toast(readyMsg, 'info');
+
+    // --- Diagnostics read-back (demonstrate reading emitted diagnostics) -
+    const currentDiags = ctx.services.diagnostics.diagnostics;
+    info(
+      ctx,
+      'flagship/diagnostics-count',
+      `Emitted ${currentDiags.length} diagnostics during activation.`,
+    );
+
+    // --- Return dispose handle ------------------------------------------
+    return {
+      dispose(): void {
+        // Unsubscribe chrome event handlers
+        toastSub.dispose();
+        renderSub.dispose();
+        commandHandle.dispose();
+        effectHandle.dispose();
+        transitionHandle.dispose();
+
+        // Emit disposal diagnostic
+        const disposedMsg = ctx.services.i18n.t('activation.disposed');
+        info(ctx, 'flagship/disposed', disposedMsg);
+
+        // Clean up the persisted setting
+        ctx.services.settings.delete('flagship.lastActivatedAt');
+
+        // Final toast
+        ctx.chrome.toast(disposedMsg, 'info');
+      },
+    };
+  },
+});

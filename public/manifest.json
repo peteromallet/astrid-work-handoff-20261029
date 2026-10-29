@@ -1,0 +1,45 @@
+{
+  "name": "Astrid",
+  "short_name": "Astrid",
+  "description": "An agent-powered video editor built to unlock the artistic potential of open-source models.",
+  "id": "/tools/video-editor?localProject=demo-project&localTimeline=demo-timeline",
+  "start_url": "/tools/video-editor",
+  "display": "standalone",
+  "background_color": "#f7f4ed",
+  "theme_color": "#f7f4ed",
+  "orientation": "any",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/astrid-app-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/astrid-app-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "categories": [
+    "multimedia",
+    "creativity",
+    "utilities"
+  ],
+  "shortcuts": [
+    {
+      "name": "Create New Project",
+      "short_name": "New Project",
+      "description": "Start creating a new video project",
+      "url": "/?action=new-project",
+      "icons": [
+        {
+          "src": "/astrid-app-icon-192.png",
+          "sizes": "192x192"
+        }
+      ]
+    }
+  ]
+}

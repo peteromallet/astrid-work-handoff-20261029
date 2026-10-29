@@ -1,0 +1,33 @@
+register_worker.sql
+
+# Database and backend files
+db/
+tasks/
+
+# Documentation
+doc/
+structure_detail/
+DEPLOY_RAILWAY.md
+*.md
+# Required by the pinned browser-source verifier during image builds.
+!vendor/astrid-browser/remotion/public/fonts/FONT_PROVENANCE.md
+
+# Development files
+.env*
+!.env.production
+
+# Build artifacts that might confuse detection
+dist/
+node_modules/
+
+# VCS and local tooling state
+.git/
+.desloppify/
+.venv*/
+.ruff_cache/
+
+# Local diagnostics and artifacts
+localhost-*.log
+findings*.json
+perfile_findings.json
+without-intro.mp4

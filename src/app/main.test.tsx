@@ -1,0 +1,112 @@
+import React from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mockRender = vi.fn();
+const mockCreateRoot = vi.fn(() => ({ render: mockRender }));
+
+vi.mock('react-dom/client', () => ({
+  createRoot: mockCreateRoot,
+}));
+
+vi.mock('@/shared/lib/logger', () => ({
+  initializeLoggerRuntime: vi.fn(),
+  reactProfilerOnRender: vi.fn(),
+}));
+
+const initializeProjectSelectionStoreMock = vi.fn();
+const initializePreloadingServiceMock = vi.fn();
+const initializeNetworkStatusManagerMock = vi.fn();
+
+vi.mock('@/shared/contexts/projectSelectionStore', () => ({
+  initializeProjectSelectionStore: initializeProjectSelectionStoreMock,
+}));
+
+vi.mock('@/shared/lib/preloading', () => ({
+  initializePreloadingService: initializePreloadingServiceMock,
+}));
+
+vi.mock('@/shared/services/network/networkStatusManager', () => ({
+  initializeNetworkStatusManager: initializeNetworkStatusManagerMock,
+}));
+
+vi.mock('@/app/App', () => ({
+  App: () => null,
+}));
+
+vi.mock('@/app/components/error/AppErrorBoundary', () => ({
+  AppErrorBoundary: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}));
+
+describe('bootstrap.renderApp', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockCreateRoot.mockClear();
+    mockRender.mockClear();
+    initializeProjectSelectionStoreMock.mockClear();
+    initializePreloadingServiceMock.mockClear();
+    initializeNetworkStatusManagerMock.mockClear();
+    window.history.replaceState({}, '', '/');
+    delete window.__ASTRID_APP_LOCAL_TEST__;
+    localStorage.clear();
+    document.documentElement.classList.remove('dark');
+  });
+
+  it('renders the app into the provided root element', async () => {
+    const { renderApp } = await import('@/app/bootstrap');
+    const root = document.createElement('div');
+
+    renderApp(root);
+
+    expect(mockCreateRoot).toHaveBeenCalledWith(root);
+    expect(mockRender).toHaveBeenCalledTimes(1);
+  }, 15_000);
+
+  it('paints the night theme at night when no preference exists', async () => {
+    const { initializeAppEnvironment } = await import('@/app/bootstrap');
+    // With no stored choice the theme follows the local time of day, so pin the clock.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(2026, 0, 15, 23, 0));
+      initializeAppEnvironment();
+      expect(document.documentElement.classList.contains('dark')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(initializeProjectSelectionStoreMock.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(initializePreloadingServiceMock.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(initializeNetworkStatusManagerMock.mock.calls.length).toBeGreaterThanOrEqual(1);
+  }, 15_000);
+
+  it('installs deterministic local-test state without network monitoring', async () => {
+    window.history.replaceState({}, '', '/tools/video-editor?localTest=1');
+    const { initializeAppEnvironment } = await import('@/app/bootstrap');
+
+    initializeAppEnvironment();
+
+    expect(window.__ASTRID_APP_LOCAL_TEST__).toEqual({
+      enabled: true,
+      diagnostics: { loader: [], runtime: [] },
+    });
+    expect(initializeNetworkStatusManagerMock).not.toHaveBeenCalled();
+  }, 15_000);
+});
+
+describe('bootstrap runtime gates', () => {
+  it('loads debug tools only in non-test dev runtime', async () => {
+    const { shouldLoadDevDebugTools } = await import('@/app/bootstrap');
+
+    expect(shouldLoadDevDebugTools({ MODE: 'development', DEV: true, VITEST: false })).toBe(true);
+    expect(shouldLoadDevDebugTools({ MODE: 'test', DEV: true, VITEST: false })).toBe(false);
+    expect(shouldLoadDevDebugTools({ MODE: 'development', DEV: false, VITEST: false })).toBe(false);
+    expect(shouldLoadDevDebugTools({ MODE: 'development', DEV: true, VITEST: true })).toBe(false);
+  });
+
+  it('loads autoplay monitor only in non-test dev runtime', async () => {
+    const { shouldLoadAutoplayMonitor } = await import('@/app/bootstrap');
+
+    expect(shouldLoadAutoplayMonitor({ MODE: 'development', DEV: true, VITEST: false })).toBe(true);
+    expect(shouldLoadAutoplayMonitor({ MODE: 'production', DEV: false, VITEST: false })).toBe(false);
+    expect(shouldLoadAutoplayMonitor({ MODE: 'test', DEV: true, VITEST: false })).toBe(false);
+    expect(shouldLoadAutoplayMonitor({ MODE: 'development', DEV: true, VITEST: true })).toBe(false);
+  });
+});

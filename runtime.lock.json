@@ -1,0 +1,56 @@
+{
+  "files": {
+    "src/integrations/runtime/fixtures/responses/events_page_1_200.json": {
+      "from": "conformance/responses/events_page_1_200.json",
+      "sha256": "sha256:6aaaabe512589beddddd5ef64f2307c39d365a99565c5a3291a15933a114be0d"
+    },
+    "src/integrations/runtime/fixtures/responses/events_page_2_200.json": {
+      "from": "conformance/responses/events_page_2_200.json",
+      "sha256": "sha256:d5bffdc93e9939779c92a18c047e70df21711f12e16c345f43f3cbdec5b27eb2"
+    },
+    "src/integrations/runtime/fixtures/responses/invalid_cursor_400.json": {
+      "from": "conformance/responses/invalid_cursor_400.json",
+      "sha256": "sha256:16a1db399e06b8d059472f567a091b4bd579d13d8885595376f61835646bfbff"
+    },
+    "src/integrations/runtime/fixtures/responses/managed_outputs_200.json": {
+      "from": "conformance/responses/managed_outputs_200.json",
+      "sha256": "sha256:6bcef19aca4ad8d574c60d738b54ba57fce6a3a9d4e1481c6f8f088dd460858d"
+    },
+    "src/integrations/runtime/fixtures/responses/not_found_404.json": {
+      "from": "conformance/responses/not_found_404.json",
+      "sha256": "sha256:4a40fedbeccd345f24944e4af368c50430593d976a923c12af93ba21faa21af6"
+    },
+    "src/integrations/runtime/fixtures/responses/publish_conflict_409.json": {
+      "from": "conformance/responses/publish_conflict_409.json",
+      "sha256": "sha256:19d664d035691202da03b22b858456c49983e253c7485a6347baa1cf350eea57"
+    },
+    "src/integrations/runtime/fixtures/responses/task_admission_201.json": {
+      "from": "conformance/responses/task_admission_201.json",
+      "sha256": "sha256:108559a92c9e681e3ade37fa6b567e1eaac3edce221665a07a81c2c2c06bb48c"
+    },
+    "src/integrations/runtime/fixtures/responses/task_read_200.json": {
+      "from": "conformance/responses/task_read_200.json",
+      "sha256": "sha256:cc590c4f7d34820382b684d737f1cdb45eebeb20fbad2d5edda2dadac8ab2829"
+    },
+    "src/integrations/runtime/fixtures/responses/validation_error_422.json": {
+      "from": "conformance/responses/validation_error_422.json",
+      "sha256": "sha256:2a02a9147bc0a8b74727d9c577803b0aca333bd0dd035602dafcf2503b00ff1a"
+    },
+    "src/integrations/runtime/generated-contract-metadata.ts": {
+      "from": "packages/typescript/src/contract-metadata.ts",
+      "sha256": "sha256:de61b6d0c7780b569922d3b91237bc6605b2940b36f563de922bfee417df7eeb"
+    },
+    "src/integrations/runtime/generated.ts": {
+      "from": "packages/typescript/src/generated.ts",
+      "sha256": "sha256:e6a82d539c37664ebc9d2a11fc9a6f65eca48c3c6235a4f1d7f3b17f3b4f1cd6"
+    },
+    "vendor/timeline-schema/python/banodoco_timeline_schema/timeline.schema.json": {
+      "from": "contract/schemas/timeline-config.schema.json",
+      "sha256": "sha256:f52b82024ecd44a5e6c9c68d5cb326d50d70efe9aaad6f8ac6352ea1c87b97b1"
+    }
+  },
+  "manifest": "contract/artifacts.json",
+  "producer": "astrid-runtime",
+  "producer_version": "sha256:a67cb4ff79b39fd3a38dbab2c424e74636c5f9c23c554eccec373aa5c802301e",
+  "source_commit": "11443b0b5b34bd5b36725504fb083146192a759d"
+}

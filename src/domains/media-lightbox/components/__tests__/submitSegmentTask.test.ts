@@ -1,0 +1,145 @@
+import { QueryClient } from '@tanstack/react-query';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createTask } from '@/shared/lib/taskCreation';
+import type { RunTaskPlaceholder } from '@/shared/hooks/tasks/useTaskPlaceholder';
+import { buildStructureVideoForTask, submitSegmentTask } from '../submitSegmentTask';
+
+vi.mock('@/shared/lib/taskCreation', () => ({
+  createTask: vi.fn(),
+}));
+
+const getSettings = () => ({
+  prompt: 'A prompt',
+  negativePrompt: '',
+  textBeforePrompts: '',
+  textAfterPrompts: '',
+  motionMode: 'basic' as const,
+  amountOfMotion: 50,
+  phaseConfig: undefined,
+  selectedPhasePresetId: null,
+  loras: [],
+  numFrames: 25,
+  randomSeed: true,
+  seed: null,
+  makePrimaryVariant: true,
+  structureMotionStrength: undefined,
+  structureTreatment: undefined,
+  structureUni3cEndPercent: undefined,
+});
+
+describe('submitSegmentTask', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns null structure video when required inputs are missing', () => {
+    const result = buildStructureVideoForTask(
+      {
+        structureVideoUrl: undefined,
+        structureVideoType: null,
+        structureVideoFrameRange: undefined,
+      },
+      () => getSettings(),
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it('builds canonical travel guidance alongside cleaned structure videos', () => {
+    const result = buildStructureVideoForTask(
+      {
+        structureVideoUrl: 'https://example.com/guide.mp4',
+        structureVideoType: 'uni3c',
+        structureVideoFrameRange: {
+          segmentStart: 8,
+          segmentEnd: 24,
+          videoTotalFrames: 48,
+          videoFps: 24,
+        },
+        structureVideoDefaults: {
+          motionStrength: 1.25,
+          treatment: 'clip',
+          uni3cEndPercent: 0.3,
+        },
+      },
+      () => getSettings(),
+    );
+
+    expect(result).toEqual({
+      structureVideos: [{
+        path: 'https://example.com/guide.mp4',
+        start_frame: 8,
+        end_frame: 24,
+        treatment: 'clip',
+      }],
+      travelGuidance: {
+        kind: 'uni3c',
+        videos: [{
+          path: 'https://example.com/guide.mp4',
+          start_frame: 8,
+          end_frame: 24,
+          treatment: 'clip',
+        }],
+        strength: 1.25,
+        step_window: [0, 0.3],
+        frame_policy: 'fit',
+        zero_empty_frames: true,
+      },
+    });
+  });
+
+  it('fails closed before task creation', () => {
+    const run = vi.fn<RunTaskPlaceholder>();
+    const onNonFatalError = vi.fn();
+
+    expect(() => submitSegmentTask({
+      taskLabel: 'Segment 1',
+      errorContext: 'submitSegmentTask.test',
+      getSettings,
+      shouldEnhance: false,
+      defaultNumFrames: 25,
+      images: {
+        startImageUrl: 'https://example.com/start.png',
+      },
+      task: {
+        projectId: 'project-1',
+        segmentIndex: 0,
+        structureInput: null,
+      },
+      run,
+      queryClient: new QueryClient(),
+      onNonFatalError,
+    })).toThrow('Astrid capability generation.generate_video is unsupported');
+
+    expect(run).not.toHaveBeenCalled();
+    expect(onNonFatalError).toHaveBeenCalledWith('unsupported_capability', expect.any(Error));
+  });
+
+  it('does not create an individual travel task', () => {
+    const createTaskMock = vi.mocked(createTask);
+    createTaskMock.mockResolvedValue({ task_id: 'task-2', status: 'queued' });
+    const run = vi.fn<RunTaskPlaceholder>();
+
+    expect(() => submitSegmentTask({
+      taskLabel: 'Segment 2',
+      errorContext: 'submitSegmentTask.test',
+      getSettings,
+      shouldEnhance: false,
+      defaultNumFrames: 25,
+      images: {
+        startImageUrl: 'https://example.com/start.png',
+      },
+      task: {
+        projectId: 'project-1',
+        segmentIndex: 1,
+        modelName: 'ltx2_22B_distilled',
+        structureInput: null,
+      },
+      run,
+      queryClient: new QueryClient(),
+    })).toThrow('Astrid capability generation.generate_video is unsupported');
+
+    expect(run).not.toHaveBeenCalled();
+    expect(createTaskMock).not.toHaveBeenCalled();
+  });
+});

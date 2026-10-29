@@ -1,0 +1,1428 @@
+// @vitest-environment jsdom
+// dataKind V1 (Batch 6): DataLaneList — reads lanes from TimelineData plus
+// the data-kind registry snapshot. Registered kind renders rows; a
+// renderer-less registered kind renders nothing (the host cannot paint it);
+// opaque lanes paint host extent bars; renderer crashes stay contained.
+//
+// Rework R1: host-painted chrome dispatches timeline interaction targets —
+// extent-bar press → `dataItem` target (laneId/itemId + registry-resolved
+// extension/contribution ids), empty lane chrome → `dataLane` target.
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { DndContext } from '@dnd-kit/core';
+import { SortableContext } from '@dnd-kit/sortable';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { TimelineData } from '@/tools/video-editor/lib/timeline-data.ts';
+import type { DataLaneView, FrozenDataItem } from '@/tools/video-editor/data/typed/envelope.ts';
+import type {
+  DataKindRegistryRecord,
+} from '@/tools/video-editor/data-kinds/DataKindRegistry.ts';
+import {
+  DataKindRegistryProvider,
+  useDataKindRegistryContext,
+} from '@/tools/video-editor/data-kinds/DataKindRegistryContext.tsx';
+import type { DataLaneRendererProps } from '@astrid/editor-sdk';
+import { DataLaneList, type DataLaneListProps } from './DataLaneList.tsx';
+import { VideoEditorRuntimeContext } from '@/tools/video-editor/contexts/VideoEditorRuntimeContext.tsx';
+import type { VideoEditorRuntimeContextValue } from '@/tools/video-editor/contexts/VideoEditorRuntimeContext.tsx';
+import { createTimelineViewStore } from '@/tools/video-editor/lib/timeline-view-store.ts';
+import {
+  DATA_LANE_ACTION_TIMEOUT_MS,
+  DATA_LANE_DOM_ITEM_BUDGET,
+  DATA_LANE_VIEWPORT_OVERSCAN_PX,
+  DataLaneRow,
+} from './DataLaneRow.tsx';
+
+const START_LEFT = 144;
+const PPS = 50;
+
+const item = (id: string): FrozenDataItem =>
+  ({
+    id,
+    shape: 'interval',
+    domain: 'source_seconds',
+    extent: { start: 0 },
+    schemaRef: 'astrid.transcript_segment/v1',
+    payload: { text: id },
+    provenance: { adapterId: 'astrid.adaptTranscript', adapterVersion: '1' },
+  }) as unknown as FrozenDataItem;
+
+const laneView = (overrides: Record<string, unknown> = {}) => ({
+  laneId: 'transcript',
+  kindId: 'transcript',
+  label: 'Transcript',
+  schemaRef: 'astrid.transcript_segment/v1',
+  shape: 'interval',
+  domain: 'source_seconds',
+  items: [],
+  hidden: false,
+  height: 24,
+  opaque: false,
+  ...overrides,
+});
+
+const buildData = (lanes: unknown[]): TimelineData =>
+  ({ dataLanes: lanes }) as unknown as TimelineData;
+
+function renderList(
+  props: Partial<DataLaneListProps> & { data: TimelineData | null },
+) {
+  return render(
+    <DataLaneList
+      data={props.data}
+      startLeft={props.startLeft ?? START_LEFT}
+      pixelsPerSecond={props.pixelsPerSecond ?? PPS}
+      viewport={props.viewport}
+      onRequestItemIntoView={props.onRequestItemIntoView}
+      timelineViewStore={props.timelineViewStore}
+      setContextTarget={props.setContextTarget}
+      setInspectorTarget={props.setInspectorTarget}
+      selectedTarget={props.selectedTarget}
+      onOpenExtensionManager={props.onOpenExtensionManager}
+    />,
+  );
+}
+
+/** Registers one record through the real registry so snapshot lookups resolve. */
+function RegisterProbe({ record }: { record: DataKindRegistryRecord }) {
+  const { registry } = useDataKindRegistryContext();
+  useEffect(() => {
+    const handle = registry.register(record);
+    return () => handle.dispose();
+  }, [registry, record]);
+  return null;
+}
+
+const registryRecord = (overrides: Partial<DataKindRegistryRecord> = {}): DataKindRegistryRecord => ({
+  kindId: 'transcript',
+  contributionId: 'ext.transcript.contrib',
+  schemaRef: 'astrid.transcript_segment/v1',
+  shape: 'interval',
+  domain: 'source_seconds',
+  laneRenderer: (props) => props,
+  ownerExtensionId: 'ext.transcript',
+  provenance: 'bundled-extension',
+  renderability: { capabilities: [] } as unknown as DataKindRegistryRecord['renderability'],
+  status: 'active',
+  ...overrides,
+});
+
+describe('DataLaneList', () => {
+  it('aligns a generic document icon with the fixed media-row icon slot', () => {
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+    renderList({ data });
+
+    const header = screen.getByTestId('data-lane-header');
+    const iconSlot = screen.getByTestId('data-lane-type-icon');
+    expect(header.firstElementChild).toBe(iconSlot);
+    expect(iconSlot).toHaveClass('h-3.5', 'w-3.5', 'shrink-0', 'text-muted-foreground');
+    expect(iconSlot.querySelector('svg')).toHaveClass('h-3.5', 'w-3.5');
+  });
+
+  it('provides an accessible lane drag handle inside the parent mixed-row sortable context', () => {
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+
+    render(
+      <DndContext>
+        <SortableContext items={['track-V1', 'data-lane-transcript', 'track-V2']}>
+          <DataLaneList startLeft={START_LEFT}
+            data={data}
+            laneId="transcript"
+            sortable
+            pixelsPerSecond={PPS}
+          />
+        </SortableContext>
+      </DndContext>,
+    );
+
+    const handle = screen.getByRole('button', { name: 'Reorder Transcript row' });
+    expect(handle).toHaveAttribute('aria-roledescription', 'sortable');
+    expect(handle).toHaveAttribute('tabindex', '0');
+    expect(handle.closest('[data-sortable-id="data-lane-transcript"]')).toBeInTheDocument();
+    expect(handle.className).toContain('opacity-0');
+    expect(handle.className).toContain('group-hover:opacity-100');
+    expect(handle.className).toContain('group-focus-within:opacity-100');
+    expect(screen.queryByText(/\d+\/\d+/)).not.toBeInTheDocument();
+  });
+
+  it('keeps resting-invisible header controls out of flow so the lane label keeps the full gutter', async () => {
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+    const runtime = {
+      extensionRuntime: { extensions: [{ manifest: { id: 'ext.transcript', label: 'Transcript' } }] },
+    } as unknown as VideoEditorRuntimeContextValue;
+
+    render(
+      <DndContext>
+        <SortableContext items={['track-V1', 'data-lane-transcript', 'track-V2']}>
+          <VideoEditorRuntimeContext.Provider value={runtime}>
+            <DataKindRegistryProvider>
+              <RegisterProbe record={registryRecord({ ownerExtensionId: 'ext.transcript' })} />
+              <DataLaneList data={data} laneId="transcript" sortable pixelsPerSecond={PPS} />
+            </DataKindRegistryProvider>
+          </VideoEditorRuntimeContext.Provider>
+        </SortableContext>
+      </DndContext>,
+    );
+
+    const info = await screen.findByRole('button', { name: 'Extension owner: Transcript' });
+    const handle = screen.getByRole('button', { name: 'Reorder Transcript row' });
+    const header = screen.getByTestId('data-lane-header');
+    const controls = within(header).getByTestId('data-lane-header-controls');
+    // Both opacity-0 controls live in one absolutely positioned overlay, so neither takes flex width
+    // from the label; only the icon and the label are in the header's flow.
+    expect(controls).toHaveClass('absolute', 'right-0');
+    expect(controls).toContainElement(info);
+    expect(controls).toContainElement(handle);
+    expect([...header.children].filter((child) => child !== controls).map((child) => child.getAttribute('data-testid') ?? child.textContent))
+      .toEqual(['data-lane-type-icon', 'Transcript']);
+    expect(controls).toHaveClass('group-hover:bg-card', 'group-focus-within:bg-card');
+  });
+
+  it('shows focusable ownership help only for the exact registered extension owner', async () => {
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+    const runtime = {
+      extensionRuntime: {
+        extensions: [
+          { manifest: { id: 'ext.transcript', label: 'Transcript' } },
+          { manifest: { id: 'transcript', label: 'Unrelated extension' } },
+        ],
+      },
+    } as unknown as VideoEditorRuntimeContextValue;
+
+    const view = render(
+      <VideoEditorRuntimeContext.Provider value={runtime}>
+        <DataKindRegistryProvider>
+          <RegisterProbe record={registryRecord({ ownerExtensionId: 'ext.transcript' })} />
+          <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={PPS} />
+        </DataKindRegistryProvider>
+      </VideoEditorRuntimeContext.Provider>,
+    );
+
+    const info = await screen.findByRole('button', { name: 'Extension owner: Transcript' });
+    expect(info).toHaveClass('opacity-0', 'group-hover:opacity-100', 'group-focus-within:opacity-100');
+    fireEvent.focus(info);
+    expect(await screen.findByText('This belongs to the Transcript extension.')).toBeInTheDocument();
+    expect(info).toHaveClass('focus-visible:ring-2');
+
+    view.unmount();
+    render(
+      <VideoEditorRuntimeContext.Provider value={runtime}>
+        <DataKindRegistryProvider>
+          <RegisterProbe record={registryRecord({ ownerExtensionId: undefined })} />
+          <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={PPS} />
+        </DataKindRegistryProvider>
+      </VideoEditorRuntimeContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('data-lane-row')).toBeInTheDocument());
+    expect(screen.queryByTestId('data-lane-owner-info')).not.toBeInTheDocument();
+  });
+
+  it('opens the shared extension manager from ownership info without selecting the lane or starting a row gesture', async () => {
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+    const onOpenExtensionManager = vi.fn();
+    const setInspectorTarget = vi.fn();
+    const setContextTarget = vi.fn();
+    const parentPointerDown = vi.fn();
+    const runtime = {
+      extensionRuntime: { extensions: [{ manifest: { id: 'ext.transcript', label: 'Transcript' } }] },
+    } as unknown as VideoEditorRuntimeContextValue;
+
+    render(
+      <div onPointerDown={parentPointerDown}>
+        <VideoEditorRuntimeContext.Provider value={runtime}>
+          <DataKindRegistryProvider>
+            <RegisterProbe record={registryRecord({ ownerExtensionId: 'ext.transcript' })} />
+            <DataLaneList startLeft={START_LEFT}
+              data={data}
+              pixelsPerSecond={PPS}
+              sortable
+              onOpenExtensionManager={onOpenExtensionManager}
+              setInspectorTarget={setInspectorTarget}
+              setContextTarget={setContextTarget}
+            />
+          </DataKindRegistryProvider>
+        </VideoEditorRuntimeContext.Provider>
+      </div>,
+    );
+
+    const info = await screen.findByRole('button', { name: 'Extension owner: Transcript' });
+    fireEvent.pointerDown(info, { pointerId: 9, button: 0 });
+    expect(parentPointerDown).not.toHaveBeenCalled();
+    fireEvent.click(info);
+
+    expect(onOpenExtensionManager).toHaveBeenCalledTimes(1);
+    expect(setInspectorTarget).not.toHaveBeenCalled();
+    expect(setContextTarget).not.toHaveBeenCalled();
+  });
+
+  it('keeps sortable lane rows visible without exposing a reorder handle in read-only mode', () => {
+    const data = buildData([laneView({ laneRenderer: () => null, height: 48 })]);
+
+    render(
+      <DndContext>
+        <SortableContext items={['data-lane-transcript']}>
+          <DataLaneList startLeft={START_LEFT}
+            data={data}
+            laneId="transcript"
+            sortable
+            readOnly
+            pixelsPerSecond={PPS}
+          />
+        </SortableContext>
+      </DndContext>,
+    );
+
+    const row = screen.getByTestId('data-lane-row');
+    expect(row).toBeInTheDocument();
+    expect(row).toHaveStyle({ height: '48px' });
+    expect(row.className).toContain('border-b border-border');
+    const header = within(row).getByTestId('data-lane-header');
+    expect(header).toHaveClass('h-9', 'text-xs', 'text-foreground', 'bg-card/60', 'border-b', 'border-border');
+    expect(within(row).getByTestId('data-lane-bottom-divider')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reorder Transcript row' })).not.toBeInTheDocument();
+  });
+
+  it('renders a row for a registered kind and passes SDK renderer props', () => {
+    const seen: DataLaneRendererProps[] = [];
+    const data = buildData([
+      laneView({
+        items: [{ item: item('a:c1:0'), timelineStart: 10, timelineEnd: 12, clipId: 'c1' }],
+        laneRenderer: (props: DataLaneRendererProps) => {
+          seen.push(props);
+          return <div data-testid="lane-renderer-body">body</div>;
+        },
+      }),
+    ]);
+
+    const { container } = renderList({ data });
+
+    expect(screen.getByTestId('data-lane-list')).toBeTruthy();
+    expect(screen.getByTestId('data-lane-row')).toBeTruthy();
+    expect(screen.getByTestId('lane-renderer-body')).toBeTruthy();
+    // The host may re-render (e.g. registry snapshot updates); every pass
+    // must receive the same SDK props.
+    expect(seen.length).toBeGreaterThanOrEqual(1);
+    const props = seen[seen.length - 1];
+    expect(props.kindId).toBe('transcript');
+    expect(props.schemaRef).toBe('astrid.transcript_segment/v1');
+    expect(props.shape).toBe('interval');
+    expect(props.items).toEqual([
+      {
+        id: 'a:c1:0',
+        timelineStart: 10,
+        timelineEnd: 12,
+        clipId: 'c1',
+        provenance: { adapterId: 'astrid.adaptTranscript', adapterVersion: '1' },
+        payload: { text: 'a:c1:0' },
+      },
+    ]);
+    expect(props.itemWindow).toEqual({ startIndex: 0, endIndex: 1, totalItemCount: 1 });
+    expect(props.activeItemId).toBe('a:c1:0');
+    expect(typeof props.onNavigateItem).toBe('function');
+    // Rework R1/R3: the host-supplied viewport geometry and item-selection
+    // callback ride the same SDK props contract. Rows are timeline-zero-
+    // origin, so renderer props always carry startLeft: 0.
+    expect(props.startLeft).toBe(0);
+    expect(props.pixelsPerSecond).toBe(PPS);
+    expect(typeof props.onSelectItem).toBe('function');
+    // Hidden lanes never render.
+    expect(container.querySelectorAll('[data-testid="data-lane-row"]')).toHaveLength(1);
+  });
+
+  it('forwards only the host-selected item in this lane and clears an explicit selection', () => {
+    const seen: DataLaneRendererProps[] = [];
+    const data = buildData([laneView({
+      items: [{ item: item('segment-a'), timelineStart: 0, timelineEnd: 1 }],
+      laneRenderer: (props: DataLaneRendererProps) => {
+        seen.push(props);
+        return null;
+      },
+    })]);
+    const base = { data, pixelsPerSecond: PPS };
+    const view = renderList({
+      ...base,
+      selectedTarget: { kind: 'dataItem', laneId: 'transcript', itemId: 'segment-a' },
+    });
+    expect(seen.at(-1)?.selectedItemId).toBe('segment-a');
+
+    view.rerender(<DataLaneList {...base} selectedTarget={null} />);
+    expect(seen.at(-1)?.selectedItemId).toBeNull();
+    view.rerender(<DataLaneList {...base} selectedTarget={{ kind: 'dataItem', laneId: 'another-lane', itemId: 'segment-a' }} />);
+    expect(seen.at(-1)?.selectedItemId).toBeNull();
+    view.rerender(<DataLaneList {...base} />);
+    expect(seen.at(-1)?.selectedItemId).toBeUndefined();
+  });
+
+  it('propagates host-authored source identity and provenance without parsing occurrence ids', () => {
+    const seen: DataLaneRendererProps[] = [];
+    const sourceAwareItem = {
+      ...item('occurrence@clip-7'),
+      sourceItemId: 'source-stable-42',
+      sourceArtifactRef: { assetId: 'asset-7', artifactHash: 'sha256:abc' },
+      provenance: {
+        adapterId: 'astrid.transcript.bridge',
+        adapterVersion: '2',
+        recordedAt: '2026-08-23T12:00:00Z',
+      },
+    } as FrozenDataItem;
+    const data = buildData([
+      laneView({
+        items: [{ item: sourceAwareItem, timelineStart: 4, timelineEnd: 5, clipId: 'clip-7' }],
+        laneRenderer: (props: DataLaneRendererProps) => {
+          seen.push(props);
+          return null;
+        },
+      }),
+    ]);
+
+    renderList({ data });
+
+    expect(seen.at(-1)?.items[0]).toMatchObject({
+      id: 'occurrence@clip-7',
+      sourceItemId: 'source-stable-42',
+      sourceArtifactRef: { assetId: 'asset-7', artifactHash: 'sha256:abc' },
+      provenance: {
+        adapterId: 'astrid.transcript.bridge',
+        adapterVersion: '2',
+        recordedAt: '2026-08-23T12:00:00Z',
+      },
+    });
+  });
+
+  it('marks every playing occurrence by host occurrence id, including duplicate source ids across assets', async () => {
+    const timelineView = createTimelineViewStore();
+    timelineView.publish({ playhead: { time: 1.5, isPlaying: true } });
+    const seen: DataLaneRendererProps[] = [];
+    const makeOccurrence = (id: string, assetId: string, clipId: string, start: number, end: number) => ({
+      item: {
+        ...item(id),
+        sourceItemId: 'logical-segment-7',
+        sourceArtifactRef: { assetId },
+      } as FrozenDataItem,
+      timelineStart: start,
+      timelineEnd: end,
+      clipId,
+    });
+    const data = buildData([laneView({
+      items: [
+        makeOccurrence('logical-segment-7@clip-a', 'asset-a', 'clip-a', 0, 2),
+        makeOccurrence('logical-segment-7@clip-b', 'asset-b', 'clip-b', 1, 3),
+      ],
+      laneRenderer: (props: DataLaneRendererProps) => {
+        seen.push(props);
+        return null;
+      },
+    })]);
+
+    renderList({ data, timelineViewStore: timelineView });
+
+    await waitFor(() => {
+      expect(seen.at(-1)?.playingItemIds).toEqual([
+        'logical-segment-7@clip-a',
+        'logical-segment-7@clip-b',
+      ]);
+    });
+    expect(seen.at(-1)?.items.map((view) => [view.id, view.clipId, view.sourceArtifactRef?.assetId])).toEqual([
+      ['logical-segment-7@clip-a', 'clip-a', 'asset-a'],
+      ['logical-segment-7@clip-b', 'clip-b', 'asset-b'],
+    ]);
+
+    act(() => timelineView.publish({ playhead: { time: 2.5, isPlaying: true } }));
+    await waitFor(() => expect(seen.at(-1)?.playingItemIds).toEqual(['logical-segment-7@clip-b']));
+    act(() => timelineView.publish({ playhead: { time: 2.5, isPlaying: false } }));
+    await waitFor(() => expect(seen.at(-1)?.playingItemIds).toEqual([]));
+    timelineView.dispose();
+  });
+
+  it('renders nothing for a renderer-less registered kind (host cannot paint)', () => {
+    const data = buildData([laneView({ laneRenderer: undefined })]);
+
+    const { container } = renderList({ data });
+
+    expect(container.querySelector('[data-testid="data-lane-list"]')).toBeNull();
+    expect(container.querySelector('[data-testid="data-lane-row"]')).toBeNull();
+  });
+
+  it('renders null when there are no lanes at all', () => {
+    const { container } = renderList({ data: buildData([]) });
+    expect(container.querySelector('[data-testid="data-lane-list"]')).toBeNull();
+
+    const { container: emptyContainer } = renderList({ data: null });
+    expect(emptyContainer.querySelector('[data-testid="data-lane-list"]')).toBeNull();
+  });
+
+  it('paints host extent bars for an opaque lane at the shared scale mapping', () => {
+    const data = buildData([
+      laneView({
+        laneId: 'opaque:unknown.schema/v1',
+        kindId: '',
+        label: 'unknown.schema/v1',
+        opaque: true,
+        items: [
+          { item: item('a:c1:0'), timelineStart: 1, timelineEnd: 3, clipId: 'c1' },
+          { item: item('b:c2:0'), timelineStart: 5, timelineEnd: 5.02, clipId: 'c2' },
+        ],
+      }),
+    ]);
+
+    renderList({ data });
+
+    const row = screen.getByTestId('data-lane-row');
+    expect(row.getAttribute('data-lane-kind')).toBe('opaque');
+
+    const bars = within(row).getAllByTestId('data-lane-extent-bar');
+    expect(bars).toHaveLength(2);
+    // left = timelineStart * pixelsPerSecond (row canvas origin IS t=0)
+    expect(bars[0].style.left).toBe(`${1 * PPS}px`);
+    expect(bars[0].style.width).toBe(`${2 * PPS}px`);
+    // Sub-minimum spans clamp to the 2px floor.
+    expect((bars[1] as HTMLElement).style.width).toBe('2px');
+  });
+
+  it.each([500, 5_000, 50_000])(
+    'keeps the %i-item lane inside the constant DOM performance budget',
+    (itemCount) => {
+      const data = buildData([
+        laneView({
+          laneId: 'opaque:large.schema/v1',
+          kindId: '',
+          label: 'large.schema/v1',
+          opaque: true,
+          items: Array.from({ length: itemCount }, (_, index) => ({
+            item: item(`item-${index}`),
+            timelineStart: index,
+            timelineEnd: index + 0.25,
+          })),
+        }),
+      ]);
+
+      renderList({ data, pixelsPerSecond: 1 });
+
+      const row = screen.getByTestId('data-lane-row');
+      expect(within(row).getAllByTestId('data-lane-extent-bar')).toHaveLength(DATA_LANE_DOM_ITEM_BUDGET);
+      expect(row).toHaveAttribute('data-total-items', String(itemCount));
+      expect(row).toHaveAttribute('data-window-start', '0');
+      expect(row).toHaveAttribute('data-window-end', String(DATA_LANE_DOM_ITEM_BUDGET));
+      expect(Number(row.getAttribute('data-total-items'))).toBe(itemCount);
+    },
+  );
+
+  it.each([500, 5_000, 50_000])(
+    'mounts late-time ids and removes early ids after a real viewport move in a %i-item lane',
+    (itemCount) => {
+      const pixelsPerSecond = 4;
+      const clientWidth = START_LEFT + 256;
+      const items = Array.from({ length: itemCount }, (_, index) => ({
+        item: item(`item-${index}`),
+        timelineStart: index * 2,
+        timelineEnd: index * 2 + 0.5,
+      }));
+      const data = buildData([laneView({
+        laneId: 'opaque:late.schema/v1',
+        kindId: '',
+        opaque: true,
+        items,
+      })]);
+      const view = renderList({
+        data,
+        pixelsPerSecond,
+        viewport: { scrollLeft: 0, clientWidth },
+      });
+
+      const row = screen.getByTestId('data-lane-row');
+      expect(within(row).getByTitle('item-0')).toBeTruthy();
+      const lateIndex = itemCount - 25;
+      const lateScrollLeft = items[lateIndex].timelineStart * pixelsPerSecond;
+      view.rerender(
+        <DataLaneList startLeft={START_LEFT}
+          data={data}
+          pixelsPerSecond={pixelsPerSecond}
+          viewport={{ scrollLeft: lateScrollLeft, clientWidth }}
+        />,
+      );
+
+      expect(within(row).getByTitle(`item-${lateIndex}`)).toBeTruthy();
+      expect(within(row).queryByTitle('item-0')).toBeNull();
+      expect(within(row).getAllByTestId('data-lane-extent-bar').length)
+        .toBeLessThanOrEqual(DATA_LANE_DOM_ITEM_BUDGET);
+      expect(Number(row.getAttribute('data-window-start'))).toBeGreaterThan(0);
+      expect(Number(row.getAttribute('data-viewport-start'))).toBe(items[lateIndex].timelineStart);
+    },
+  );
+
+  it('keeps visible sparse items and biases the bounded runway in scroll direction', () => {
+    const pixelsPerSecond = 10;
+    const clientWidth = START_LEFT + 100;
+    const items = Array.from({ length: 1_000 }, (_, index) => ({
+      item: item(`direction-${index}`),
+      timelineStart: index / 2,
+      timelineEnd: index / 2 + 0.25,
+    }));
+    const lane = laneView({
+      laneId: 'directional-sparse',
+      kindId: 'directional-sparse',
+      items,
+    }) as unknown as DataLaneView;
+    const renderLane = (scrollDirection: 'backward' | 'forward') => render(
+      <DataLaneRow labelWidth={START_LEFT}
+        lane={lane}
+        pixelsPerSecond={pixelsPerSecond}
+        supportsSparseItemWindows
+        viewport={{ scrollLeft: 1_000, clientWidth, scrollDirection }}
+      />,
+    );
+
+    const forward = renderLane('forward');
+    const forwardIds = within(screen.getByTestId('data-lane-row'))
+      .getAllByTestId('data-lane-extent-bar')
+      .map((bar) => bar.getAttribute('data-item-id'));
+    expect(forwardIds).toContain('direction-200');
+    expect(forwardIds).toContain('direction-220');
+    expect(forwardIds).toContain('direction-300');
+    expect(forwardIds).not.toContain('direction-50');
+    forward.unmount();
+
+    const backward = renderLane('backward');
+    const backwardIds = within(screen.getByTestId('data-lane-row'))
+      .getAllByTestId('data-lane-extent-bar')
+      .map((bar) => bar.getAttribute('data-item-id'));
+    expect(backwardIds).toContain('direction-200');
+    expect(backwardIds).toContain('direction-220');
+    expect(backwardIds).toContain('direction-100');
+    expect(backwardIds).not.toContain('direction-50');
+    expect(backwardIds).not.toContain('direction-300');
+  });
+
+  it('includes overlapping, zero-duration, and exact overscan-boundary items', () => {
+    const pixelsPerSecond = 10;
+    const viewport = { scrollLeft: 5_000, clientWidth: START_LEFT + 100 };
+    const overscanSeconds = DATA_LANE_VIEWPORT_OVERSCAN_PX / pixelsPerSecond;
+    const queryStart = viewport.scrollLeft / pixelsPerSecond - overscanSeconds;
+    const queryEnd = (viewport.scrollLeft + viewport.clientWidth - START_LEFT) / pixelsPerSecond
+      + overscanSeconds;
+    const data = buildData([laneView({
+      laneId: 'opaque:edge.schema/v1',
+      kindId: '',
+      opaque: true,
+      items: [
+        { item: item('long-overlap'), timelineStart: 0, timelineEnd: 1_000 },
+        { item: item('ends-at-left-boundary'), timelineStart: queryStart - 10, timelineEnd: queryStart },
+        { item: item('zero-at-visible-start'), timelineStart: 500, timelineEnd: 500 },
+        { item: item('overlap-visible'), timelineStart: 505, timelineEnd: 507 },
+        { item: item('zero-at-visible-end'), timelineStart: 510, timelineEnd: 510 },
+        { item: item('starts-at-right-boundary'), timelineStart: queryEnd, timelineEnd: queryEnd + 4 },
+        { item: item('after-right-boundary'), timelineStart: queryEnd + 0.01, timelineEnd: queryEnd + 1 },
+      ],
+    })]);
+
+    renderList({ data, pixelsPerSecond, viewport });
+
+    const ids = within(screen.getByTestId('data-lane-row'))
+      .getAllByTestId('data-lane-extent-bar')
+      .map((bar) => bar.getAttribute('data-item-id'));
+    expect(ids).toEqual(expect.arrayContaining([
+      'long-overlap',
+      'ends-at-left-boundary',
+      'zero-at-visible-start',
+      'overlap-visible',
+      'zero-at-visible-end',
+      'starts-at-right-boundary',
+    ]));
+    expect(ids).not.toContain('after-right-boundary');
+  });
+
+  it('keeps an ancient spanning interval when dense expired history exceeds the DOM budget', () => {
+    const pixelsPerSecond = 10;
+    const viewportStart = 50_000;
+    const clientWidth = START_LEFT + 100;
+    const expired = Array.from({ length: 49_800 }, (_, index) => ({
+      item: item(`expired-${index}`),
+      timelineStart: index + 1,
+      timelineEnd: index + 1.01,
+    }));
+    const denseVisible = Array.from({ length: 256 }, (_, index) => ({
+      item: item(`visible-${index}`),
+      timelineStart: viewportStart - 5 + index * 0.05,
+      timelineEnd: viewportStart - 4.98 + index * 0.05,
+    }));
+    const data = buildData([laneView({
+      laneId: 'opaque:spanning.schema/v1',
+      kindId: '',
+      opaque: true,
+      items: [
+        { item: item('ancient-spanning'), timelineStart: 0, timelineEnd: 100_000 },
+        ...expired,
+        ...denseVisible,
+      ],
+    })]);
+
+    renderList({
+      data,
+      pixelsPerSecond,
+      viewport: { scrollLeft: viewportStart * pixelsPerSecond, clientWidth },
+    });
+
+    const row = screen.getByTestId('data-lane-row');
+    const bars = within(row).getAllByTestId('data-lane-extent-bar');
+    expect(bars).toHaveLength(DATA_LANE_DOM_ITEM_BUDGET);
+    expect(within(row).getByTitle('ancient-spanning')).toBeTruthy();
+    expect(bars.some((bar) => bar.getAttribute('data-item-id')?.startsWith('visible-'))).toBe(true);
+    expect(within(row).queryByTitle('expired-25000')).toBeNull();
+  });
+
+  it('selects the deterministic top 128 from 50k simultaneous overlaps', () => {
+    const itemCount = 50_000;
+    const items = Array.from({ length: itemCount }, (_, index) => ({
+      item: item(`overlap-${String(index).padStart(5, '0')}`),
+      timelineStart: 0,
+      // The permutation exercises heap replacement while the repeated 257
+      // duration ranks exercise the canonical id tie-breaker.
+      timelineEnd: 1_000 + ((index * 7_919) % 257),
+    }));
+    const expectedIndices = Array.from({ length: itemCount }, (_, index) => index)
+      .sort((left, right) => (
+        (items[right].timelineEnd - items[left].timelineEnd)
+        || (items[left].item.id < items[right].item.id ? -1 : 1)
+      ))
+      .slice(0, DATA_LANE_DOM_ITEM_BUDGET)
+      .sort((left, right) => left - right);
+    const data = buildData([laneView({
+      laneId: 'opaque:all-overlap.schema/v1',
+      kindId: '',
+      opaque: true,
+      items,
+    })]);
+
+    renderList({
+      data,
+      pixelsPerSecond: 1,
+      viewport: { scrollLeft: 500, clientWidth: START_LEFT + 100 },
+    });
+
+    const bars = within(screen.getByTestId('data-lane-row')).getAllByTestId('data-lane-extent-bar');
+    expect(bars).toHaveLength(DATA_LANE_DOM_ITEM_BUDGET);
+    expect(bars.map((bar) => bar.getAttribute('data-item-id'))).toEqual(
+      expectedIndices.map((index) => `overlap-${String(index).padStart(5, '0')}`),
+    );
+  });
+
+  it('recomputes the temporal window for zoom and viewport resize', () => {
+    const items = Array.from({ length: 300 }, (_, index) => ({
+      item: item(`item-${index}`),
+      timelineStart: index * 10,
+      timelineEnd: index * 10 + 1,
+    }));
+    const data = buildData([laneView({
+      laneId: 'opaque:zoom.schema/v1',
+      kindId: '',
+      opaque: true,
+      items,
+    })]);
+    const view = renderList({
+      data,
+      pixelsPerSecond: 10,
+      viewport: { scrollLeft: 10_000, clientWidth: START_LEFT + 100 },
+    });
+    const row = screen.getByTestId('data-lane-row');
+    expect(within(row).getByTitle('item-100')).toBeTruthy();
+    expect(within(row).queryByTitle('item-50')).toBeNull();
+
+    view.rerender(
+      <DataLaneList startLeft={START_LEFT}
+        data={data}
+        pixelsPerSecond={20}
+        viewport={{ scrollLeft: 10_000, clientWidth: START_LEFT + 100 }}
+      />,
+    );
+    expect(within(row).getByTitle('item-50')).toBeTruthy();
+    expect(within(row).queryByTitle('item-100')).toBeNull();
+
+    view.rerender(
+      <DataLaneList startLeft={START_LEFT}
+        data={data}
+        pixelsPerSecond={20}
+        viewport={{ scrollLeft: 10_000, clientWidth: START_LEFT + 2_100 }}
+      />,
+    );
+    expect(within(row).getByTitle('item-60')).toBeTruthy();
+  });
+
+  it('scrolls Home, End, and arrow keyboard targets into view before restoring focus', async () => {
+    const pixelsPerSecond = 4;
+    const clientWidth = START_LEFT + 64;
+    const items = Array.from({ length: 500 }, (_, index) => ({
+      item: item(`item-${index}`),
+      timelineStart: index * 2,
+      timelineEnd: index * 2 + 0.5,
+    }));
+    const lane = laneView({
+      laneId: 'opaque:keyboard.schema/v1',
+      kindId: '',
+      opaque: true,
+      items,
+    }) as unknown as DataLaneView;
+    const onSelectItem = vi.fn();
+    const requested = vi.fn();
+
+    function KeyboardHarness() {
+      const [viewport, setViewport] = useState({ scrollLeft: 0, clientWidth });
+      return (
+        <DataLaneRow labelWidth={START_LEFT}
+          lane={lane}
+          pixelsPerSecond={pixelsPerSecond}
+          viewport={viewport}
+          onRequestItemIntoView={(timelineStart, timelineEnd) => {
+            requested(timelineStart, timelineEnd);
+            setViewport({ scrollLeft: timelineStart * pixelsPerSecond, clientWidth });
+          }}
+          onSelectItem={onSelectItem}
+        />
+      );
+    }
+
+    render(<KeyboardHarness />);
+    const first = screen.getByTitle('item-0');
+    first.focus();
+    fireEvent.keyDown(first, { key: 'End' });
+    const last = await screen.findByTitle('item-499');
+    expect(last).toHaveFocus();
+    expect(requested).toHaveBeenLastCalledWith(998, 998.5);
+    expect(screen.queryByTitle('item-0')).toBeNull();
+
+    fireEvent.keyDown(last, { key: 'ArrowLeft' });
+    const previous = await screen.findByTitle('item-498');
+    expect(previous).toHaveFocus();
+    fireEvent.keyDown(previous, { key: 'Home' });
+    expect(await screen.findByTitle('item-0')).toHaveFocus();
+    expect(onSelectItem.mock.calls).toEqual([['item-499'], ['item-498'], ['item-0']]);
+  });
+
+  it('keeps the focused End target mounted when dense sparse overlaps exceed the DOM budget', async () => {
+    const pixelsPerSecond = 10;
+    const initialCanvasWidth = 10;
+    const targetCanvasWidth = 1_000;
+    const items = Array.from({ length: 566 }, (_, index) => ({
+      item: item(`overlap-${index}`),
+      timelineStart: index * 0.75,
+      timelineEnd: index * 0.75 + 0.01,
+    }));
+    const lane = laneView({
+      laneId: 'opaque:keyboard-overlap.schema/v1',
+      kindId: '',
+      opaque: true,
+      items,
+    }) as unknown as DataLaneView;
+
+    function KeyboardOverlapHarness() {
+      const [viewport, setViewport] = useState({
+        scrollLeft: 0,
+        clientWidth: START_LEFT + initialCanvasWidth,
+      });
+      return (
+        <DataLaneRow labelWidth={START_LEFT}
+          lane={lane}
+          pixelsPerSecond={pixelsPerSecond}
+          viewport={viewport}
+          onRequestItemIntoView={(_timelineStart, timelineEnd) => {
+            // Match TimelineCanvas: put a late target against the viewport's
+            // right edge, where the nearest-128 sparse ranker used to evict it.
+            setViewport({
+              scrollLeft: Math.max(0, timelineEnd * pixelsPerSecond - targetCanvasWidth),
+              clientWidth: START_LEFT + targetCanvasWidth,
+            });
+          }}
+        />
+      );
+    }
+
+    render(<KeyboardOverlapHarness />);
+    const first = screen.getByTitle('overlap-0');
+    first.focus();
+    fireEvent.keyDown(first, { key: 'End' });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const last = screen.getByTitle('overlap-565');
+    expect(last).toHaveFocus();
+    expect(screen.getAllByTestId('data-lane-extent-bar')).toHaveLength(DATA_LANE_DOM_ITEM_BUDGET);
+  });
+
+  it.each([5_000, 50_000])(
+    'preserves the selected interval by id across reorder and uses a nearest fallback when removed (%i items)',
+    (itemCount) => {
+      const targetIndex = Math.floor(itemCount / 2);
+      const pixelsPerSecond = 4;
+      const targetTime = targetIndex * 2;
+      const viewport = {
+        scrollLeft: targetTime * pixelsPerSecond - 32,
+        clientWidth: START_LEFT + 64,
+      };
+      const items = Array.from({ length: itemCount }, (_, index) => ({
+        item: item(`stable-${index}`),
+        timelineStart: index * 2,
+        timelineEnd: index * 2 + 0.5,
+      }));
+      const renderLane = (nextItems: typeof items) => ({
+        ...laneView({
+          laneId: 'opaque:stable-selection.schema/v1',
+          kindId: '',
+          opaque: true,
+          items: nextItems,
+        }),
+      }) as unknown as DataLaneView;
+
+      const view = render(
+        <DataLaneRow labelWidth={START_LEFT}
+          lane={renderLane(items)}
+          pixelsPerSecond={pixelsPerSecond}
+          viewport={viewport}
+        />,
+      );
+      fireEvent.click(screen.getByTitle(`stable-${targetIndex}`));
+      expect(screen.getByTitle(`stable-${targetIndex}`)).toHaveAttribute('tabindex', '0');
+
+      // The host can receive the same logical lane in a new order. The
+      // selected id remains active even though its absolute index shifts.
+      const reordered = [
+        {
+          item: item('stable-inserted'),
+          timelineStart: -2,
+          timelineEnd: -1.5,
+        },
+        ...items,
+      ].reverse();
+      view.rerender(
+        <DataLaneRow labelWidth={START_LEFT}
+          lane={renderLane(reordered)}
+          pixelsPerSecond={pixelsPerSecond}
+          viewport={viewport}
+        />,
+      );
+      expect(screen.getByTitle(`stable-${targetIndex}`)).toHaveAttribute('tabindex', '0');
+
+      // Once the selected id disappears, fall back to the nearest surviving
+      // item at the reconciled index rather than leaving selection stale.
+      const withoutSelected = reordered.filter((view) => view.item.id !== `stable-${targetIndex}`);
+      view.rerender(
+        <DataLaneRow labelWidth={START_LEFT}
+          lane={renderLane(withoutSelected)}
+          pixelsPerSecond={pixelsPerSecond}
+          viewport={viewport}
+        />,
+      );
+      expect(screen.queryByTitle(`stable-${targetIndex}`)).toBeNull();
+      expect(screen.getByTitle(`stable-${targetIndex + 1}`)).toHaveAttribute('tabindex', '0');
+    },
+  );
+
+  it('bounds render work and materializes a 50k full lane once, only on action invocation', async () => {
+    const itemCount = 50_000;
+    let payloadReads = 0;
+    let rendererCalls = 0;
+    const items = Array.from({ length: itemCount }, (_, index) => {
+      const laneItem = item(`item-${index}`) as FrozenDataItem;
+      Object.defineProperty(laneItem, 'payload', {
+        configurable: true,
+        get: () => {
+          payloadReads += 1;
+          return { index };
+        },
+      });
+      return { item: laneItem, timelineStart: index, timelineEnd: index + 0.25 };
+    });
+    const lane = laneView({
+      items,
+      laneRenderer: (props: DataLaneRendererProps) => {
+        rendererCalls += 1;
+        return <div data-testid="budget-renderer">{props.items.length}</div>;
+      },
+    }) as unknown as DataLaneView;
+    const invoke = vi.fn();
+    const actions = [{ id: 'all', label: 'All', invoke }];
+    const view = render(
+      <DataLaneRow labelWidth={START_LEFT}
+        lane={lane}
+        pixelsPerSecond={1}
+        viewport={{ scrollLeft: 0, clientWidth: START_LEFT + 128 }}
+        laneActions={actions}
+      />,
+    );
+    const scrollUpdates = 24;
+    for (let update = 1; update <= scrollUpdates; update += 1) {
+      view.rerender(
+        <DataLaneRow labelWidth={START_LEFT}
+          lane={lane}
+          pixelsPerSecond={1}
+          viewport={{ scrollLeft: update * 500, clientWidth: START_LEFT + 128 }}
+          laneActions={actions}
+        />,
+      );
+    }
+    expect(rendererCalls).toBeLessThanOrEqual(scrollUpdates + 2);
+    expect(payloadReads).toBeLessThanOrEqual((scrollUpdates + 2) * DATA_LANE_DOM_ITEM_BUDGET);
+    expect(screen.getByTestId('budget-renderer')).toHaveTextContent(String(DATA_LANE_DOM_ITEM_BUDGET));
+
+    const readsBeforeAction = payloadReads;
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'All' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+    expect(invoke.mock.calls[0][0]).toHaveLength(itemCount);
+    expect(payloadReads - readsBeforeAction).toBe(itemCount);
+
+    const readsAfterAction = payloadReads;
+    view.rerender(
+      <DataLaneRow labelWidth={START_LEFT}
+        lane={lane}
+        pixelsPerSecond={1}
+        viewport={{ scrollLeft: 20_000, clientWidth: START_LEFT + 128 }}
+        laneActions={actions}
+      />,
+    );
+    expect(payloadReads - readsAfterAction).toBeLessThanOrEqual(DATA_LANE_DOM_ITEM_BUDGET);
+  });
+
+  it('contains a crashing laneRenderer inside the error boundary without losing sibling lanes', () => {
+    const data = buildData([
+      laneView({
+        laneId: 'broken',
+        kindId: 'broken',
+        laneRenderer: () => {
+          throw new Error('renderer crash');
+        },
+      }),
+      laneView({
+        laneId: 'healthy',
+        kindId: 'healthy',
+        label: 'Healthy',
+        items: [{ item: item('h:0'), timelineStart: 0, timelineEnd: 1 }],
+        laneRenderer: () => <div data-testid="healthy-lane">ok</div>,
+      }),
+    ]);
+
+    renderList({ data });
+
+    expect(screen.getByRole('alert')).toBeTruthy();
+    expect(screen.getByTestId('healthy-lane')).toBeTruthy();
+    expect(screen.getAllByTestId('data-lane-row')).toHaveLength(2);
+  });
+
+  it('resolves the owning extension id through the registry snapshot; domain comes from the lane view', () => {
+    const seen: DataLaneRendererProps[] = [];
+    // The record declares a DIFFERENT domain than the assembled view: paint
+    // must trust the view (assembly-time copy), never re-lookup the registry.
+    const record = registryRecord({ domain: 'frames' });
+    const data = buildData([
+      laneView({
+        domain: 'source_seconds',
+        laneRenderer: (props: DataLaneRendererProps) => {
+          seen.push(props);
+          return null;
+        },
+      }),
+    ]);
+
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={record} />
+        <DataLaneList data={data} startLeft={START_LEFT} pixelsPerSecond={PPS} />
+      </DataKindRegistryProvider>,
+    );
+
+    expect(seen.length).toBeGreaterThanOrEqual(1);
+    // Domain is the view's assembly-time copy, not the registry's.
+    expect(seen[seen.length - 1].domain).toBe('source_seconds');
+  });
+
+  it('gives opted-in registered renderers sparse absolute indices', () => {
+    const seen: DataLaneRendererProps[] = [];
+    const renderer = (props: DataLaneRendererProps) => {
+      seen.push(props);
+      return null;
+    };
+    const data = buildData([laneView({
+      items: [
+        { item: item('ancient-spanning'), timelineStart: 0, timelineEnd: 1_000 },
+        ...Array.from({ length: 300 }, (_, index) => ({
+          item: item(`expired-${index}`),
+          timelineStart: index + 1,
+          timelineEnd: index + 1.1,
+        })),
+        ...Array.from({ length: 160 }, (_, index) => ({
+          item: item(`current-${index}`),
+          timelineStart: 500 + index * 0.01,
+          timelineEnd: 500 + index * 0.01 + 0.005,
+        })),
+      ],
+      laneRenderer: renderer,
+    })]);
+
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={registryRecord({
+          laneRenderer: renderer,
+          supportsSparseItemWindows: true,
+        })} />
+        <DataLaneList startLeft={START_LEFT}
+          data={data}
+          pixelsPerSecond={10}
+          viewport={{ scrollLeft: 5_000, clientWidth: START_LEFT + 100 }}
+        />
+      </DataKindRegistryProvider>,
+    );
+
+    const props = seen.at(-1)!;
+    expect(props.items).toHaveLength(DATA_LANE_DOM_ITEM_BUDGET);
+    expect(props.itemWindow?.itemIndices).toHaveLength(DATA_LANE_DOM_ITEM_BUDGET);
+    expect(props.itemWindow?.itemIndices?.[0]).toBe(0);
+    expect(props.itemWindow!.endIndex - props.itemWindow!.startIndex).toBeGreaterThan(props.items.length);
+    expect(props.items[0].id).toBe('ancient-spanning');
+    expect(props.items.some((renderItem) => renderItem.id.startsWith('current-'))).toBe(true);
+  });
+
+  it('preserves the contiguous window contract for legacy registered renderers', () => {
+    const seen: DataLaneRendererProps[] = [];
+    const renderer = (props: DataLaneRendererProps) => {
+      seen.push(props);
+      return null;
+    };
+    const data = buildData([laneView({
+      items: [
+        { item: item('ancient-spanning'), timelineStart: 0, timelineEnd: 1_000 },
+        ...Array.from({ length: 500 }, (_, index) => ({
+          item: item(`item-${index}`),
+          timelineStart: index + 1,
+          timelineEnd: index + 1.1,
+        })),
+      ],
+      laneRenderer: renderer,
+    })]);
+
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={registryRecord({ laneRenderer: renderer })} />
+        <DataLaneList startLeft={START_LEFT}
+          data={data}
+          pixelsPerSecond={10}
+          viewport={{ scrollLeft: 4_900, clientWidth: START_LEFT + 100 }}
+        />
+      </DataKindRegistryProvider>,
+    );
+
+    const props = seen.at(-1)!;
+    expect(props.items.length).toBeLessThanOrEqual(DATA_LANE_DOM_ITEM_BUDGET);
+    expect(props.itemWindow?.itemIndices).toBeUndefined();
+    expect(props.itemWindow!.endIndex - props.itemWindow!.startIndex).toBe(props.items.length);
+    expect(props.items.some((renderItem) => renderItem.id.startsWith('item-48'))).toBe(true);
+    expect(props.items[0].id).not.toBe('ancient-spanning');
+  });
+
+  it('dispatches a dataItem target when an extent bar is pressed', () => {
+    const setContextTarget = vi.fn();
+    const setInspectorTarget = vi.fn();
+    const data = buildData([
+      laneView({
+        laneId: 'opaque:unknown.schema/v1',
+        kindId: '',
+        label: 'unknown.schema/v1',
+        opaque: true,
+        items: [{ item: item('a:c1:0'), timelineStart: 1, timelineEnd: 3, clipId: 'c1' }],
+      }),
+    ]);
+
+    renderList({ data, setContextTarget, setInspectorTarget });
+
+    fireEvent.click(screen.getByTestId('data-lane-extent-bar'));
+
+    const expected = {
+      kind: 'dataItem',
+      laneId: 'opaque:unknown.schema/v1',
+      itemId: 'a:c1:0',
+      extensionId: undefined,
+      contributionId: undefined,
+    };
+    expect(setContextTarget).toHaveBeenCalledTimes(1);
+    expect(setContextTarget).toHaveBeenCalledWith(expected);
+    expect(setInspectorTarget).toHaveBeenCalledTimes(1);
+    expect(setInspectorTarget).toHaveBeenCalledWith(expected);
+  });
+
+  it('dispatches a dataLane target from empty lane chrome with registry-resolved provenance', () => {
+    const setContextTarget = vi.fn();
+    const setInspectorTarget = vi.fn();
+    const record = registryRecord();
+    const data = buildData([
+      laneView({
+        items: [{ item: item('a:c1:0'), timelineStart: 1, timelineEnd: 3, clipId: 'c1' }],
+        laneRenderer: () => <div data-testid="lane-renderer-body">body</div>,
+      }),
+    ]);
+
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={record} />
+        <DataLaneList
+          data={data}
+          startLeft={START_LEFT}
+          pixelsPerSecond={PPS}
+          setContextTarget={setContextTarget}
+          setInspectorTarget={setInspectorTarget}
+        />
+      </DataKindRegistryProvider>,
+    );
+
+    // A registered lane's renderer paints the items, so the row chrome (the
+    // label gutter here) is the empty part of the row.
+    fireEvent.click(within(screen.getByTestId('data-lane-row')).getByTitle('Transcript'));
+
+    const expected = {
+      kind: 'dataLane',
+      laneId: 'transcript',
+      extensionId: 'ext.transcript',
+      contributionId: 'ext.transcript.contrib',
+    };
+    expect(setContextTarget).toHaveBeenCalledTimes(1);
+    expect(setContextTarget).toHaveBeenCalledWith(expected);
+    expect(setInspectorTarget).toHaveBeenCalledTimes(1);
+    expect(setInspectorTarget).toHaveBeenCalledWith(expected);
+  });
+
+  it('keeps an extent-bar press from also firing the row-level dataLane target', () => {
+    const setInspectorTarget = vi.fn();
+    const data = buildData([
+      laneView({
+        laneId: 'opaque:unknown.schema/v1',
+        kindId: '',
+        label: 'unknown.schema/v1',
+        opaque: true,
+        items: [{ item: item('a:c1:0'), timelineStart: 1, timelineEnd: 3, clipId: 'c1' }],
+      }),
+    ]);
+
+    renderList({ data, setInspectorTarget });
+
+    fireEvent.click(screen.getByTestId('data-lane-extent-bar'));
+
+    expect(setInspectorTarget).toHaveBeenCalledTimes(1);
+    expect(setInspectorTarget.mock.calls[0][0]).toMatchObject({ kind: 'dataItem' });
+  });
+
+  it('forwards renderer item presses through onSelectItem into the dataItem dispatch (rework R3, G5: no dataLane double-fire)', () => {
+    const setContextTarget = vi.fn();
+    const setInspectorTarget = vi.fn();
+    const data = buildData([
+      laneView({
+        items: [
+          { item: item('a:c1:0'), timelineStart: 10, timelineEnd: 12, clipId: 'c1' },
+          { item: item('b:c2:0'), timelineStart: 20, timelineEnd: 22, clipId: 'c2' },
+        ],
+        laneRenderer: (props: DataLaneRendererProps) => (
+          <div data-testid="lane-renderer-body">
+            {props.items.map((renderItem) => (
+              <button
+                key={renderItem.id}
+                type="button"
+                data-testid="renderer-item"
+                // Same discipline as the host extent bars: swallow the event
+                // so the row's dataLane handler cannot overwrite the target.
+                onClick={(event) => {
+                  event.stopPropagation();
+                  props.onSelectItem?.(renderItem.id);
+                }}
+              >
+                {renderItem.id}
+              </button>
+            ))}
+          </div>
+        ),
+      }),
+    ]);
+
+    renderList({ data, setContextTarget, setInspectorTarget });
+
+    fireEvent.click(within(screen.getByTestId('lane-renderer-body')).getAllByTestId('renderer-item')[1]);
+
+    const expected = {
+      kind: 'dataItem',
+      laneId: 'transcript',
+      itemId: 'b:c2:0',
+      extensionId: undefined,
+      contributionId: undefined,
+    };
+    expect(setContextTarget).toHaveBeenCalledTimes(1);
+    expect(setContextTarget).toHaveBeenCalledWith(expected);
+    expect(setInspectorTarget).toHaveBeenCalledTimes(1);
+    expect(setInspectorTarget).toHaveBeenCalledWith(expected);
+  });
+
+  it('renders a host-owned action menu and invokes against the complete lane, not its DOM window', async () => {
+    const invoke = vi.fn();
+    const record = registryRecord({
+      laneActions: [{
+        id: 'materialize',
+        label: 'Materialize',
+        ariaLabel: 'Materialize every transcript item',
+        invoke,
+      }],
+    });
+    const items = Array.from({ length: DATA_LANE_DOM_ITEM_BUDGET + 50 }, (_, index) => ({
+      item: item(`item-${index}`),
+      timelineStart: index,
+      timelineEnd: index + 0.5,
+    }));
+    const data = buildData([laneView({ items, laneRenderer: () => null })]);
+
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={record} />
+        <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={1} />
+      </DataKindRegistryProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Materialize every transcript item' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+    expect(invoke.mock.calls[0][0]).toHaveLength(items.length);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('contains action failures as visible lane-menu errors and keeps keyboard recovery reachable', async () => {
+    const record = registryRecord({
+      laneActions: [{
+        id: 'fails',
+        label: 'Fail safely',
+        invoke: () => { throw new Error('contained action failure'); },
+      }],
+    });
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={record} />
+        <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={1} />
+      </DataKindRegistryProvider>,
+    );
+    const trigger = screen.getByRole('button', { name: 'Transcript actions' });
+    fireEvent.keyDown(trigger, { key: 'ArrowDown' });
+    const action = await screen.findByRole('menuitem', { name: 'Fail safely' });
+    expect(action).toHaveFocus();
+    fireEvent.click(action);
+    expect(await screen.findByRole('alert')).toHaveTextContent('contained action failure');
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
+  it('implements complete menu keyboard navigation with wrapping', async () => {
+    const record = registryRecord({
+      laneActions: ['First', 'Second', 'Third'].map((label, index) => ({
+        id: `action-${index}`,
+        label,
+        invoke: vi.fn(),
+      })),
+    });
+    const data = buildData([laneView({ laneRenderer: () => null })]);
+    render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={record} />
+        <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={1} />
+      </DataKindRegistryProvider>,
+    );
+
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Transcript actions' }), { key: 'ArrowDown' });
+    const menu = await screen.findByRole('menu');
+    const [first, second, third] = within(menu).getAllByRole('menuitem');
+    expect(first).toHaveFocus();
+    fireEvent.keyDown(menu, { key: 'ArrowDown' });
+    expect(second).toHaveFocus();
+    fireEvent.keyDown(menu, { key: 'End' });
+    expect(third).toHaveFocus();
+    fireEvent.keyDown(menu, { key: 'ArrowDown' });
+    expect(first).toHaveFocus();
+    fireEvent.keyDown(menu, { key: 'ArrowUp' });
+    expect(third).toHaveFocus();
+    fireEvent.keyDown(menu, { key: 'Home' });
+    expect(first).toHaveFocus();
+  });
+
+  it('recovers from never-settling actions and bounds arbitrary displayed errors', async () => {
+    vi.useFakeTimers();
+    try {
+      const record = registryRecord({
+        laneActions: [
+          { id: 'stalls', label: 'Stalls', invoke: () => new Promise(() => {}) },
+          { id: 'long-error', label: 'Long error', invoke: () => { throw new Error(`unsafe\n${'x'.repeat(400)}`); } },
+        ],
+      });
+      const data = buildData([laneView({ laneRenderer: () => null })]);
+      render(
+        <DataKindRegistryProvider>
+          <RegisterProbe record={record} />
+          <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={1} />
+        </DataKindRegistryProvider>,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'Transcript actions' }));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Stalls' }));
+      expect(screen.getByRole('menuitem', { name: 'Long error' })).toBeDisabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(DATA_LANE_ACTION_TIMEOUT_MS); });
+      expect(screen.getByRole('alert')).toHaveTextContent('Action timed out after 15 seconds. Try again.');
+      expect(screen.getByRole('menuitem', { name: 'Long error' })).not.toBeDisabled();
+
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Long error' }));
+      await act(async () => {});
+      const displayed = screen.getByRole('alert').textContent ?? '';
+      expect(displayed).not.toContain('\n');
+      expect(displayed).toHaveLength(180);
+      expect(displayed.endsWith('…')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps actions isolated by lane kind and removes them with registration disposal', async () => {
+    const transcript = registryRecord({
+      laneActions: [{ id: 'transcript-action', label: 'Transcript action', invoke: vi.fn() }],
+    });
+    const runaway = registryRecord({
+      kindId: 'runaway',
+      contributionId: 'ext.runaway.contrib',
+      schemaRef: 'astrid.runaway_transition/v1',
+      ownerExtensionId: 'ext.runaway',
+      laneActions: [{ id: 'runaway-action', label: 'Runaway action', invoke: vi.fn() }],
+    });
+    const data = buildData([
+      laneView({ laneRenderer: () => null }),
+      laneView({
+        laneId: 'runaway',
+        kindId: 'runaway',
+        label: 'Runaway',
+        schemaRef: 'astrid.runaway_transition/v1',
+        laneRenderer: () => null,
+      }),
+    ]);
+
+    const view = render(
+      <DataKindRegistryProvider>
+        <RegisterProbe record={transcript} />
+        <RegisterProbe record={runaway} />
+        <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={1} />
+      </DataKindRegistryProvider>,
+    );
+    expect(screen.getAllByTestId('data-lane-actions-trigger')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'Transcript actions' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Runaway actions' })).toBeVisible();
+    // The trigger is a fixed-height control: its label must stay on one line, and the rail grows to fit it.
+    expect(screen.getByRole('button', { name: 'Transcript actions' })).toHaveClass('whitespace-nowrap');
+    for (const rail of screen.getAllByTestId('data-lane-action-rail')) {
+      expect(rail).toHaveClass('min-w-20', 'w-auto');
+      expect(rail).not.toHaveClass('w-20');
+    }
+
+    view.rerender(
+      <DataKindRegistryProvider>
+        <DataLaneList startLeft={START_LEFT} data={data} pixelsPerSecond={1} />
+      </DataKindRegistryProvider>,
+    );
+    await waitFor(() => expect(screen.queryAllByTestId('data-lane-actions-trigger')).toHaveLength(0));
+  });
+});

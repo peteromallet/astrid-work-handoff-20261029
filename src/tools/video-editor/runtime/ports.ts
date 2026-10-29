@@ -1,0 +1,126 @@
+import type { ComponentType, ReactNode } from 'react';
+import type { Shot, GenerationRow } from '@/domains/generation/types/index.ts';
+import type { DataProvider } from '@/tools/video-editor/data/DataProvider.ts';
+import type {
+  CanonicalShotOccurrence,
+  PreparedShotComposition,
+  ShotCompositionAdapter,
+} from '@/tools/video-editor/data/shotCompositionAdapter.ts';
+import type { AstridAgentElementContext } from '@/tools/video-editor/runtime/element-contract.ts';
+import type { AstridElementOperationAdapter } from '@/tools/video-editor/runtime/element-adapter.ts';
+export type CanonicalShotTimelineScope = Readonly<{
+  projectId: string;
+  parentDocumentId: string;
+  occurrenceId: string;
+  editorSessionId: string;
+}>;
+
+export type CanonicalShotTimelineDraft = Readonly<{
+  scope: CanonicalShotTimelineScope;
+  generation: number;
+  composition: PreparedShotComposition;
+}>;
+
+export type CanonicalShotTimelinePublication = Readonly<{
+  scope: CanonicalShotTimelineScope;
+  generation: number;
+  expectedHeadRevisionId: string | null;
+}>;
+
+
+/**
+ * Checklist-backed runtime inventory for the host surfaces this layer is
+ * allowed to depend on directly.
+ */
+export const VIDEO_EDITOR_HOST_PORT_NAMES = [
+  'DataProvider',
+  'AssetResolver',
+  'ProjectHost',
+  'ShotsHost',
+  'MediaLightboxHost',
+  'AgentChatHost',
+  'ToastHost',
+  'TelemetryHost',
+  'AuthHost',
+] as const;
+
+export interface VideoEditorAssetResolver {
+  resolveAssetUrl: DataProvider['resolveAssetUrl'];
+}
+
+export interface VideoEditorAuthHost {
+  userId: string | null;
+}
+
+export interface VideoEditorProjectHost {
+  projectId: string | null;
+  /** Human-friendly/local workspace reference when it differs from projectId. */
+  projectSlug?: string | null;
+}
+
+export interface VideoEditorShotsHost {
+  shots: Shot[] | undefined;
+  isLoading: boolean;
+  error: Error | null;
+  refetchShots: () => void;
+  allImagesCount?: number;
+  noShotImagesCount?: number;
+  shotComposition?: ShotCompositionAdapter | null;
+  canonicalOccurrences?: readonly CanonicalShotOccurrence[];
+  /** Runtime-owned source-frame thumbnails keyed by canonical occurrence. */
+  canonicalThumbnailUrls?: ReadonlyMap<string, string>;
+  canonicalComposition?: PreparedShotComposition | null;
+  canonicalCompositionError?: Error | null;
+  canonicalDraft?: CanonicalShotTimelineDraft | null;
+  beginCanonicalDraftSession?: (scope: CanonicalShotTimelineScope) => void;
+  endCanonicalDraftSession?: (scope: CanonicalShotTimelineScope) => void;
+  setCanonicalDraftProjection?: (draft: CanonicalShotTimelineDraft) => void;
+  clearCanonicalDraftProjection?: (
+    scope: CanonicalShotTimelineScope,
+    generation: number,
+  ) => void;
+  adoptCanonicalComposition?: (
+    composition: PreparedShotComposition,
+    publication?: CanonicalShotTimelinePublication,
+  ) => void;
+}
+
+export interface VideoEditorMediaLightboxHost {
+  Lightbox: ComponentType<Record<string, unknown>>;
+  loadGenerationForLightbox: (generationId: string) => Promise<GenerationRow | null>;
+}
+
+export interface VideoEditorAgentChatHost {
+  registerTimeline: (value: {
+    timelineId: string | null;
+    projectId: string | null;
+    projectSlug?: string | null;
+    timelineName?: string | null;
+    timelineSummary?: {
+      configVersion: number;
+      trackCount: number;
+      clipCount: number;
+      assetCount: number;
+      duration: number;
+    };
+    elementContext?: AstridAgentElementContext;
+    elementOperationAdapter?: AstridElementOperationAdapter;
+    liveSceneOperationPort?: import('./liveSceneOperationPort').LiveSceneOperationPort;
+  }) => void | (() => void);
+  /** Activate this registered instance for host Chat/Gallery/Tasks. */
+  activateTimeline?: () => void;
+  unregisterTimeline: () => void;
+}
+
+export interface VideoEditorToastHost {
+  error: (message: string, options?: { description?: ReactNode; duration?: number; id?: string }) => string;
+  success: (message: string, options?: { description?: ReactNode; duration?: number; id?: string }) => string;
+  warning: (message: string, options?: { description?: ReactNode; duration?: number; id?: string }) => string;
+  info: (message: string, options?: { description?: ReactNode; duration?: number; id?: string }) => string;
+}
+
+export interface VideoEditorTelemetryHost {
+  log: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+}

@@ -1,0 +1,60 @@
+import { createContext, useContext, useMemo, type PropsWithChildren } from 'react';
+import {
+  VideoEditorRuntimeProvider,
+  useVideoEditorRuntime,
+  type VideoEditorRuntimeContextValue,
+} from '@/tools/video-editor/contexts/VideoEditorRuntimeContext.tsx';
+import type { Shot } from '@/domains/generation/types/index.ts';
+import type { VideoEditorCorePorts, VideoEditorFinalVideo } from '@/tools/video-editor/core/core-ports.ts';
+
+const VideoEditorCorePortsContext = createContext<VideoEditorCorePorts | null>(null);
+const EMPTY_SHOTS: Shot[] = [];
+const EMPTY_FINAL_VIDEO_MAP = new Map<string, VideoEditorFinalVideo>();
+
+export interface VideoEditorCoreRuntimeValue extends VideoEditorRuntimeContextValue {
+  ports: VideoEditorCorePorts;
+}
+
+interface CoreRuntimeProviderProps extends PropsWithChildren {
+  ports: VideoEditorCorePorts;
+  runtime: VideoEditorRuntimeContextValue;
+}
+
+export function CoreRuntimeProvider({
+  ports,
+  runtime,
+  children,
+}: CoreRuntimeProviderProps) {
+  return (
+    <VideoEditorRuntimeProvider value={runtime}>
+      <VideoEditorCorePortsContext.Provider value={ports}>
+        {children}
+      </VideoEditorCorePortsContext.Provider>
+    </VideoEditorRuntimeProvider>
+  );
+}
+
+export function useVideoEditorCorePorts(): VideoEditorCorePorts {
+  const runtime = useVideoEditorRuntime();
+  const ports = useContext(VideoEditorCorePortsContext);
+
+  return useMemo(() => (
+    ports ?? {
+      dataProvider: runtime.provider,
+      selectedProjectId: null,
+      shots: EMPTY_SHOTS,
+      finalVideoMap: EMPTY_FINAL_VIDEO_MAP,
+    }
+  ), [ports, runtime.provider]);
+}
+
+export function useVideoEditorCoreRuntime(): VideoEditorCoreRuntimeValue {
+  const runtime = useVideoEditorRuntime();
+  const ports = useVideoEditorCorePorts();
+
+  return useMemo(() => ({
+    ...runtime,
+    provider: ports.dataProvider,
+    ports,
+  }), [ports, runtime]);
+}

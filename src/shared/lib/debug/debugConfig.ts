@@ -1,0 +1,173 @@
+// Centralized debug configuration to control logging noise
+// This allows fine-grained control over different debug categories
+
+interface DebugConfig {
+  // Core performance logging
+  reactProfiler: boolean;
+  renderLogging: boolean;
+  
+  // Image loading and progressive loading
+  progressiveImage: boolean;
+  imageLoading: boolean;
+  
+  // Component-specific debugging
+  shotImageDebug: boolean;
+  autoplayDebugger: boolean;
+  tasksPaneDebug: boolean;
+  galleryPollingDebug: boolean;
+  
+  // UI and interaction debugging
+  dragDebug: boolean;
+  skeletonDebug: boolean;
+  videoDebug: boolean;
+  
+  // Realtime and networking
+  realtimeDebug: boolean;
+  reconnectionDebug: boolean;
+  
+  // Development helpers
+  devMode: boolean;
+}
+
+// Environment-based configuration
+const getEnvFlag = (key: string, defaultValue: boolean = false): boolean => {
+  try {
+    const env = (import.meta as ImportMeta & { env?: Record<string, unknown> }).env;
+    const value = env?.[key];
+    if (typeof value === 'string') {
+      return value === 'true' || value === '1';
+    }
+  } catch { /* intentionally ignored */ }
+  return defaultValue;
+};
+
+// Lazy default configuration - env reads deferred until first access
+function getDefaultConfig(): DebugConfig {
+  return {
+    // Core performance - disable by default (too noisy)
+    reactProfiler: getEnvFlag('VITE_DEBUG_REACT_PROFILER', false),
+    renderLogging: getEnvFlag('VITE_DEBUG_RENDER_LOGGING', false),
+
+    // Image loading - reduce noise significantly
+    progressiveImage: getEnvFlag('VITE_DEBUG_PROGRESSIVE_IMAGE', false),
+    imageLoading: getEnvFlag('VITE_DEBUG_IMAGE_LOADING', false),
+
+    // Component debugging - only enable when specifically needed
+    shotImageDebug: getEnvFlag('VITE_DEBUG_SHOT_IMAGES', false),
+    autoplayDebugger: getEnvFlag('VITE_DEBUG_AUTOPLAY', false),
+    tasksPaneDebug: getEnvFlag('VITE_DEBUG_TASKS_PANE', false),
+    galleryPollingDebug: getEnvFlag('VITE_DEBUG_GALLERY_POLLING', false),
+
+    // UI debugging - minimal by default
+    dragDebug: getEnvFlag('VITE_DEBUG_DRAG', false),
+    skeletonDebug: getEnvFlag('VITE_DEBUG_SKELETON', false),
+    videoDebug: getEnvFlag('VITE_DEBUG_VIDEO', false),
+
+    // Realtime - keep essential debugging only
+    realtimeDebug: getEnvFlag('VITE_DEBUG_REALTIME', true), // Keep for critical issues
+    reconnectionDebug: getEnvFlag('VITE_DEBUG_RECONNECTION', true), // Keep for critical issues
+
+    // Development mode - enables minimal essential debugging
+    devMode: getEnvFlag('VITE_DEBUG_DEV_MODE', true),
+  };
+}
+
+// Runtime configuration - lazily initialized on first access
+let runtimeConfig: DebugConfig | null = null;
+
+function ensureConfig(): DebugConfig {
+  if (!runtimeConfig) {
+    runtimeConfig = getDefaultConfig();
+  }
+  return runtimeConfig;
+}
+
+// Public API for controlling debug output
+export const debugConfig = {
+  // Check if a specific debug category is enabled
+  isEnabled: (category: keyof DebugConfig): boolean => {
+    return ensureConfig()[category];
+  },
+
+  // Enable/disable specific categories at runtime
+  enable: (category: keyof DebugConfig): void => {
+    ensureConfig()[category] = true;
+  },
+
+  disable: (category: keyof DebugConfig): void => {
+    ensureConfig()[category] = false;
+  },
+
+  // Bulk operations
+  enableAll: (): void => {
+    const config = ensureConfig();
+    Object.keys(config).forEach(key => {
+      config[key as keyof DebugConfig] = true;
+    });
+  },
+
+  disableAll: (): void => {
+    const config = ensureConfig();
+    Object.keys(config).forEach(key => {
+      config[key as keyof DebugConfig] = false;
+    });
+  },
+
+  // Preset configurations
+  setQuietMode: (): void => {
+    runtimeConfig = {
+      ...ensureConfig(),
+      reactProfiler: false,
+      renderLogging: false,
+      progressiveImage: false,
+      imageLoading: false,
+      shotImageDebug: false,
+      autoplayDebugger: false,
+      tasksPaneDebug: false,
+      galleryPollingDebug: false,
+      dragDebug: false,
+      skeletonDebug: false,
+      videoDebug: false
+    };
+  },
+
+  setDevelopmentMode: (): void => {
+    runtimeConfig = {
+      ...ensureConfig(),
+      reactProfiler: false, // Still too noisy for dev
+      renderLogging: true,
+      progressiveImage: false, // Still too noisy for dev
+      imageLoading: true,
+      shotImageDebug: true,
+      autoplayDebugger: false,
+      tasksPaneDebug: true,
+      galleryPollingDebug: false,
+      dragDebug: true,
+      skeletonDebug: true,
+      videoDebug: true
+    };
+  },
+
+  // Get current configuration
+  getConfig: (): DebugConfig => ({ ...ensureConfig() }),
+
+  // Status report
+  status: (): void => {
+    const config = ensureConfig();
+    console.group('🔍 [DebugConfig] Current Configuration');
+    Object.entries(config).forEach(([key, value]) => {
+      console.log(`${value ? '✅' : '❌'} ${key}: ${value}`);
+    });
+    console.groupEnd();
+  }
+};
+
+/**
+ * Attach debugConfig to window for runtime control in dev tools console.
+ * Call explicitly from bootstrap rather than as a module-scope side-effect.
+ */
+export function registerDebugGlobals(): void {
+  if (typeof window !== 'undefined') {
+    (window as Window & { debugConfig?: typeof debugConfig }).debugConfig = debugConfig;
+  }
+}

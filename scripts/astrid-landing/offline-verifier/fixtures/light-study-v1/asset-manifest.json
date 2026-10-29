@@ -1,0 +1,33 @@
+{
+  "fixture_version": "light-study-v1",
+  "assets": [
+    {
+      "key": "first-light",
+      "video": "media/first-light.mp4",
+      "video_sha256": "f94618ccf47b76140e2aab240bacab98e330cf0e171fd68a7aac6783dbe346f1",
+      "thumbnail": "media/first-light-thumb.jpg",
+      "thumbnail_sha256": "ed55a93bfb8c309e66cd851069d8fc6ac324d430155b373d4343dee2abe52dbf",
+      "duration_seconds": 8
+    },
+    {
+      "key": "passing-shapes",
+      "video": "media/passing-shapes.mp4",
+      "video_sha256": "a3b16d538c9a1a7648e55bd2889541373aa5774ae3c4386f63bc645933091347",
+      "thumbnail": "media/passing-shapes-thumb.jpg",
+      "thumbnail_sha256": "f436a7b65b0f15ac05e44eb5c005bc1368bc5fefc14350d69e09315474a03486",
+      "duration_seconds": 12
+    },
+    {
+      "key": "quiet-finish",
+      "video": "media/quiet-finish.mp4",
+      "video_sha256": "56d87d4c752651f042e8d41f122ab038549ef6dfb601c4e026b5e52d1be52670",
+      "thumbnail": "media/quiet-finish-thumb.jpg",
+      "thumbnail_sha256": "8df9d21333004d1e425db49b210c93aee8949ad3a564578da9d1913fd5005447",
+      "duration_seconds": 8
+    }
+  ],
+  "project_poster": {
+    "path": "posters/project-poster.jpg",
+    "sha256": "e08f29c0ccfdbe68782a4918d45cec1fa3433ec0981b764fd7d396b7544a7a4a"
+  }
+}

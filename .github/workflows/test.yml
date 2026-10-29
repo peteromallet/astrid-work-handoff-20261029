@@ -1,0 +1,72 @@
+# Default vitest run per push (testing plan UP.1). The checkout lane (npm run test:checkout) needs sibling repos and does not run here.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  vitest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release check compares against the previous main manifest and its full release history.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.0"
+          cache: npm
+      - name: Check manifest release against main history
+        if: (github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main'
+        env:
+          RELEASE_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: node scripts/installer/release-check.mjs "$RELEASE_BASE_REF"
+      - run: node --test scripts/installer/release.test.mjs
+      - run: npm ci --legacy-peer-deps
+      - run: npm test
+      - run: npm run test:sdk-boundary
+
+  # The release tooling is macOS-only by design (lockf broker, BSD ps eww, darwin-pinned attestation), so the vitest job
+  # declares these cases as skipped (config/testing/skipRegistry.mjs: macos-release-process-containment, macos-lockf-broker)
+  # and this job runs exactly those files where the condition holds. Plain node: these files import only the repo.
+  release-tooling-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./scripts/quality/node-skip-guard-reporter.mjs --test-reporter-destination=stdout scripts/release/bounded-command.test.mjs scripts/release/astrid-release-provenance.test.mjs scripts/release/verify-extension-ship.test.mjs
+
+  # Cross-repo copies: every vendored artifact must match its selected producer commit.
+  boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.0"
+      - id: pins
+        run: |
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const fs = require('node:fs');
+          const runtime = JSON.parse(fs.readFileSync('runtime.lock.json', 'utf8'));
+          const astrid = JSON.parse(fs.readFileSync('config/astrid-cli-surface/vendor.lock.json', 'utf8'));
+          process.stdout.write(`runtime_sha=${runtime.source_commit}\nastrid_sha=${astrid.source_commit}\n`);
+          NODE
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-runtime
+          ref: ${{ steps.pins.outputs.runtime_sha }}
+          path: runtime-producer
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: ${{ steps.pins.outputs.astrid_sha }}
+          path: astrid-producer
+      - run: |
+          node scripts/vendor-lock.mjs check runtime.lock.json --producer runtime-producer
+      - run: node scripts/vendor-lock.mjs check config/astrid-cli-surface/vendor.lock.json --producer astrid-producer
+      - run: node --test scripts/quality/astrid-public-boundary.test.mjs
+      - run: node scripts/build/verify-astrid-vendor-sources.mjs

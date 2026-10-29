@@ -1,0 +1,62 @@
+import { useIsMobile } from "@/shared/hooks/mobile";
+import { safeAreaCalc } from "@/shared/lib/safeArea";
+
+export type ModalSize = 'small' | 'medium' | 'large' | 'extra-large';
+
+interface ModalStyling {
+  className: string;
+  style: Record<string, unknown>;
+  isMobile: boolean;
+  headerClass: string;
+  scrollClass: string;
+  footerClass: string;
+}
+
+/**
+ * Simplified modal hook that replaces the complex useMobileModalStyling system
+ * Provides the same functionality with much less complexity
+ */
+export const useModal = (size: ModalSize = 'medium'): ModalStyling => {
+  const isMobile = useIsMobile();
+  
+  // Base classes that all modals need - removed z-index from classes since we apply it via inline style
+  const baseClasses = 'bg-white dark:bg-gray-950 border-gray-200 dark:border-gray-800 rounded-lg flex flex-col';
+  
+  // Size-specific max widths and heights
+  const sizeClasses = {
+    small: 'sm:max-w-sm',
+    medium: 'sm:max-w-[425px] max-h-[85vh]', 
+    large: 'sm:max-w-2xl max-h-[90vh]',
+    'extra-large': 'max-w-4xl max-h-[90vh]'
+  }[size];
+  
+  // Mobile-specific styles (only for medium and larger modals)
+  // Note: z-index is handled by the Dialog component CSS (z-[100003]) so we don't override it here
+  const mobileStyle = isMobile && size !== 'small' ? {
+    width: 'calc(100vw - 2rem)', // 16px edges
+    maxHeight: (size === 'large' || size === 'extra-large')
+      ? safeAreaCalc.maxHeight('80px', '80vh')
+      : safeAreaCalc.maxHeight('64px', '90vh'),
+    // Position modal lower on mobile to account for safe area at top
+    top: (size === 'large' || size === 'extra-large')
+      ? safeAreaCalc.verticalCenter()
+      : undefined,
+  } : {};
+
+  return {
+    className: `${sizeClasses} ${baseClasses}`,
+    style: mobileStyle,
+    isMobile,
+    headerClass: 'flex-shrink-0',
+    scrollClass: 'flex-1 overflow-y-auto min-h-0',
+    footerClass: 'flex-shrink-0'
+  };
+};
+
+// Convenience functions for common sizes
+export const useMediumModal = () => useModal('medium');
+export const useLargeModal = () => useModal('large');
+export const useExtraLargeModal = (_specialCase?: string) => {
+  // For now, ignore specialCase: 'promptEditor' and 'loraSelector' do not seem to do much
+  return useModal('extra-large');
+};

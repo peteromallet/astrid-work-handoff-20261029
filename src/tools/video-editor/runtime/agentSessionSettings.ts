@@ -1,0 +1,33 @@
+import type { AstridLocalAcpRoutes } from '@/integrations/astrid/acpRoutes';
+import { AGENT_CHAT_COPY } from '@/integrations/astrid/chatCopy';
+
+type JsonRecord = Record<string, unknown>;
+
+function asRecord(value: unknown): JsonRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+export async function setSessionConfigOption(
+  acp: Pick<AstridLocalAcpRoutes, 'setConfigOption'>,
+  connectionId: string,
+  sessionId: string,
+  command: string,
+): Promise<string> {
+  if (/^\/model(?:\s|$)/.test(command.trim())) throw new Error(AGENT_CHAT_COPY.fixedModel);
+  const match = command.trim().match(/^\/thinking\s+(\S+)$/);
+  if (!match) throw new Error(AGENT_CHAT_COPY.thinkingUsage);
+  const configId = 'thinking';
+  const value = match[1];
+  const result = asRecord(await acp.setConfigOption<unknown>(connectionId, sessionId, configId, value));
+  const options = Array.isArray(result?.configOptions) ? result.configOptions : [];
+  const config = options.map(asRecord).find((option) => option?.id === configId);
+  const currentValue = stringValue(config?.currentValue);
+  if (currentValue !== value) {
+    throw new Error(`ACP did not confirm ${configId}=${value}; current value is ${currentValue ?? 'unavailable'}.`);
+  }
+  return `Thinking level set to ${currentValue} for this session only.`;
+}

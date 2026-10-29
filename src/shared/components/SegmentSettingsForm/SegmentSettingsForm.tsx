@@ -1,0 +1,395 @@
+/**
+ * SegmentSettingsForm - Controlled Form Component
+ *
+ * A presentational form for editing segment settings.
+ * Parent owns the data and handles persistence/task creation.
+ *
+ * Usage:
+ * ```tsx
+ * const { settings, updateSettings, saveSettings } = useSegmentSettings({...});
+ *
+ * <SegmentSettingsForm
+ *   settings={settings}
+ *   onChange={updateSettings}
+ *   onSubmit={async () => {
+ *     await saveSettings();
+ *     await createTask();
+ *   }}
+ * />
+ * ```
+ */
+
+import React, { useState, useCallback, useEffect } from 'react';
+import { Button } from '@/shared/components/ui/button';
+import { Label } from '@/shared/components/ui/primitives/label';
+import { Slider } from '@/shared/components/ui/slider';
+import { Switch } from '@/shared/components/ui/switch';
+import { Loader2, RotateCcw, Save } from 'lucide-react';
+import { quantizeFrameCount, framesToSeconds } from '@/shared/lib/media/videoUtils';
+import { normalizeAndPresentError } from '@/shared/lib/errorHandling/runtimeError';
+import { usePromptFieldState } from '@/shared/hooks/usePromptFieldState';
+import {
+  MODEL_DEFAULTS,
+  coerceSelectedModel,
+  getModelSpec,
+  resolveSelectedModelFromModelName,
+  resolveGenerationPolicy,
+} from '@/tools/travel-between-images/settings';
+
+// Extracted components
+import { AdvancedSettingsSection } from './components/AdvancedSettingsSection';
+import { FieldDefaultControls } from './components/FieldDefaultControls';
+import { ImageVariantPicker } from './components/ImageVariantPicker';
+import { PromptSection } from './components/PromptSection';
+
+// Extracted hooks
+import { useSaveFieldAsDefault } from './hooks/useSaveFieldAsDefault';
+import { useModelChange } from './hooks/useModelChange';
+
+// Types
+import type { SegmentSettingsFormProps } from './types';
+import { mediaCrossOrigin } from '@/shared/lib/media/mediaCrossOrigin';
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+export const SegmentSettingsForm: React.FC<SegmentSettingsFormProps> = ({
+  settings,
+  onChange,
+  onSubmit,
+  startImageUrl,
+  endImageUrl,
+  modelName,
+  isRegeneration = false,
+  isSubmitting = false,
+  buttonLabel,
+  showHeader = true,
+  headerTitle = 'Regenerate Segment',
+  maxFrames = 81,
+  segmentIndex,
+  onFrameCountChange,
+  onRestoreDefaults,
+  onSaveAsShotDefaults,
+  onSaveFieldAsDefault,
+  hasOverride,
+  shotDefaults,
+  structureVideoType,
+  structureVideoDefaults,
+  structureVideoUrl,
+  structureVideoFrameRange,
+  enhancedPrompt,
+  basePromptForEnhancement,
+  onClearEnhancedPrompt,
+  enhancePromptEnabled,
+  onEnhancePromptChange,
+  edgeExtendAmount = 4,
+  // Per-segment structure video management
+  isTimelineMode,
+  onRemoveSegmentStructureVideo,
+  // Navigation to constituent images
+  startImageGenerationId,
+  endImageGenerationId,
+  startImageShotGenerationId,
+  endImageShotGenerationId,
+  onNavigateToImage,
+}) => {
+  // Model detection for LTX-specific controls
+  const effectiveSelectedModel = coerceSelectedModel(
+    settings.selectedModel ?? (modelName ? resolveSelectedModelFromModelName(modelName) : undefined)
+  );
+  const spec = getModelSpec(effectiveSelectedModel);
+  const modelDefaults = MODEL_DEFAULTS[effectiveSelectedModel];
+  const frameStep = modelDefaults.frameStep;
+  const effectiveSmoothContinuations = settings.smoothContinuations ?? shotDefaults?.smoothContinuations ?? false;
+  const continuationPolicy = resolveGenerationPolicy(spec, {
+    smoothContinuations: effectiveSmoothContinuations,
+    requestedExecutionMode: shotDefaults?.generationTypeMode ?? 'i2v',
+    guidanceKind: settings.guidanceMode ?? shotDefaults?.guidanceMode ?? structureVideoType ?? undefined,
+  });
+  const canToggleSmoothContinuations = segmentIndex !== undefined
+    && segmentIndex > 0
+    && Boolean(spec.continuationByExecutionMode[continuationPolicy.travelMode]);
+  const resolvedMaxFrames = continuationPolicy.continuation.enabled
+    ? continuationPolicy.continuation.maxOutputFrames
+    : maxFrames;
+
+  // UI state
+  const [submitSuccess, setSubmitSuccess] = useState(false);
+  const [isSavingDefaults, setIsSavingDefaults] = useState(false);
+  const [saveDefaultsSuccess, setSaveDefaultsSuccess] = useState(false);
+  const [startImageUrlOverride, setStartImageUrlOverride] = useState<string | null>(null);
+  const [endImageUrlOverride, setEndImageUrlOverride] = useState<string | null>(null);
+  const displayedStartImageUrl = startImageUrlOverride ?? startImageUrl;
+  const displayedEndImageUrl = endImageUrlOverride ?? endImageUrl;
+
+  // Model change handler (shared between PromptSection toggle and AdvancedSettingsSection)
+  const handleModelChange = useModelChange({ onChange, settings, shotDefaults });
+
+  // Save-field-as-default (shared with AdvancedSettingsSection)
+  const { savingField, handleSaveFieldAsDefault } = useSaveFieldAsDefault({
+    onSaveFieldAsDefault,
+    onChange,
+  });
+
+  // Prompt field state
+  const promptField = usePromptFieldState({
+    settingsPrompt: settings.prompt,
+    enhancedPrompt,
+    basePromptForEnhancement,
+    defaultPrompt: shotDefaults?.prompt,
+    onSettingsChange: (value) => onChange({ prompt: value }),
+    onClearEnhancedPrompt,
+  });
+
+  useEffect(() => {
+    setStartImageUrlOverride(null);
+  }, [startImageUrl]);
+
+  useEffect(() => {
+    setEndImageUrlOverride(null);
+  }, [endImageUrl]);
+
+  // ==========================================================================
+  // HANDLERS
+  // ==========================================================================
+
+  const handleSubmit = useCallback(async () => {
+    setSubmitSuccess(false);
+    try {
+      await onSubmit();
+      setSubmitSuccess(true);
+      setTimeout(() => setSubmitSuccess(false), 1500);
+    } catch (error) {
+      normalizeAndPresentError(error, { context: 'SegmentSettingsForm', showToast: false });
+    }
+  }, [onSubmit]);
+
+  const handleFrameCountChange = useCallback((value: number) => {
+    const quantized = quantizeFrameCount(value, 9, frameStep);
+    onChange({ numFrames: quantized });
+    onFrameCountChange?.(quantized);
+  }, [frameStep, onChange, onFrameCountChange]);
+
+  const handleSaveAsShotDefaults = useCallback(async () => {
+    if (!onSaveAsShotDefaults) return;
+    setIsSavingDefaults(true);
+    setSaveDefaultsSuccess(false);
+    try {
+      const success = await onSaveAsShotDefaults();
+      if (success) {
+        setSaveDefaultsSuccess(true);
+        setTimeout(() => setSaveDefaultsSuccess(false), 2000);
+      }
+    } finally {
+      setIsSavingDefaults(false);
+    }
+  }, [onSaveAsShotDefaults]);
+
+  // ==========================================================================
+  // RENDER
+  // ==========================================================================
+
+  return (
+    <div className="space-y-4">
+      {/* Header */}
+      {showHeader && (
+        <div className="flex items-center gap-2">
+          <h3 className="text-lg font-medium flex items-center gap-2">
+            <RotateCcw className="w-5 h-5 text-primary" />
+            {headerTitle}
+          </h3>
+        </div>
+      )}
+
+      {/* Input Images with Frames Slider */}
+      {(displayedStartImageUrl || displayedEndImageUrl) && (
+        <div className="@container">
+          <div className="grid grid-cols-2 gap-2 @[280px]:grid-cols-3">
+            {/* Start Image */}
+            <div className="relative aspect-video">
+              {displayedStartImageUrl && (
+                <button
+                  type="button"
+                  onClick={() => startImageShotGenerationId && onNavigateToImage?.(startImageShotGenerationId)}
+                  disabled={!onNavigateToImage || !startImageShotGenerationId}
+                  className="w-full h-full relative bg-muted/30 rounded-lg overflow-hidden border border-border/50 transition-all hover:ring-2 hover:ring-primary/50 hover:scale-[1.02] disabled:hover:ring-0 disabled:hover:scale-100 disabled:cursor-default"
+                  title={onNavigateToImage && startImageShotGenerationId ? "View start image" : undefined}
+                >
+                  {startImageGenerationId && startImageUrl && (
+                    <ImageVariantPicker
+                      generationId={startImageGenerationId}
+                      currentImageUrl={startImageUrl}
+                      onImageUrlChange={setStartImageUrlOverride}
+                    />
+                  )}
+                  <img
+                    src={displayedStartImageUrl}
+                    crossOrigin={mediaCrossOrigin(displayedStartImageUrl)}
+                    alt="Start frame"
+                    className="absolute inset-0 w-full h-full object-cover"
+                  />
+                  <span className="absolute bottom-0.5 left-0.5 text-[10px] bg-black/60 text-white px-1 rounded">Start</span>
+                </button>
+              )}
+            </div>
+
+            {/* Frames Slider */}
+            <div className="order-last col-span-2 @[280px]:order-none @[280px]:col-span-1 flex items-center gap-2">
+              <div className="flex-1 flex flex-col justify-center gap-y-1">
+                <div className="flex flex-col items-center text-center">
+                  <Label className="text-xs font-medium">Frames</Label>
+                  <span className="text-xs text-muted-foreground">
+                    {settings.numFrames} ({framesToSeconds(settings.numFrames)})
+                  </span>
+                </div>
+                <Slider
+                  value={quantizeFrameCount(settings.numFrames, 9, frameStep)}
+                  onValueChange={(value) => {
+                    const nextValue = Array.isArray(value)
+                      ? (value[0] ?? quantizeFrameCount(settings.numFrames, 9, frameStep))
+                      : value;
+                    handleFrameCountChange(nextValue);
+                  }}
+                  min={9}
+                  max={resolvedMaxFrames}
+                  step={frameStep}
+                  className="w-full"
+                />
+              </div>
+            </div>
+
+            {/* End Image */}
+            <div className="relative aspect-video">
+              {displayedEndImageUrl && (
+                <button
+                  type="button"
+                  onClick={() => endImageShotGenerationId && onNavigateToImage?.(endImageShotGenerationId)}
+                  disabled={!onNavigateToImage || !endImageShotGenerationId}
+                  className="w-full h-full relative bg-muted/30 rounded-lg overflow-hidden border border-border/50 transition-all hover:ring-2 hover:ring-primary/50 hover:scale-[1.02] disabled:hover:ring-0 disabled:hover:scale-100 disabled:cursor-default"
+                  title={onNavigateToImage && endImageShotGenerationId ? "View end image" : undefined}
+                >
+                  {endImageGenerationId && endImageUrl && (
+                    <ImageVariantPicker
+                      generationId={endImageGenerationId}
+                      currentImageUrl={endImageUrl}
+                      onImageUrlChange={setEndImageUrlOverride}
+                    />
+                  )}
+                  <img
+                    src={displayedEndImageUrl}
+                    crossOrigin={mediaCrossOrigin(displayedEndImageUrl)}
+                    alt="End frame"
+                    className="absolute inset-0 w-full h-full object-cover"
+                  />
+                  <span className="absolute bottom-0.5 right-0.5 text-[10px] bg-black/60 text-white px-1 rounded">End</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Prompt */}
+      <PromptSection
+        promptField={promptField}
+        isRegeneration={isRegeneration}
+        settings={settings}
+        onChange={onChange}
+        selectedModel={effectiveSelectedModel}
+        onSelectedModelChange={handleModelChange}
+        basePromptForEnhancement={basePromptForEnhancement}
+        enhancePromptEnabled={enhancePromptEnabled}
+        onEnhancePromptChange={onEnhancePromptChange}
+        onSaveFieldAsDefault={onSaveFieldAsDefault}
+        handleSaveFieldAsDefault={handleSaveFieldAsDefault}
+        savingField={savingField}
+        smoothContinuations={canToggleSmoothContinuations ? {
+          enabled: effectiveSmoothContinuations,
+          onChange: (checked: boolean) => onChange({ smoothContinuations: checked }),
+          maxOutputFrames: continuationPolicy.continuation.maxOutputFrames,
+        } : undefined}
+      />
+
+      {/* Advanced Settings */}
+      <AdvancedSettingsSection
+        settings={settings}
+        onChange={onChange}
+        modelName={modelName}
+        edgeExtendAmount={edgeExtendAmount}
+        defaults={{
+          shotDefaults,
+          hasOverride,
+          onSaveFieldAsDefault,
+        }}
+        structureVideo={{
+          type: structureVideoType,
+          url: structureVideoUrl,
+          frameRange: structureVideoFrameRange,
+          defaults: structureVideoDefaults,
+          isTimelineMode,
+          onRemoveSegmentStructureVideo,
+        }}
+      />
+
+      {/* Submit Button */}
+      <Button
+        size="sm"
+        onClick={handleSubmit}
+        disabled={isSubmitting || !startImageUrl}
+        className="w-full gap-2"
+        variant={submitSuccess ? "outline" : "default"}
+      >
+        {isSubmitting ? (
+          <>
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>Generating...</span>
+          </>
+        ) : submitSuccess ? (
+          <>
+            <span className="text-green-600">&#10003;</span>
+            <span>Task Created</span>
+          </>
+        ) : (
+          <span>{buttonLabel || (isRegeneration ? 'Regenerate Segment' : 'Generate Segment')}</span>
+        )}
+      </Button>
+
+      {/* Restore Defaults / Save as Defaults Buttons */}
+      {(onRestoreDefaults || onSaveAsShotDefaults) && (
+        <div className="flex gap-2">
+          {onRestoreDefaults && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onRestoreDefaults}
+              disabled={isSubmitting || isSavingDefaults}
+              className="flex-1 h-7 text-xs text-muted-foreground hover:text-foreground gap-1"
+            >
+              <RotateCcw className="w-3 h-3" />
+              Restore Defaults
+            </Button>
+          )}
+          {onSaveAsShotDefaults && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={handleSaveAsShotDefaults}
+              disabled={isSubmitting || isSavingDefaults}
+              className="flex-1 h-7 text-xs text-muted-foreground hover:text-foreground gap-1"
+            >
+              {isSavingDefaults ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : saveDefaultsSuccess ? (
+                <span className="text-green-600">&#10003;</span>
+              ) : (
+                <Save className="w-3 h-3" />
+              )}
+              {saveDefaultsSuccess ? 'Saved!' : 'Set as Shot Defaults'}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};

@@ -1,0 +1,110 @@
+{
+  "version": "lantern-valley-14s-v1",
+  "durationSeconds": 14,
+  "sourceFrom": 2.5,
+  "sourceTo": 16.5,
+  "anchorTimes": [
+    0,
+    6.5,
+    10,
+    13
+  ],
+  "anchorCaptureTimes": [
+    0,
+    6.5,
+    10,
+    13.966666666666667
+  ],
+  "assets": {
+    "world": {
+      "filename": "ca975b68e035d6af3aa6b828cd49acb2c99ab4bc66a0aaa83dbab8913b14c35e.json",
+      "sha256": "ca975b68e035d6af3aa6b828cd49acb2c99ab4bc66a0aaa83dbab8913b14c35e",
+      "size": 625192,
+      "mediaType": "application/json"
+    },
+    "guide": {
+      "filename": "f6829f7778fb9fdcda9159635a0444b81a6769e9518d326607fbd403e77c0ed2.mp4",
+      "sha256": "f6829f7778fb9fdcda9159635a0444b81a6769e9518d326607fbd403e77c0ed2",
+      "size": 3951331,
+      "mediaType": "video/mp4",
+      "width": 1280,
+      "height": 720,
+      "durationSeconds": 14,
+      "fps": 30
+    },
+    "video": {
+      "filename": "9afbe1674750162fbf47587790728fc5526f26e6845744bda3e99f07573e12ef.mp4",
+      "sha256": "9afbe1674750162fbf47587790728fc5526f26e6845744bda3e99f07573e12ef",
+      "size": 3641617,
+      "mediaType": "video/mp4",
+      "width": 1344,
+      "height": 768,
+      "durationSeconds": 14.375,
+      "fps": 24
+    },
+    "still1": {
+      "filename": "5d03a816af444891300bbf45311af6e93ef6c0ded1758a052bbec09737392c7d.png",
+      "sha256": "5d03a816af444891300bbf45311af6e93ef6c0ded1758a052bbec09737392c7d",
+      "size": 1733788,
+      "mediaType": "image/png",
+      "width": 1376,
+      "height": 768
+    },
+    "frame1": {
+      "filename": "843e232802d0e1eae7909ff6876e5020f8e9c8107ff2851badc273d5e0df6f70.png",
+      "sha256": "843e232802d0e1eae7909ff6876e5020f8e9c8107ff2851badc273d5e0df6f70",
+      "size": 930983,
+      "mediaType": "image/png",
+      "width": 1280,
+      "height": 720
+    },
+    "still2": {
+      "filename": "15da01205ca47324a8bb36e0ccb10ddb62b40adef81ae3acebd32b80aff148a1.png",
+      "sha256": "15da01205ca47324a8bb36e0ccb10ddb62b40adef81ae3acebd32b80aff148a1",
+      "size": 1616480,
+      "mediaType": "image/png",
+      "width": 1376,
+      "height": 768
+    },
+    "frame2": {
+      "filename": "cd854a90da6d5ff22e7b23d22a6d42915a390c6d2e37b9c3b835d793a604fc9f.png",
+      "sha256": "cd854a90da6d5ff22e7b23d22a6d42915a390c6d2e37b9c3b835d793a604fc9f",
+      "size": 899020,
+      "mediaType": "image/png",
+      "width": 1280,
+      "height": 720
+    },
+    "still3": {
+      "filename": "1340978c01a3721dfec4071b3371c156ae3cd1a46d2d50f835398dde4e36bd48.png",
+      "sha256": "1340978c01a3721dfec4071b3371c156ae3cd1a46d2d50f835398dde4e36bd48",
+      "size": 2014832,
+      "mediaType": "image/png",
+      "width": 1376,
+      "height": 768
+    },
+    "frame3": {
+      "filename": "d22de830a0e034ba6cfa4a4826affff008e527bf13624c0292d6a70d4fc0abbc.png",
+      "sha256": "d22de830a0e034ba6cfa4a4826affff008e527bf13624c0292d6a70d4fc0abbc",
+      "size": 960066,
+      "mediaType": "image/png",
+      "width": 1280,
+      "height": 720
+    },
+    "still4": {
+      "filename": "e2f106ce2e53434487e24da748ddac7eb28aee43afe2b6f768efbd901622d31f.png",
+      "sha256": "e2f106ce2e53434487e24da748ddac7eb28aee43afe2b6f768efbd901622d31f",
+      "size": 1959991,
+      "mediaType": "image/png",
+      "width": 1376,
+      "height": 768
+    },
+    "frame4": {
+      "filename": "fb82b57225b8bbcc86ad2becff6eaec1bf814d0d3c07101fb10ac909b3f0970e.png",
+      "sha256": "fb82b57225b8bbcc86ad2becff6eaec1bf814d0d3c07101fb10ac909b3f0970e",
+      "size": 954481,
+      "mediaType": "image/png",
+      "width": 1280,
+      "height": 720
+    }
+  }
+}

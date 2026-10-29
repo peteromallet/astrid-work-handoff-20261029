@@ -1,0 +1,347 @@
+/**
+ * ImageLightbox
+ *
+ * Specialized info-only lightbox for image media.
+ *
+ * Uses useSharedLightboxState for shared functionality (variants, navigation, etc.)
+ *
+ * This is part of the split architecture where MediaLightbox dispatches to
+ * ImageLightbox or VideoLightbox based on media type.
+ */
+
+import React, { useCallback, useMemo, useRef } from 'react';
+import type { GenerationRow } from '@/domains/generation/types';
+import type { OverlayViewportConstraints } from '@/shared/lib/layout/overlayViewportConstraints';
+import type {
+  AdjacentSegmentsData,
+  TaskDetailsData,
+  LightboxNavigationProps,
+  LightboxShotWorkflowProps,
+  LightboxFeatureFlags,
+  LightboxActionHandlers,
+} from './types';
+
+import {
+  useImageLightboxEnvironment,
+  type ImageLightboxEnvironment,
+} from './hooks/useImageLightboxEnvironment';
+import {
+  useImageLightboxSharedState,
+  type ImageLightboxSharedModel,
+} from './hooks/useImageLightboxSharedState';
+import { ImageLightboxControlsPanel } from './components/ImageLightboxControlsPanel';
+
+import { LightboxShell } from './components/LightboxShell';
+import { LightboxProviders } from './components/LightboxProviders';
+import { LightboxLayout } from './components/layouts/LightboxLayout';
+import type { WorkflowControlsBarProps } from './components/WorkflowControlsBar';
+import type { LightboxLayoutProps } from './components/layouts/types';
+
+import { handleLightboxDownload } from './utils/lightboxDownload';
+import { invokeLightboxDelete } from './utils/lightboxDelete';
+import { useAddToVideoEditor } from './hooks/useAddToVideoEditor';
+import { useRenderBudget } from '@/shared/dev/useRenderBudget';
+
+// Re-export grouped sub-interfaces for consumers that import from ImageLightbox
+export type {
+  LightboxNavigationProps,
+  LightboxShotWorkflowProps,
+  LightboxFeatureFlags,
+  LightboxActionHandlers,
+} from './types';
+
+// ============================================================================
+// Main Props Interface
+// ============================================================================
+
+interface ImageLightboxCoreProps {
+  media: GenerationRow;
+  onClose: () => void;
+  readOnly?: boolean;
+  shotId?: string;
+  initialVariantId?: string;
+}
+
+interface ImageLightboxTaskDetailProps {
+  taskDetailsData?: TaskDetailsData;
+  onOpenExternalGeneration?: (generationId: string, derivedContext?: string[]) => Promise<void>;
+  onNavigateToGeneration?: (generationId: string) => void;
+  adjacentSegments?: AdjacentSegmentsData;
+}
+
+interface ImageLightboxUiStateProps {
+  showTickForImageId?: string | null;
+  showTickForSecondaryImageId?: string | null;
+  tasksPaneOpen?: boolean;
+  tasksPaneWidth?: number;
+}
+
+interface ImageLightboxBehaviorProps {
+  // Grouped props
+  navigation?: LightboxNavigationProps;
+  shotWorkflow?: LightboxShotWorkflowProps;
+  features?: LightboxFeatureFlags;
+  actions?: LightboxActionHandlers;
+  customOverlay?: React.ReactNode;
+}
+
+interface ImageLightboxProps
+  extends ImageLightboxCoreProps,
+    ImageLightboxTaskDetailProps,
+    ImageLightboxUiStateProps,
+    ImageLightboxBehaviorProps {}
+
+function useImageLightboxRenderModel(
+  props: ImageLightboxProps,
+  env: ImageLightboxEnvironment,
+  sharedModel: ImageLightboxSharedModel,
+) {
+  const {
+    media,
+    onClose,
+    readOnly = false,
+    adjacentSegments,
+    showTickForImageId,
+    showTickForSecondaryImageId,
+  } = props;
+  const actionHandlers = props.actions;
+  const addToVideoEditor = useAddToVideoEditor(props.media);
+
+  const navigation = props.navigation;
+  const shotWorkflow = props.shotWorkflow;
+
+  const { sharedState, handleSlotNavNext, handleSlotNavPrev, adjustedTaskDetailsData, variantBadges } = sharedModel;
+
+  // --- Variant state for LightboxStateContext ---
+  const lightboxVariants = useMemo(() => ({
+    variants: sharedState.variants.list,
+    activeVariant: sharedState.variants.activeVariant,
+    primaryVariant: sharedState.variants.primaryVariant,
+    isLoadingVariants: sharedState.variants.isLoading,
+    handleVariantSelect: sharedState.variants.setActiveVariantId,
+    handleMakePrimary: sharedState.variants.setPrimaryVariant,
+    handleDeleteVariant: sharedState.variants.deleteVariant,
+    pendingTaskCount: variantBadges.pendingTaskCount,
+    unviewedVariantCount: variantBadges.unviewedVariantCount,
+    onMarkAllViewed: variantBadges.handleMarkAllViewed,
+    variantsSectionRef: env.variantsSectionRef,
+  }), [
+    sharedState.variants,
+    variantBadges, env.variantsSectionRef,
+  ]);
+
+  // --- Action handlers ---
+  const handleDownload = useCallback(() => {
+    return handleLightboxDownload({
+      intendedVariantId: sharedState.intendedActiveVariantIdRef.current,
+      variants: sharedState.variants.list,
+      fallbackUrl: sharedState.effectiveMedia.mediaUrl ?? '',
+      media, isVideo: false, setIsDownloading: env.setIsDownloading,
+    });
+  }, [sharedState.intendedActiveVariantIdRef, sharedState.variants.list, sharedState.effectiveMedia.mediaUrl, media, env.setIsDownloading]);
+
+  const handleDelete = useCallback(async (): Promise<void> => {
+    if (!actionHandlers?.onDelete) return;
+    await invokeLightboxDelete(actionHandlers.onDelete, media.id, 'ImageLightbox.delete');
+  }, [actionHandlers, media.id]);
+
+  // --- Workflow bar ---
+  const handleNavigateToShotFromSelector = useCallback((shot: { id: string; name: string }) => {
+    if (!shotWorkflow?.onNavigateToShot) return;
+    onClose();
+    shotWorkflow.onNavigateToShot({ id: shot.id, name: shot.name, images: [], position: 0 });
+  }, [onClose, shotWorkflow]);
+
+  const allShots = useMemo(() => shotWorkflow?.allShots ?? [], [shotWorkflow?.allShots]);
+  const selectedShotId = shotWorkflow?.selectedShotId;
+
+  const workflowBar = useMemo(() => ({
+    core: {
+      onAddToVideoEditor: actionHandlers?.onAddToVideoEditor ?? addToVideoEditor.onClick,
+      addToVideoEditorPhase: actionHandlers?.onAddToVideoEditor ? 'idle' : addToVideoEditor.phase,
+      isVideo: false,
+    },
+    shotSelector: shotWorkflow?.onAddToShot
+      ? {
+          mediaId: env.actualGenerationId ?? media.id,
+          imageUrl: sharedState.effectiveMedia.mediaUrl ?? '',
+          thumbUrl: media.thumbUrl,
+          allShots, selectedShotId,
+          onShotChange: shotWorkflow?.onShotChange,
+          isAlreadyPositionedInSelectedShot: sharedState.shots.isAlreadyPositionedInSelectedShot,
+          isAlreadyAssociatedWithoutPosition: sharedState.shots.isAlreadyAssociatedWithoutPosition,
+          showTickForImageId, showTickForSecondaryImageId,
+          onAddToShot: shotWorkflow.onAddToShot,
+          onAddToShotWithoutPosition: shotWorkflow?.onAddToShotWithoutPosition,
+          onShowTick: shotWorkflow?.onShowTick,
+          onOptimisticPositioned: shotWorkflow?.onOptimisticPositioned,
+          onShowSecondaryTick: shotWorkflow?.onShowSecondaryTick,
+          onOptimisticUnpositioned: shotWorkflow?.onOptimisticUnpositioned,
+          isAdding: false, isAddingWithoutPosition: false,
+          contentRef: env.contentRef,
+          onNavigateToShot: handleNavigateToShotFromSelector,
+          onClose,
+        }
+      : undefined,
+  } satisfies WorkflowControlsBarProps), [
+    actionHandlers,
+    addToVideoEditor,
+    shotWorkflow, env.actualGenerationId, env.contentRef,
+    media.id, media.thumbUrl,
+    sharedState.effectiveMedia.mediaUrl, allShots, selectedShotId,
+    sharedState.shots.isAlreadyPositionedInSelectedShot,
+    sharedState.shots.isAlreadyAssociatedWithoutPosition,
+    showTickForImageId, showTickForSecondaryImageId,
+    handleNavigateToShotFromSelector, onClose,
+  ]);
+
+  // --- Panel layout ---
+  const showTaskDetails = props.features?.showTaskDetails ?? true;
+  const showPanel = sharedState.layout.shouldShowSidePanel
+    || (showTaskDetails && env.isMobile);
+  const panelVariant = (sharedState.layout.shouldShowSidePanel && !env.isMobile)
+    ? 'desktop' as const : 'mobile' as const;
+  const panelTaskId = adjustedTaskDetailsData?.taskId || media?.source_task_id || null;
+
+  const needsFullscreenLayout = true;
+  const needsTasksPaneOffset = needsFullscreenLayout
+    && (env.effectiveTasksPaneOpen || env.isTasksPaneLocked)
+    && !sharedState.layout.isPortraitMode
+    && sharedState.layout.isTabletOrLarger;
+
+  // --- Build lightbox state value ---
+  const lightboxStateValue = useMemo(() => ({
+    core: {
+      onClose, readOnly,
+      isMobile: env.isMobile,
+      isTabletOrLarger: sharedState.layout.isTabletOrLarger,
+      selectedProjectId: env.selectedProjectId,
+      actualGenerationId: env.actualGenerationId,
+    },
+    media: {
+      media, isVideo: false,
+      effectiveMediaUrl: sharedState.effectiveMedia.mediaUrl ?? '',
+      effectiveVideoUrl: '',
+      effectiveImageDimensions: sharedState.effectiveMedia.imageDimensions,
+      imageDimensions: env.imageDimensions,
+      setImageDimensions: env.setImageDimensions,
+    },
+    variants: lightboxVariants,
+    navigation: {
+      showNavigation: navigation?.showNavigation ?? true,
+      hasNext: navigation?.hasNext ?? false,
+      hasPrevious: navigation?.hasPrevious ?? false,
+      handleSlotNavNext, handleSlotNavPrev,
+      swipeNavigation: sharedState.navigation.swipeNavigation,
+    },
+  }), [
+    onClose, readOnly, env.isMobile, sharedState.layout.isTabletOrLarger,
+    env.selectedProjectId, env.actualGenerationId, media,
+    sharedState.effectiveMedia.mediaUrl, sharedState.effectiveMedia.imageDimensions,
+    env.imageDimensions, env.setImageDimensions, lightboxVariants,
+    navigation?.showNavigation, navigation?.hasNext, navigation?.hasPrevious,
+    handleSlotNavNext, handleSlotNavPrev, sharedState.navigation.swipeNavigation,
+  ]);
+
+  const controlsPanelContent = (
+    <ImageLightboxControlsPanel
+      taskDetailsData={adjustedTaskDetailsData}
+      showPanel={showPanel}
+      panelVariant={panelVariant}
+      panelTaskId={panelTaskId}
+    />
+  );
+
+  const layoutProps = useMemo(() => ({
+    showPanel,
+    shouldShowSidePanel: sharedState.layout.shouldShowSidePanel,
+    effectiveTasksPaneOpen: env.effectiveTasksPaneOpen,
+    effectiveTasksPaneWidth: env.effectiveTasksPaneWidth,
+    workflowBar,
+    buttonGroups: {
+      bottomRight: sharedState.buttonGroupProps.bottomRight,
+      topRight: {
+        ...sharedState.buttonGroupProps.topRight,
+        handleDownload, handleDelete,
+      },
+    },
+    customOverlay: props.customOverlay,
+    adjacentSegments,
+  } satisfies LightboxLayoutProps), [
+    showPanel, sharedState.layout.shouldShowSidePanel,
+    env.effectiveTasksPaneOpen, env.effectiveTasksPaneWidth, workflowBar,
+    sharedState.buttonGroupProps.bottomRight,
+    sharedState.buttonGroupProps.topRight, handleDownload, handleDelete, props.customOverlay, adjacentSegments,
+  ]);
+
+  return {
+    lightboxStateValue, layoutProps, controlsPanelContent,
+    needsFullscreenLayout, needsTasksPaneOffset,
+    accessibilityTitle: `Image Lightbox - ${media?.id?.substring(0, 8)}`,
+    accessibilityDescription: 'View and interact with image in full screen. Use arrow keys to navigate, Escape to close.',
+  };
+}
+
+export const ImageLightbox: React.FC<ImageLightboxProps> = (props) => {
+  useRenderBudget('ImageLightbox', 5);
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+  const instanceRef = useRef<string>();
+  if (!instanceRef.current) {
+    instanceRef.current = Math.random().toString(36).slice(2, 6);
+  }
+  const prevPropsRef = useRef<ImageLightboxProps | null>(null);
+  const changed: string[] = [];
+  if (prevPropsRef.current) {
+    const prev = prevPropsRef.current;
+    for (const key of Object.keys(props) as Array<keyof ImageLightboxProps>) {
+      if (prev[key] !== props[key]) changed.push(String(key));
+    }
+  }
+  prevPropsRef.current = props;
+  console.log(
+    `[ImageLightbox] r${renderCountRef.current} mediaId=${props.media?.id?.slice(0, 8)} changedProps=[${changed.join(', ')}]`,
+  );
+
+  const { onClose: onRequestClose } = props;
+  const env = useImageLightboxEnvironment(props);
+  const prevEnvRef = useRef<Record<string, unknown> | null>(null);
+  const envChanged: string[] = [];
+  if (prevEnvRef.current) {
+    for (const k of Object.keys(env) as Array<keyof typeof env>) {
+      if (prevEnvRef.current[k as string] !== (env as unknown as Record<string, unknown>)[k as string]) {
+        envChanged.push(k as string);
+      }
+    }
+  }
+  prevEnvRef.current = env as unknown as Record<string, unknown>;
+  if (envChanged.length > 0) {
+    console.log(`[ImageLightbox] env changed r${renderCountRef.current}: ${envChanged.join(', ')}`);
+  }
+  const sharedModel = useImageLightboxSharedState(props, env);
+  const renderModel = useImageLightboxRenderModel(props, env, sharedModel);
+  const overlayViewport: OverlayViewportConstraints = {
+    tasksPaneOpen: env.effectiveTasksPaneOpen,
+    tasksPaneWidth: env.effectiveTasksPaneWidth,
+    tasksPaneLocked: env.isTasksPaneLocked,
+    isTabletOrLarger: sharedModel.sharedState.layout.isTabletOrLarger,
+    needsFullscreenLayout: renderModel.needsFullscreenLayout,
+    needsTasksPaneOffset: renderModel.needsTasksPaneOffset,
+  };
+
+  return (
+    <LightboxProviders stateValue={renderModel.lightboxStateValue}>
+      <LightboxShell
+        onClose={onRequestClose}
+        isMobile={env.isMobile}
+        isTabletOrLarger={sharedModel.sharedState.layout.isTabletOrLarger}
+        overlayViewport={overlayViewport}
+        contentRef={env.contentRef}
+        accessibilityTitle={renderModel.accessibilityTitle}
+        accessibilityDescription={renderModel.accessibilityDescription}
+      >
+        <LightboxLayout {...renderModel.layoutProps} controlsPanelContent={renderModel.controlsPanelContent} />
+      </LightboxShell>
+    </LightboxProviders>
+  );
+};

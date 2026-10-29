@@ -1,0 +1,66 @@
+interface DeprecationBudgetPhase {
+  through: string;
+  max: number;
+}
+
+export interface DeprecationPolicy {
+  owner: string;
+  removeBy: string;
+  importBudgetPhases: readonly DeprecationBudgetPhase[];
+}
+
+type DeprecationPolicyId =
+  | 'runtime_error_alias'
+  | 'join_clips_compat'
+  | 'travel_structure_legacy';
+
+const DEPRECATION_POLICIES: Record<DeprecationPolicyId, DeprecationPolicy> = {
+  runtime_error_alias: {
+    owner: 'runtime-foundation',
+    removeBy: '2026-06-30',
+    importBudgetPhases: [
+      { through: '2026-03-31', max: 28 },
+      { through: '2026-04-30', max: 20 },
+      { through: '2026-05-31', max: 10 },
+      { through: '2026-06-30', max: 4 },
+    ],
+  },
+  join_clips_compat: {
+    owner: 'video-workflow',
+    removeBy: '2026-06-30',
+    importBudgetPhases: [],
+  },
+  travel_structure_legacy: {
+    owner: 'video-workflow',
+    removeBy: '2026-05-31',
+    importBudgetPhases: [],
+  },
+};
+
+export function getDeprecationPolicy(id: DeprecationPolicyId): DeprecationPolicy {
+  return DEPRECATION_POLICIES[id];
+}
+
+export function getDeprecationPolicyImportBudget(
+  policy: DeprecationPolicy,
+  now: Date = new Date(),
+): number {
+  const date = now.toISOString().slice(0, 10);
+  for (const phase of policy.importBudgetPhases) {
+    if (date <= phase.through) {
+      return phase.max;
+    }
+  }
+  return 0;
+}
+
+export function isPastRemovalTarget(
+  policy: DeprecationPolicy,
+  now: Date = new Date(),
+): boolean {
+  const timestamp = Date.parse(`${policy.removeBy}T23:59:59Z`);
+  if (!Number.isFinite(timestamp)) {
+    return false;
+  }
+  return now.getTime() > timestamp;
+}

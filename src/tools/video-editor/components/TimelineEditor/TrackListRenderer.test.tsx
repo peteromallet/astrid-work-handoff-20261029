@@ -1,0 +1,687 @@
+// @vitest-environment jsdom
+import React from 'react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { KeyboardSensor, useSensor, useSensors } from '@dnd-kit/core';
+import { describe, expect, it, vi } from 'vitest';
+import { VideoEditorRuntimeProvider, type VideoEditorRuntimeContextValue } from '@/tools/video-editor/contexts/VideoEditorRuntimeContext';
+import { createCommandRegistry, type CommandRegistry } from '@/tools/video-editor/runtime/commandRegistry';
+import { TrackLabelContent } from '@/tools/video-editor/components/TimelineEditor/TrackLabel';
+import {
+  computeActionVerticalPlacements,
+  TrackListRenderer,
+} from '@/tools/video-editor/components/TimelineEditor/TrackListRenderer';
+import type { TrackDefinition } from '@/tools/video-editor/types';
+import type { TimelineRow } from '@/tools/video-editor/types/timeline-canvas';
+import type { TimelineRowLayout } from '@/tools/video-editor/lib/timeline-row-layout.ts';
+import type { AstridExtension } from '@astrid/editor-sdk';
+
+const tracks: TrackDefinition[] = [
+  { id: 'V1', kind: 'visual', label: 'V1' },
+  { id: 'V2', kind: 'visual', label: 'V2' },
+];
+
+const rows: TimelineRow[] = [
+  {
+    id: 'V1',
+    actions: [{ id: 'clip-1', start: 0, end: 2, effectId: 'effect-clip-1' }],
+  },
+  {
+    id: 'V2',
+    actions: [{ id: 'clip-2', start: 2, end: 4, effectId: 'effect-clip-2' }],
+  },
+];
+
+function buildRuntime(commandRegistry: CommandRegistry): VideoEditorRuntimeContextValue {
+  const extension = {
+    manifest: {
+      id: 'ext.track',
+      version: '1.0.0',
+      label: 'Track Extension',
+    },
+  } as AstridExtension;
+
+  return {
+    provider: {} as VideoEditorRuntimeContextValue['provider'],
+    assetResolver: {} as VideoEditorRuntimeContextValue['assetResolver'],
+    auth: { userId: 'user-1' },
+    project: { projectId: 'project-1' },
+    shots: {} as VideoEditorRuntimeContextValue['shots'],
+    mediaLightbox: {} as VideoEditorRuntimeContextValue['mediaLightbox'],
+    agentChat: {} as VideoEditorRuntimeContextValue['agentChat'],
+    toast: {
+      error: vi.fn(),
+      success: vi.fn(),
+      warning: vi.fn(),
+      info: vi.fn(),
+    },
+    telemetry: {
+      log: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+    timelineId: 'timeline-1',
+    userId: 'user-1',
+    extensions: {
+      slots: {},
+      dialogHost: { dialogs: [] },
+      registry: { panels: [], inspectorSections: [] },
+      overlays: [],
+    },
+    extensionRuntime: {
+      extensions: [extension],
+      byId: new Map([['ext.track', extension]]),
+    } as VideoEditorRuntimeContextValue['extensionRuntime'],
+    commandRegistry,
+  };
+}
+
+function registerTrackMenuCommand(
+  registry: CommandRegistry,
+  options: {
+    command?: string;
+    label?: string;
+    menuLabel?: string;
+    when?: string;
+    handler?: Parameters<CommandRegistry['registerCommand']>[2];
+  } = {},
+) {
+  const command = options.command ?? 'ext.track.run';
+  registry.ingestCommandContribution('ext.track', {
+    id: `${command}.command` as never,
+    kind: 'command',
+    command,
+    label: options.label ?? 'Run track command',
+  });
+  registry.ingestContextMenuItemContribution('ext.track', {
+    id: `${command}.menu` as never,
+    kind: 'contextMenuItem',
+    command,
+    target: 'track',
+    label: options.menuLabel,
+    when: options.when,
+  });
+  registry.registerCommand('ext.track', command, options.handler ?? vi.fn());
+}
+
+describe('TrackListRenderer', () => {
+  it('paints same-row overlays above media and promotes whichever clip is selected without changing geometry', () => {
+    const overlappingRows = [{ id: 'V1', actions: [
+      { id: 'effect', start: 0, end: 6, effectId: 'effect' },
+      { id: 'media', start: 0, end: 10, effectId: 'media' },
+    ] }];
+    const getActionRender = (action: TimelineRow['actions'][number]) => <div>{action.id}</div>;
+    const view = (selected: string | null) => <TrackListRenderer
+      rows={overlappingRows} tracks={[tracks[0]]} rowHeight={36} startLeft={144}
+      pixelsPerSecond={40} selectedTrackId={null} deviceClass="desktop"
+      resizeClampedActionId={null} rowResizePreview={[{}]} resizeHandleWidth={8}
+      onSelectTrack={vi.fn()} onTrackChange={vi.fn()} onRemoveTrack={vi.fn()}
+      onTrackDragEnd={vi.fn()} trackSensors={[] as never} getActionRender={getActionRender}
+      getActionPaintLayer={(action) => action.id === selected ? 'selected' : action.id === 'effect' ? 'overlay' : undefined}
+    />;
+    const { container, rerender } = render(view(null));
+    const slot = (id: string) => container.querySelector<HTMLElement>(`[data-action-id="${id}"]`)!;
+    const effect = slot('effect'); const media = slot('media');
+    const geometry = (node: HTMLElement) => [node.style.left, node.style.top, node.style.width, node.style.height];
+    const initialGeometry = [geometry(effect), geometry(media)];
+    expect(Number(effect.style.zIndex)).toBeGreaterThan(Number(media.style.zIndex));
+    rerender(view('effect'));
+    expect(Number(effect.style.zIndex)).toBeGreaterThan(Number(media.style.zIndex));
+    expect(effect.style.zIndex).toBe('4');
+    rerender(view('media'));
+    expect(Number(media.style.zIndex)).toBeGreaterThan(Number(effect.style.zIndex));
+    rerender(view(null));
+    expect(Number(effect.style.zIndex)).toBeGreaterThan(Number(media.style.zIndex));
+    expect([slot('effect'), slot('media')]).toEqual([effect, media]);
+    expect([geometry(effect), geometry(media)]).toEqual(initialGeometry);
+    expect(overlappingRows[0].actions.map(action => action.id)).toEqual(['effect', 'media']);
+  });
+
+  it('renders mixed media and data rows in the shared layout order and uses supplied track heights', () => {
+    const rowLayout: TimelineRowLayout = {
+      rows: [
+        { sortableId: 'track-V1', kind: 'track', id: 'V1', top: 0, height: 40, mediaRowIndex: 0 },
+        { sortableId: 'data-lane-transcript', kind: 'dataLane', id: 'transcript', top: 40, height: 24 },
+        { sortableId: 'track-V2', kind: 'track', id: 'V2', top: 64, height: 56, mediaRowIndex: 1 },
+      ],
+      totalHeight: 120,
+      trackRects: new Map(),
+    };
+
+    const { container } = render(
+      <TrackListRenderer
+        rows={rows}
+        tracks={tracks}
+        rowLayout={rowLayout}
+        renderDataLane={(laneId) => <div data-sortable-id={`data-lane-${laneId}`} style={{ height: 24 }} />}
+        rowHeight={48}
+        startLeft={0}
+        pixelsPerSecond={100}
+        selectedTrackId={null}
+        deviceClass="desktop"
+        resizeClampedActionId={null}
+        rowResizePreview={[{}, {}]}
+        resizeHandleWidth={8}
+        onSelectTrack={vi.fn()}
+        onTrackChange={vi.fn()}
+        onRemoveTrack={vi.fn()}
+        onTrackDragEnd={vi.fn()}
+        trackSensors={[] as never}
+      />,
+    );
+
+    const sortableRows = [...container.querySelectorAll<HTMLElement>('[data-sortable-id]')];
+    expect(sortableRows.map((element) => element.dataset.sortableId)).toEqual([
+      'track-V1',
+      'data-lane-transcript',
+      'track-V2',
+    ]);
+    expect(sortableRows[0].style.height).toBe('40px');
+    expect(sortableRows[2].style.height).toBe('56px');
+  });
+
+  it('partitions overlapping minimum-width text hit targets while leaving generic clips alone', () => {
+    const row: TimelineRow = {
+      id: 'V1',
+      actions: [
+        { id: 'ava', start: 0, end: 0.04, effectId: 'text-ava' },
+        { id: 'boris', start: 0.1, end: 0.2, effectId: 'text-boris' },
+        { id: 'isolated', start: 0.5, end: 0.6, effectId: 'text-isolated' },
+        { id: 'generic', start: 0, end: 0.04, effectId: 'video-generic' },
+      ],
+    };
+    const placements = computeActionVerticalPlacements({
+      actions: row.actions,
+      row,
+      pixelsPerSecond: 100,
+      resizeHandleWidth: 8,
+      shouldStack: (action) => action.id !== 'generic',
+    });
+
+    expect(placements.get('ava')).toEqual({ lane: 0, laneCount: 2 });
+    expect(placements.get('boris')).toEqual({ lane: 1, laneCount: 2 });
+    expect(placements.get('isolated')).toEqual({ lane: 0, laneCount: 1 });
+    expect(placements.get('generic')).toEqual({ lane: 0, laneCount: 1 });
+  });
+
+  it('applies the vertical placement to clip bodies without changing their rendered width', () => {
+    const stackedRows: TimelineRow[] = [{
+      id: 'V1',
+      actions: [
+        { id: 'ava', start: 0, end: 0.04, effectId: 'text-ava' },
+        { id: 'boris', start: 0.1, end: 0.2, effectId: 'text-boris' },
+        { id: 'generic', start: 0, end: 0.04, effectId: 'video-generic' },
+      ],
+    }];
+    const { container } = render(
+      <TrackListRenderer
+        rows={stackedRows}
+        tracks={[tracks[0]]}
+        rowHeight={48}
+        startLeft={0}
+        pixelsPerSecond={100}
+        selectedTrackId={null}
+        deviceClass="desktop"
+        resizeClampedActionId={null}
+        rowResizePreview={[{}]}
+        resizeHandleWidth={8}
+        getActionRender={() => <div>clip</div>}
+        shouldStackOverlappingActions={(action) => action.id !== 'generic'}
+        onSelectTrack={vi.fn()}
+        onTrackChange={vi.fn()}
+        onRemoveTrack={vi.fn()}
+        onTrackDragEnd={vi.fn()}
+        trackSensors={[] as never}
+      />,
+    );
+
+    const slot = (id: string) => container.querySelector<HTMLElement>(`[data-action-id="${id}"]`)!;
+    expect(slot('ava').style).toMatchObject({ top: '4px', height: '20px', width: '24px' });
+    expect(slot('boris').style).toMatchObject({ top: '24px', height: '20px', width: '24px' });
+    expect(slot('generic').style).toMatchObject({ top: '4px', height: '40px', width: '24px' });
+    // Clip slots cover idle shot labels (z=1), retaining lane order.
+    expect(slot('ava').style.zIndex).toBe('2');
+    expect(slot('boris').style.zIndex).toBe('3');
+    expect(slot('generic').style.zIndex).toBe('2');
+  });
+
+  it('keeps a selectable clip body between both resize handles for very short clips', () => {
+    const shortRows: TimelineRow[] = [{
+      id: 'V1',
+      actions: [{ id: 'short-caption', start: 1, end: 1.01, effectId: 'effect-caption' }],
+    }];
+    const getActionRender = vi.fn((_action, _row, width) => (
+      <div data-testid="short-caption-body" data-render-width={width}>caption</div>
+    ));
+
+    const { container } = render(
+      <TrackListRenderer
+        rows={shortRows}
+        tracks={[tracks[0]]}
+        rowHeight={48}
+        startLeft={0}
+        pixelsPerSecond={100}
+        selectedTrackId={null}
+        deviceClass="desktop"
+        resizeClampedActionId={null}
+        rowResizePreview={[{}]}
+        resizeHandleWidth={8}
+        getActionRender={getActionRender}
+        onSelectTrack={vi.fn()}
+        onTrackChange={vi.fn()}
+        onRemoveTrack={vi.fn()}
+        onTrackDragEnd={vi.fn()}
+        trackSensors={[] as never}
+      />,
+    );
+
+    const slot = container.querySelector<HTMLElement>('[data-action-id="short-caption"]');
+    const handles = slot?.querySelectorAll<HTMLElement>('[data-resize-edge]');
+    expect(slot?.style.width).toBe('24px');
+    expect(screen.getByTestId('short-caption-body')).toHaveAttribute('data-render-width', '24');
+    expect(handles).toHaveLength(2);
+    expect(handles?.[0].style.width).toBe('8px');
+    expect(handles?.[1].style.width).toBe('8px');
+  });
+
+  it('keeps unaffected row action renders stable when the clamp ring changes for another row', () => {
+    const getActionRender = vi.fn((_action, _row, _width) => <div>clip</div>);
+    const props = {
+      rows,
+      tracks,
+      rowHeight: 48,
+      startLeft: 0,
+      pixelsPerSecond: 100,
+      selectedTrackId: null,
+      resizeClampedActionId: null,
+      rowResizePreview: [{}, {}],
+      resizeHandleWidth: 8,
+      getActionRender,
+      onSelectTrack: vi.fn(),
+      onTrackChange: vi.fn(),
+      onRemoveTrack: vi.fn(),
+      onTrackDragEnd: vi.fn(),
+      trackSensors: [] as never,
+    } satisfies React.ComponentProps<typeof TrackListRenderer>;
+
+    const { rerender } = render(<TrackListRenderer {...props} />);
+
+    expect(getActionRender).toHaveBeenCalledTimes(2);
+    expect(getActionRender.mock.calls.map(([action]) => action.id)).toEqual(['clip-1', 'clip-2']);
+
+    rerender(
+      <TrackListRenderer
+        {...props}
+        resizeClampedActionId="clip-1"
+      />,
+    );
+
+    expect(getActionRender).toHaveBeenCalledTimes(3);
+    expect(getActionRender.mock.calls.at(-1)?.[0].id).toBe('clip-1');
+  });
+
+  it('renders eligible extension track menu items and invokes with a snapshotted track target', async () => {
+    const registry = createCommandRegistry();
+    const handler = vi.fn();
+    registerTrackMenuCommand(registry, {
+      menuLabel: 'Analyze track',
+      when: 'target.target == "track" && target.trackId == "V1"',
+      handler,
+    });
+    const onSelectTrack = vi.fn();
+    const props = {
+      rows,
+      tracks,
+      rowHeight: 48,
+      startLeft: 0,
+      pixelsPerSecond: 100,
+      selectedTrackId: null,
+      resizeClampedActionId: null,
+      rowResizePreview: [{}, {}],
+      resizeHandleWidth: 8,
+      getActionRender: vi.fn((_action, _row, _width) => <div>clip</div>),
+      onSelectTrack,
+      onTrackChange: vi.fn(),
+      onRemoveTrack: vi.fn(),
+      onTrackDragEnd: vi.fn(),
+      trackSensors: [] as never,
+    } satisfies React.ComponentProps<typeof TrackListRenderer>;
+
+    const { container } = render(
+      <VideoEditorRuntimeProvider value={buildRuntime(registry)}>
+        <TrackListRenderer {...props} />
+      </VideoEditorRuntimeProvider>,
+    );
+
+    fireEvent.contextMenu(container.querySelector('[data-track-id="V1"]') as HTMLElement);
+    fireEvent.click(screen.getByText('Analyze track'));
+
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(onSelectTrack).toHaveBeenCalledWith('V1');
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'ext.track.run',
+      extensionId: 'ext.track',
+      target: { target: 'track', trackId: 'V1' },
+    }));
+  });
+
+  it.each(['phone', 'tablet'] as const)('names the track until it is tapped on %s (no inline buttons)', (deviceClass) => {
+    render(
+      <TrackLabelContent
+        track={tracks[0]}
+        isSelected={false}
+        hasClips={false}
+        deviceClass={deviceClass}
+        onSelect={vi.fn()}
+        onChange={vi.fn()}
+        onRemove={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(tracks[0].label)).toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it.each(['phone', 'tablet'] as const)('selects the track on %s without rendering a sheet or inline controls', (deviceClass) => {
+    const onSelect = vi.fn();
+    render(<TrackLabelContent
+      track={tracks[0]} isSelected={false} hasClips deviceClass={deviceClass}
+      onSelect={onSelect} onChange={vi.fn()} onRemove={vi.fn()}
+    />);
+    fireEvent.click(screen.getByText(tracks[0].label));
+    expect(onSelect).toHaveBeenCalledWith('V1');
+    expect(screen.getByText(tracks[0].label).closest('[data-track-label]')).not.toBeNull();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('timeline-track-sheet')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it('keeps the desktop hover overlay with its three inline actions', () => {
+    render(
+      <TrackLabelContent
+        track={tracks[0]}
+        isSelected={false}
+        hasClips={false}
+        onSelect={vi.fn()}
+        onChange={vi.fn()}
+        onRemove={vi.fn()}
+      />,
+    );
+
+    const reorder = screen.getByRole('button', { name: 'Reorder track' });
+    expect(reorder.className).toContain('h-6 w-6');
+    expect(reorder.closest('.opacity-0')).not.toBeNull();
+    expect(screen.getByTitle('Remove track')).toBeInTheDocument();
+    expect(screen.getByTitle('Track settings')).toBeInTheDocument();
+  });
+
+  it.each(['visual', 'audio'] as const)('retains the %s identity and same activator throughout a drag', (kind) => {
+    const track = { id: kind === 'visual' ? 'V1' : 'A1', kind, label: 'A named media track' };
+    const onChange = vi.fn();
+    const label = (rowDragging: boolean) => <TrackLabelContent
+      track={track} displayLabel={`${track.label} · context`}
+      isSelected={false} hasClips rowDragging={rowDragging}
+      onSelect={vi.fn()} onChange={onChange} onRemove={vi.fn()}
+    />;
+    const { container, rerender } = render(label(false));
+    const grip = screen.getByRole('button', { name: 'Reorder track' });
+    rerender(label(true));
+    expect(screen.getByRole('button', { name: 'Reorder track' })).toBe(grip);
+    expect(grip.closest('.opacity-0')).toBeNull();
+    expect(container.querySelector('[data-track-dragging="true"]')).not.toBeNull();
+    expect(screen.getByRole('textbox', { name: 'Track name' })).toHaveValue(`${track.label} · context`);
+    expect(screen.getByRole('textbox', { name: 'Track name' })).toHaveAttribute('readonly');
+    expect(screen.getByTitle('Track settings')).toHaveClass('hidden');
+    expect(screen.getByTitle('Remove track')).toHaveClass('hidden');
+    expect(container.querySelector('svg')).not.toBeNull();
+    expect(onChange).not.toHaveBeenCalled();
+    rerender(label(false));
+    expect(screen.getByRole('button', { name: 'Reorder track' })).toBe(grip);
+    expect(screen.getByRole('textbox', { name: 'Track name' })).not.toHaveAttribute('readonly');
+    expect(screen.getByTitle('Track settings')).not.toHaveClass('hidden');
+  });
+
+  it('forwards actual sortable drag state without dimming the media row and cancels without reordering', async () => {
+    const onTrackDragEnd = vi.fn();
+    function KeyboardTrack() {
+      const sensors = useSensors(useSensor(KeyboardSensor));
+      return <TrackListRenderer rows={[rows[0]]} tracks={[tracks[0]]}
+        rowHeight={36} startLeft={144} pixelsPerSecond={40} selectedTrackId={null}
+        deviceClass="desktop" resizeClampedActionId={null} rowResizePreview={[{}]}
+        resizeHandleWidth={8} onSelectTrack={vi.fn()} onTrackChange={vi.fn()}
+        onRemoveTrack={vi.fn()} onTrackDragEnd={onTrackDragEnd} trackSensors={sensors}
+      />;
+    }
+    const { container } = render(<KeyboardTrack />);
+    const grip = screen.getByRole('button', { name: 'Reorder track' });
+    grip.focus();
+    fireEvent.keyDown(grip, { key: ' ', code: 'Space' });
+    await waitFor(() => expect(container.querySelector('[data-track-dragging="true"]')).not.toBeNull());
+    expect(container.querySelector<HTMLElement>('[data-sortable-id="track-V1"]')?.style.opacity).not.toBe('0.5');
+    expect(screen.getByRole('button', { name: 'Reorder track' })).toBe(grip);
+    fireEvent.keyDown(document, { key: 'Escape', code: 'Escape' });
+    await waitFor(() => expect(container.querySelector('[data-track-dragging="true"]')).toBeNull());
+    expect(onTrackDragEnd).not.toHaveBeenCalled();
+  });
+
+  it('marks Source tracks and changes their role through the existing edit callback', async () => {
+    const onChange = vi.fn();
+    render(<TrackLabelContent
+      track={{ ...tracks[0], role: 'source' }}
+      isSelected={false}
+      hasClips
+      onSelect={vi.fn()}
+      onChange={onChange}
+      onRemove={vi.fn()}
+    />);
+
+    expect(screen.getByLabelText('Source — excluded from final output')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Track settings' }));
+    const role = await screen.findByRole('combobox', { name: 'Track role' });
+    expect(role).toHaveTextContent('Source');
+    fireEvent.click(role);
+    await userEvent.click(await screen.findByRole('option', { name: 'Output' }));
+    expect(onChange).toHaveBeenCalledWith('V1', { role: 'output' });
+  }, 30000);
+  it('keeps public read-only track labels free of edit and reorder controls', () => {
+    render(
+      <TrackLabelContent
+        track={tracks[0]}
+        isSelected={false}
+        hasClips
+        readOnly
+        onSelect={vi.fn()}
+        onChange={vi.fn()}
+        onRemove={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('V1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reorder track' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Track settings' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove track' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+  });
+
+  it('preserves the native track context menu when no extension items are eligible', () => {
+    const registry = createCommandRegistry();
+    registerTrackMenuCommand(registry, {
+      menuLabel: 'Hidden track action',
+      when: 'target.trackId == "missing"',
+    });
+    const onSelectTrack = vi.fn();
+    const { container } = render(
+      <VideoEditorRuntimeProvider value={buildRuntime(registry)}>
+        <TrackLabelContent
+          track={tracks[0]}
+          isSelected={false}
+          hasClips
+          onSelect={onSelectTrack}
+          onChange={vi.fn()}
+          onRemove={vi.fn()}
+        />
+      </VideoEditorRuntimeProvider>,
+    );
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+
+    container.firstElementChild?.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(onSelectTrack).not.toHaveBeenCalled();
+    expect(screen.queryByText('Hidden track action')).not.toBeInTheDocument();
+  });
+
+  it('filters track context menu contributions by predicate without hiding eligible items', () => {
+    const registry = createCommandRegistry();
+    registerTrackMenuCommand(registry, {
+      command: 'ext.track.visible',
+      menuLabel: 'Visible track action',
+      when: 'target.target == "track" && target.trackId == "V1"',
+    });
+    registerTrackMenuCommand(registry, {
+      command: 'ext.track.hidden',
+      menuLabel: 'Hidden track action',
+      when: 'target.trackId == "V2"',
+    });
+    const { container } = render(
+      <VideoEditorRuntimeProvider value={buildRuntime(registry)}>
+        <TrackLabelContent
+          track={tracks[0]}
+          isSelected={false}
+          hasClips
+          onSelect={vi.fn()}
+          onChange={vi.fn()}
+          onRemove={vi.fn()}
+        />
+      </VideoEditorRuntimeProvider>,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+
+    expect(screen.getByText('Visible track action')).toBeInTheDocument();
+    expect(screen.queryByText('Hidden track action')).not.toBeInTheDocument();
+  });
+
+  it('invokes track items with the target captured when the menu opened', async () => {
+    const registry = createCommandRegistry();
+    const handler = vi.fn();
+    registerTrackMenuCommand(registry, {
+      command: 'ext.track.snapshot',
+      menuLabel: 'Snapshot track',
+      handler,
+    });
+    const renderTrack = (track: TrackDefinition) => (
+      <VideoEditorRuntimeProvider value={buildRuntime(registry)}>
+        <TrackLabelContent
+          track={track}
+          isSelected={false}
+          hasClips={false}
+          onSelect={vi.fn()}
+          onChange={vi.fn()}
+          onRemove={vi.fn()}
+        />
+      </VideoEditorRuntimeProvider>
+    );
+    const { container, rerender } = render(renderTrack(tracks[0]));
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+    rerender(renderTrack({ ...tracks[0], label: 'Renamed V1' }));
+    fireEvent.click(screen.getByText('Snapshot track'));
+
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'ext.track.snapshot',
+      extensionId: 'ext.track',
+      target: { target: 'track', trackId: 'V1' },
+    }));
+  });
+
+  it('diagnoses stale snapshotted track targets instead of invoking extension handlers', async () => {
+    const registry = createCommandRegistry();
+    const staleToast = vi.fn();
+    registry.setCallbacks({
+      onContextMenuStaleTarget: staleToast,
+    });
+    const handler = vi.fn();
+    registerTrackMenuCommand(registry, {
+      command: 'ext.track.stale',
+      menuLabel: 'Use stale track',
+      handler,
+    });
+    const renderTrack = (track: TrackDefinition) => (
+      <VideoEditorRuntimeProvider value={buildRuntime(registry)}>
+        <TrackLabelContent
+          track={track}
+          isSelected={false}
+          hasClips={false}
+          onSelect={vi.fn()}
+          onChange={vi.fn()}
+          onRemove={vi.fn()}
+        />
+      </VideoEditorRuntimeProvider>
+    );
+    const { container, rerender } = render(renderTrack(tracks[0]));
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+    rerender(renderTrack({ id: 'V9', kind: 'visual', label: 'V9' }));
+    fireEvent.click(screen.getByText('Use stale track'));
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(staleToast).toHaveBeenCalledWith(
+      'ext.track.stale',
+      'ext.track',
+      'Track "V1" is no longer available.',
+    );
+    expect(registry.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'command-registry/context-menu-stale-target',
+        extensionId: 'ext.track',
+      }),
+    ]));
+  });
+});
+
+
+describe('track source/output settings', () => {
+  it('keeps the Source badge visible on desktop and explains whole-track use', async () => {
+    const onChange = vi.fn();
+    render(<TrackLabelContent
+      track={{ ...tracks[0], role: 'source' }} isSelected={false} hasClips
+      deviceClass="desktop" onSelect={vi.fn()} onChange={onChange} onRemove={vi.fn()}
+    />);
+    const badge = screen.getByLabelText('Source — excluded from final output');
+    expect(badge.closest('.opacity-0')).toBeNull();
+    expect(badge.parentElement?.className).not.toContain('group-hover:opacity-0');
+    fireEvent.click(screen.getByRole('button', { name: 'Track settings' }));
+    expect(await screen.findByText(/Applies to all items on this track/)).toHaveTextContent('Excluded from final output');
+    fireEvent.click(screen.getByRole('combobox', { name: 'Track role' }));
+    const option = await screen.findByRole('option', { name: 'Output' });
+    await userEvent.click(option);
+    expect(onChange).toHaveBeenCalledWith('V1', { role: 'output' });
+  }, 30000);
+
+  it.each(['phone', 'tablet'] as const)('keeps the Source badge visible on %s, where the track column only names the track', (deviceClass) => {
+    render(<TrackLabelContent
+      track={{ ...tracks[0], role: 'source' }} isSelected={false} hasClips
+      deviceClass={deviceClass} onSelect={vi.fn()} onChange={vi.fn()} onRemove={vi.fn()}
+    />);
+    const badge = screen.getByLabelText('Source — excluded from final output');
+    expect(badge.closest('.opacity-0')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Track settings' })).not.toBeInTheDocument();
+  });
+
+  it('shows legacy tracks as Output and edits role through the ordinary callback', async () => {
+    const onChange = vi.fn();
+    render(<TrackLabelContent
+      track={tracks[0]} isSelected={false} hasClips
+      onSelect={vi.fn()} onChange={onChange} onRemove={vi.fn()}
+    />);
+    expect(screen.queryByLabelText('Source — excluded from final output')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Track settings' }));
+    expect(await screen.findByRole('combobox', { name: 'Track role' })).toHaveTextContent('Output');
+    fireEvent.click(screen.getByRole('combobox', { name: 'Track role' }));
+    const option = await screen.findByRole('option', { name: 'Source' });
+    await userEvent.click(option);
+    expect(onChange).toHaveBeenCalledWith('V1', { role: 'source' });
+  }, 30000);
+});

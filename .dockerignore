@@ -1,0 +1,64 @@
+node_modules
+dist
+.vite
+.turbo
+.cache
+coverage
+test-results
+
+.git
+.gitignore
+.github
+
+.env
+.env.local
+.env.*.local
+
+logs
+*.log
+
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Tooling state — not needed inside the build context
+.claude
+.cursor
+.cursorrules
+.codex
+codex_logs
+.devcontainer
+.husky
+.agents
+.desloppify
+.pytest_cache
+.venv-debug
+.nixpacksignore
+.railwayignore
+
+# Local-only documents and notes
+tasks
+docs
+investigation
+*.md
+README.md
+VIDEO_EDITOR_INTEGRATION_PLAN.md
+findings.json
+localhost-*.log
+
+# Old build configs (replaced by Dockerfile)
+nixpacks.toml
+pnpm-lock.yaml
+
+# The Dockerfile itself doesn't need to be inside the image
+Dockerfile
+.dockerignore
+
+# Tests aren't needed for build/serve
+**/*.test.ts
+**/*.test.tsx
+**/*.spec.ts
+**/*.spec.tsx

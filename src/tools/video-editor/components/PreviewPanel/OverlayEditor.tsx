@@ -1,0 +1,898 @@
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import type { PointerEvent as ReactPointerEvent, RefObject } from 'react';
+import { Maximize2, RotateCcw } from 'lucide-react';
+import {
+  getClipTypeOverlayBehavior,
+  getDefaultBoxForClipType,
+  getRegisteredClipTypeDescriptor,
+  type ClipTypeOverlayBehavior,
+} from '@/tools/video-editor/clip-types/index.ts';
+import {
+  hasRenderableBounds,
+} from '@/tools/video-editor/lib/render-bounds.ts';
+import { useEffectDiagnostic, useRenderDiagnostic } from '@/tools/video-editor/hooks/usePerfDiagnostics.ts';
+import {
+  isTouchTimelineInput,
+  type TimelineContextTarget,
+  type TimelineDeviceClass,
+  type TimelineGestureOwner,
+  type TimelineInputModality,
+  type TimelineInspectorTarget,
+  type TimelineInteractionMode,
+} from '@/tools/video-editor/lib/mobile-interaction-model.ts';
+import type { ClipMeta } from '@/tools/video-editor/lib/timeline-data.ts';
+import type { TimelineRow } from '@/tools/video-editor/types/timeline-canvas.ts';
+import type { ResolvedTimelineConfig } from '@/tools/video-editor/types/index.ts';
+import {
+  clamp,
+  getFullBoundsFromVisibleBounds,
+  getVisibleBoundsFromCrop,
+  getVisibleClipIds,
+  MAX_CROP_FRACTION,
+  MIN_CLIP_SIZE,
+  normalizeCropValues,
+  scaleBoundsAboutCenter,
+  toOverlayStyle,
+  type CropValues,
+  type OverlayBounds,
+  type OverlayLayout,
+} from '@/tools/video-editor/lib/overlay-bounds.ts';
+import { VIDEO_EDITOR_THEME_VARS } from '@/tools/video-editor/lib/themeTokens.ts';
+
+interface OverlayEditorProps {
+  rows: TimelineRow[];
+  meta: Record<string, ClipMeta>;
+  registry: ResolvedTimelineConfig['registry'];
+  currentTime: number;
+  playerContainerRef: RefObject<HTMLDivElement>;
+  trackScaleMap: Record<string, number>;
+  compositionWidth: number;
+  compositionHeight: number;
+  selectedClipId: string | null;
+  deviceClass: TimelineDeviceClass;
+  inputModality: TimelineInputModality;
+  interactionMode: TimelineInteractionMode;
+  gestureOwner: TimelineGestureOwner;
+  onSelectClip: (clipId: string | null) => void;
+  onOverlayChange: (actionId: string, patch: Partial<ClipMeta>) => void;
+  setInputModalityFromPointerType: (pointerType: string | null | undefined) => TimelineInputModality;
+  setGestureOwner: (owner: TimelineGestureOwner) => void;
+  setContextTarget: (target: TimelineContextTarget) => void;
+  setInspectorTarget: (target: TimelineInspectorTarget) => void;
+  onDoubleClickAsset?: (assetKey: string, clipId?: string) => void;
+}
+
+type DragMode =
+  | 'move'
+  | 'resize-nw'
+  | 'resize-ne'
+  | 'resize-sw'
+  | 'resize-se'
+  | 'crop-n'
+  | 'crop-s'
+  | 'crop-e'
+  | 'crop-w';
+type OverlayViewModel = {
+  actionId: string;
+  track: string;
+  label: string;
+  bounds: OverlayBounds;
+  fullBounds: OverlayBounds;
+  cropValues: CropValues;
+  behavior: ClipTypeOverlayBehavior;
+};
+
+function OverlayEditorComponent({
+  rows,
+  meta,
+  registry: _registry,
+  currentTime,
+  playerContainerRef,
+  trackScaleMap,
+  compositionWidth,
+  compositionHeight,
+  selectedClipId,
+  deviceClass,
+  inputModality,
+  interactionMode: _interactionMode,
+  gestureOwner,
+  onSelectClip,
+  onOverlayChange,
+  setInputModalityFromPointerType,
+  setGestureOwner,
+  setContextTarget,
+  setInspectorTarget,
+  onDoubleClickAsset,
+}: OverlayEditorProps) {
+  const [layout, setLayout] = useState<OverlayLayout | null>(null);
+  const [editingClipId, setEditingClipId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
+  const [dragOverride, setDragOverride] = useState<{
+    actionId: string;
+    bounds: OverlayBounds;
+    cropValues: CropValues;
+    startBounds: OverlayBounds;
+  } | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const dragState = useRef<{
+    mode: DragMode;
+    actionId: string;
+    trackId: string;
+    startMouseX: number;
+    startMouseY: number;
+    pointerId: number;
+    scaleX: number;
+    scaleY: number;
+    target: HTMLElement;
+    startBounds: OverlayBounds;
+    startFullBounds: OverlayBounds;
+    startCropValues: CropValues;
+    startAspectRatio: number;
+    latestBounds: OverlayBounds;
+    cropValues: CropValues;
+    claimedOwnership: boolean;
+    hasChanges: boolean;
+  } | null>(null);
+  useRenderDiagnostic('OverlayEditor');
+  const markLayoutEffect = useEffectDiagnostic('overlayEditor:layout');
+  const touchPreviewInput = isTouchTimelineInput(deviceClass, inputModality);
+  // Touch keeps the picture clean: overlays are edited from the clip sheet, not with handles on the picture.
+  const allowsDirectManipulationControls = !(deviceClass !== 'desktop' && inputModality === 'touch');
+  const previewTouchAction = deviceClass === 'desktop' ? 'none' : 'manipulation';
+
+  const getTrackScale = useCallback((trackId: string): number => (
+    Math.max(trackScaleMap[trackId] ?? 1, 0.01)
+  ), [trackScaleMap]);
+
+  // The composition applies `scale(track.scale)` (center-origin) to the whole
+  // track subtree, so stored x/y/width/height are track-local. The gizmo works
+  // in rendered (composition) space: read = forward scale, write = inverse.
+  // Keeping both conversions here — and nowhere else — is what keeps gizmo and
+  // render agreeing at every track scale.
+  const toRenderedBounds = useCallback((bounds: OverlayBounds, trackId: string): OverlayBounds => (
+    scaleBoundsAboutCenter(bounds, getTrackScale(trackId), compositionWidth, compositionHeight)
+  ), [compositionHeight, compositionWidth, getTrackScale]);
+
+  const toStoredBounds = useCallback((bounds: OverlayBounds, trackId: string): OverlayBounds => (
+    scaleBoundsAboutCenter(bounds, 1 / getTrackScale(trackId), compositionWidth, compositionHeight)
+  ), [compositionHeight, compositionWidth, getTrackScale]);
+
+  const getClipBounds = useCallback((clipMeta: ClipMeta, trackId: string): OverlayBounds => {
+    // Must match VisualClip's hasPositionOverride check (includes crop fields).
+    // When any of these are set, Remotion renders with absolute positioning at
+    // clip.x/y/width/height; without them, every surface asks the clip-type
+    // descriptor for the canonical default box (`getDefaultBoxForClipType`).
+    const hasPositionOverride = (
+      clipMeta.x !== undefined
+      || clipMeta.y !== undefined
+      || clipMeta.width !== undefined
+      || clipMeta.height !== undefined
+      || clipMeta.cropTop !== undefined
+      || clipMeta.cropBottom !== undefined
+      || clipMeta.cropLeft !== undefined
+      || clipMeta.cropRight !== undefined
+    );
+
+    const storedBounds = hasPositionOverride
+      ? {
+          x: clipMeta.x ?? 0,
+          y: clipMeta.y ?? 0,
+          width: clipMeta.width ?? compositionWidth,
+          height: clipMeta.height ?? compositionHeight,
+        }
+      : getDefaultBoxForClipType(clipMeta.clipType, compositionWidth, compositionHeight);
+
+    return toRenderedBounds(storedBounds, trackId);
+  }, [compositionHeight, compositionWidth, toRenderedBounds]);
+
+  // Compute which clip IDs are visible at currentTime — this string only changes when clips enter/exit
+  const visibleClipKey = useMemo(() => {
+    const ids: string[] = [];
+    for (const row of rows) {
+      if (!row.id.startsWith('V')) continue;
+      for (const action of row.actions) {
+        if (currentTime >= action.start && currentTime < action.end) {
+          ids.push(action.id);
+        }
+      }
+    }
+    return ids.join(',');
+  }, [currentTime, rows]);
+
+  const activeOverlays = useMemo(() => {
+    const overlays: OverlayViewModel[] = [];
+    for (const row of rows) {
+      if (!row.id.startsWith('V')) {
+        continue;
+      }
+
+      for (const action of row.actions) {
+        if (currentTime < action.start || currentTime >= action.end) {
+          continue;
+        }
+
+        const clipMeta = meta[action.id];
+        if (!clipMeta || clipMeta.track !== row.id) {
+          continue;
+        }
+        const descriptor = getRegisteredClipTypeDescriptor(clipMeta.clipType);
+        const behavior = getClipTypeOverlayBehavior(descriptor);
+        if (behavior.excluded) {
+          continue;
+        }
+
+        const hasPositionOverride = behavior.alwaysVisible
+          || clipMeta.x !== undefined
+          || clipMeta.y !== undefined
+          || clipMeta.width !== undefined
+          || clipMeta.height !== undefined
+          || clipMeta.cropTop !== undefined
+          || clipMeta.cropBottom !== undefined
+          || clipMeta.cropLeft !== undefined
+          || clipMeta.cropRight !== undefined;
+        if (!hasPositionOverride && selectedClipId !== action.id) {
+          continue;
+        }
+
+        const fullBounds = getClipBounds(clipMeta, row.id);
+        const cropValues = normalizeCropValues({
+          cropTop: clipMeta.cropTop,
+          cropBottom: clipMeta.cropBottom,
+          cropLeft: clipMeta.cropLeft,
+          cropRight: clipMeta.cropRight,
+        });
+        const visibleBounds = getVisibleBoundsFromCrop(fullBounds, cropValues);
+        overlays.push({
+          actionId: action.id,
+          track: row.id,
+          label: clipMeta.text?.content || clipMeta.asset || descriptor?.label || action.id,
+          bounds: visibleBounds,
+          fullBounds,
+          cropValues,
+          behavior,
+        });
+      }
+    }
+
+    return overlays;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- visibleClipKey is a stable proxy for currentTime
+  }, [visibleClipKey, getClipBounds, meta, rows, selectedClipId]);
+
+  const effectiveOverlays = useMemo(() => {
+    if (!dragOverride) {
+      return activeOverlays;
+    }
+
+    return activeOverlays.map((overlay) => (
+      overlay.actionId === dragOverride.actionId
+        ? {
+            ...overlay,
+            bounds: dragOverride.bounds,
+            fullBounds: getFullBoundsFromVisibleBounds(dragOverride.bounds, dragOverride.cropValues),
+            cropValues: dragOverride.cropValues,
+          }
+        : overlay
+    ));
+  }, [activeOverlays, dragOverride]);
+
+  const computeLayout = useCallback((): OverlayLayout | null => {
+    const player = playerContainerRef.current;
+    if (!player || compositionWidth <= 0 || compositionHeight <= 0) {
+      return null;
+    }
+
+    const parent = player.offsetParent as HTMLElement | null;
+    if (!parent) {
+      return null;
+    }
+
+    const playerRect = player.getBoundingClientRect();
+    const parentRect = parent.getBoundingClientRect();
+    const videoAspect = compositionWidth / compositionHeight;
+    const containerAspect = playerRect.width / Math.max(1, playerRect.height);
+    const videoWidth = containerAspect > videoAspect ? playerRect.height * videoAspect : playerRect.width;
+    const videoHeight = containerAspect > videoAspect ? playerRect.height : playerRect.width / videoAspect;
+
+    return {
+      left: playerRect.left - parentRect.left + (playerRect.width - videoWidth) / 2,
+      top: playerRect.top - parentRect.top + (playerRect.height - videoHeight) / 2,
+      width: videoWidth,
+      height: videoHeight,
+    };
+  }, [compositionHeight, compositionWidth, playerContainerRef]);
+
+  useEffect(() => {
+    markLayoutEffect();
+    const updateLayout = () => setLayout(computeLayout());
+
+    updateLayout();
+    window.addEventListener('resize', updateLayout);
+    const player = playerContainerRef.current;
+    const observer = typeof ResizeObserver !== 'undefined' && player ? new ResizeObserver(updateLayout) : null;
+    if (observer && player) {
+      observer.observe(player);
+    }
+
+    return () => {
+      window.removeEventListener('resize', updateLayout);
+      observer?.disconnect();
+    };
+  }, [computeLayout, markLayoutEffect, playerContainerRef]);
+
+  const finishDrag = useCallback((pointerId: number | null) => {
+    const state = dragState.current;
+    if (!state) {
+      return;
+    }
+
+    const releasePointerId = pointerId ?? state.pointerId;
+    if (state.target.hasPointerCapture(releasePointerId)) {
+      state.target.releasePointerCapture(releasePointerId);
+    }
+    if (state.claimedOwnership) {
+      setGestureOwner('none');
+    }
+
+    dragState.current = null;
+    setDragOverride(null);
+    setDragActive(false);
+  }, [setGestureOwner]);
+
+  useEffect(() => {
+    if (!dragActive) {
+      return;
+    }
+
+    const onPointerMove = (event: PointerEvent) => {
+      const state = dragState.current;
+      if (!state || state.pointerId !== event.pointerId) {
+        return;
+      }
+
+      const deltaX = (event.clientX - state.startMouseX) * state.scaleX;
+      const deltaY = (event.clientY - state.startMouseY) * state.scaleY;
+      let nextBounds = { ...state.startBounds };
+      let nextCropValues = state.cropValues;
+
+      if (state.mode === 'move') {
+        nextBounds.x += deltaX;
+        nextBounds.y += deltaY;
+      } else if (state.mode.startsWith('crop-')) {
+        const minVisibleWidthFraction = Math.min(
+          MAX_CROP_FRACTION,
+          MIN_CLIP_SIZE / Math.max(MIN_CLIP_SIZE, state.startFullBounds.width),
+        );
+        const minVisibleHeightFraction = Math.min(
+          MAX_CROP_FRACTION,
+          MIN_CLIP_SIZE / Math.max(MIN_CLIP_SIZE, state.startFullBounds.height),
+        );
+        nextCropValues = { ...state.startCropValues };
+
+        if (state.mode === 'crop-e') {
+          nextCropValues.cropRight = clamp(
+            state.startCropValues.cropRight - deltaX / Math.max(MIN_CLIP_SIZE, state.startFullBounds.width),
+            0,
+            1 - state.startCropValues.cropLeft - minVisibleWidthFraction,
+          );
+        }
+        if (state.mode === 'crop-w') {
+          nextCropValues.cropLeft = clamp(
+            state.startCropValues.cropLeft + deltaX / Math.max(MIN_CLIP_SIZE, state.startFullBounds.width),
+            0,
+            1 - state.startCropValues.cropRight - minVisibleWidthFraction,
+          );
+        }
+        if (state.mode === 'crop-s') {
+          nextCropValues.cropBottom = clamp(
+            state.startCropValues.cropBottom - deltaY / Math.max(MIN_CLIP_SIZE, state.startFullBounds.height),
+            0,
+            1 - state.startCropValues.cropTop - minVisibleHeightFraction,
+          );
+        }
+        if (state.mode === 'crop-n') {
+          nextCropValues.cropTop = clamp(
+            state.startCropValues.cropTop + deltaY / Math.max(MIN_CLIP_SIZE, state.startFullBounds.height),
+            0,
+            1 - state.startCropValues.cropBottom - minVisibleHeightFraction,
+          );
+        }
+
+        nextCropValues = normalizeCropValues(nextCropValues);
+        nextBounds = getVisibleBoundsFromCrop(state.startFullBounds, nextCropValues);
+      } else {
+        // Corner resize — lock aspect ratio. Use the dominant axis (larger delta) to drive both.
+        const ar = state.startAspectRatio;
+        const absDX = Math.abs(deltaX);
+        const absDY = Math.abs(deltaY);
+        // Determine scale delta from the axis the user is dragging most
+        const useWidth = absDX * (state.startBounds.height / Math.max(1, state.startBounds.width)) >= absDY;
+        const east = state.mode.includes('e');
+        const south = state.mode.includes('s');
+        const west = state.mode.includes('w');
+        const north = state.mode.includes('n');
+
+        let newWidth: number;
+        let newHeight: number;
+        if (useWidth) {
+          newWidth = Math.max(MIN_CLIP_SIZE, state.startBounds.width + (east ? deltaX : -deltaX));
+          newHeight = Math.max(MIN_CLIP_SIZE, newWidth / ar);
+        } else {
+          newHeight = Math.max(MIN_CLIP_SIZE, state.startBounds.height + (south ? deltaY : -deltaY));
+          newWidth = Math.max(MIN_CLIP_SIZE, newHeight * ar);
+        }
+
+        if (west) {
+          nextBounds.x = state.startBounds.x + (state.startBounds.width - newWidth);
+        }
+        if (north) {
+          nextBounds.y = state.startBounds.y + (state.startBounds.height - newHeight);
+        }
+        nextBounds.width = newWidth;
+        nextBounds.height = newHeight;
+      }
+
+      state.latestBounds = nextBounds;
+      state.cropValues = nextCropValues;
+      state.hasChanges = true;
+      setDragOverride({
+        actionId: state.actionId,
+        bounds: nextBounds,
+        cropValues: nextCropValues,
+        startBounds: state.startBounds,
+      });
+
+      // Push changes to Remotion live so IT renders the image (no fake preview).
+      // This is cheap — just a shallow meta merge + React re-render. The gizmo
+      // works in rendered space; stored x/y/width/height are track-local, so
+      // the write inverts the track scale (`toStoredBounds`).
+      if (state.mode.startsWith('crop-')) {
+        onOverlayChange(state.actionId, {
+          ...toStoredBounds(state.startFullBounds, state.trackId),
+          cropTop: nextCropValues.cropTop || undefined,
+          cropBottom: nextCropValues.cropBottom || undefined,
+          cropLeft: nextCropValues.cropLeft || undefined,
+          cropRight: nextCropValues.cropRight || undefined,
+        });
+      } else {
+        onOverlayChange(
+          state.actionId,
+          toStoredBounds(getFullBoundsFromVisibleBounds(nextBounds, nextCropValues), state.trackId),
+        );
+      }
+    };
+
+    const onPointerUp = (event: PointerEvent) => {
+      const state = dragState.current;
+      if (!state || state.pointerId !== event.pointerId) {
+        return;
+      }
+
+      finishDrag(event.pointerId);
+    };
+
+    const onPointerCancel = (event: PointerEvent) => {
+      const state = dragState.current;
+      if (!state || state.pointerId !== event.pointerId) {
+        return;
+      }
+
+      finishDrag(event.pointerId);
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        finishDrag(null);
+      }
+    };
+
+    const onWindowBlur = () => {
+      finishDrag(null);
+    };
+
+    const onWindowContextMenu = () => {
+      finishDrag(null);
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerCancel);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', onWindowBlur);
+    window.addEventListener('contextmenu', onWindowContextMenu);
+    return () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerCancel);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', onWindowBlur);
+      window.removeEventListener('contextmenu', onWindowContextMenu);
+    };
+  }, [dragActive, finishDrag, onOverlayChange, toStoredBounds]);
+
+  const startDrag = useCallback((event: ReactPointerEvent<HTMLElement>, overlay: OverlayViewModel, mode: DragMode) => {
+    if (event.button !== 0) {
+      return;
+    }
+    if (gestureOwner !== 'none' && gestureOwner !== 'preview') {
+      return;
+    }
+
+    const nextInputModality = setInputModalityFromPointerType(event.pointerType);
+    const nextContextTarget: TimelineContextTarget = { kind: 'overlay', clipId: overlay.actionId };
+    const nextInspectorTarget: TimelineInspectorTarget = { kind: 'clip', clipId: overlay.actionId };
+
+    setContextTarget(nextContextTarget);
+    setInspectorTarget(nextInspectorTarget);
+    onSelectClip(overlay.actionId);
+
+    if (deviceClass !== 'desktop' && nextInputModality === 'touch') {
+      event.stopPropagation();
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setGestureOwner('preview');
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    const scaleX = compositionWidth / Math.max(1, layout?.width ?? 1);
+    const scaleY = compositionHeight / Math.max(1, layout?.height ?? 1);
+    dragState.current = {
+      mode,
+      actionId: overlay.actionId,
+      trackId: overlay.track,
+      startMouseX: event.clientX,
+      startMouseY: event.clientY,
+      pointerId: event.pointerId,
+      scaleX,
+      scaleY,
+      target: event.currentTarget,
+      startBounds: { ...overlay.bounds },
+      startFullBounds: { ...overlay.fullBounds },
+      startCropValues: { ...overlay.cropValues },
+      startAspectRatio: overlay.bounds.width / Math.max(1, overlay.bounds.height),
+      latestBounds: { ...overlay.bounds },
+      cropValues: { ...overlay.cropValues },
+      claimedOwnership: true,
+      hasChanges: false,
+    };
+    setDragActive(true);
+  }, [
+    compositionHeight,
+    compositionWidth,
+    deviceClass,
+    gestureOwner,
+    layout,
+    onSelectClip,
+    setContextTarget,
+    setGestureOwner,
+    setInputModalityFromPointerType,
+    setInspectorTarget,
+  ]);
+
+  const beginTextEdit = useCallback((actionId: string) => {
+    const clipMeta = meta[actionId];
+    const behavior = getClipTypeOverlayBehavior(
+      getRegisteredClipTypeDescriptor(clipMeta?.clipType),
+    );
+    if (!behavior.supportsInlineTextEdit) {
+      return;
+    }
+
+    setEditingClipId(actionId);
+    setEditText(clipMeta.text?.content ?? '');
+  }, [meta]);
+
+  const commitText = useCallback(() => {
+    if (!editingClipId) {
+      return;
+    }
+
+    const clipMeta = meta[editingClipId];
+    const behavior = getClipTypeOverlayBehavior(
+      getRegisteredClipTypeDescriptor(clipMeta?.clipType),
+    );
+    if (behavior.supportsInlineTextEdit) {
+      onOverlayChange(editingClipId, {
+        text: {
+          ...(clipMeta.text ?? { content: '' }),
+          content: editText,
+        },
+      });
+    }
+    setEditingClipId(null);
+  }, [editText, editingClipId, meta, onOverlayChange]);
+
+  if (!layout) {
+    return null;
+  }
+
+  const fontScale = layout.width / Math.max(1, compositionWidth);
+  const draggingId = dragOverride?.actionId ?? null;
+  const isCropDrag = dragState.current?.mode.startsWith('crop-') ?? false;
+
+  return (
+    <div
+      className="pointer-events-none absolute"
+      style={{ ...VIDEO_EDITOR_THEME_VARS, left: layout.left, top: layout.top, width: layout.width, height: layout.height, touchAction: previewTouchAction }}
+    >
+      {/* Dim entire composition during crop drag, with a hole for the visible crop area */}
+      {isCropDrag && (() => {
+        const cropOverlay = effectiveOverlays.find((o) => o.actionId === draggingId);
+        if (!cropOverlay) return null;
+        // The visible (kept) bounds in screen space as percentages of the layout
+        const vl = ((cropOverlay.bounds.x) / compositionWidth) * 100;
+        const vt = ((cropOverlay.bounds.y) / compositionHeight) * 100;
+        const vr = ((cropOverlay.bounds.x + cropOverlay.bounds.width) / compositionWidth) * 100;
+        const vb = ((cropOverlay.bounds.y + cropOverlay.bounds.height) / compositionHeight) * 100;
+        // Clamp to composition edges (0-100%)
+        const cl = Math.max(0, Math.min(100, vl));
+        const ct = Math.max(0, Math.min(100, vt));
+        const cr = Math.max(0, Math.min(100, vr));
+        const cb = Math.max(0, Math.min(100, vb));
+        return (
+          <div
+            className="absolute inset-0"
+            style={{
+              backgroundColor: 'var(--video-editor-stage-dim)',
+              clipPath: `polygon(0% 0%, 100% 0%, 100% 100%, 0% 100%, 0% ${ct}%, ${cl}% ${ct}%, ${cl}% ${cb}%, ${cr}% ${cb}%, ${cr}% ${ct}%, 0% ${ct}%)`,
+            }}
+          />
+        );
+      })()}
+      {effectiveOverlays.map((overlay) => {
+        const clipMeta = meta[overlay.actionId];
+        const isSelected = selectedClipId === overlay.actionId;
+        const isDragging = draggingId === overlay.actionId;
+        const isDraggingCrop = isDragging && isCropDrag;
+
+        // During crop drag, show overlay at FULL bounds so the image stays in place;
+        // crop is visualised as a mask over the cropped-out regions.
+        // Do NOT clamp overlay bounds to composition — the overlay should extend
+        // beyond the composition edge so users can see and drag their clip back.
+        // Only Remotion's render layer (VisualClip) clamps to the viewport.
+        const displayBounds = isDraggingCrop ? overlay.fullBounds : overlay.bounds;
+        const style = toOverlayStyle(displayBounds, layout, compositionWidth, compositionHeight);
+        const renderFullBounds = overlay.fullBounds;
+
+        const hasCrop = (
+          overlay.cropValues.cropTop > 0
+          || overlay.cropValues.cropBottom > 0
+          || overlay.cropValues.cropLeft > 0
+          || overlay.cropValues.cropRight > 0
+        );
+
+        // Show full-bounds ghost when a cropped clip is selected (not during crop drag —
+        // during crop drag the overlay is already at full bounds).
+        const ghostStyle: CSSProperties | null = isSelected && hasCrop && !isDraggingCrop && hasRenderableBounds(renderFullBounds)
+          ? {
+              left: ((renderFullBounds.x - displayBounds.x) / compositionWidth) * layout.width,
+              top: ((renderFullBounds.y - displayBounds.y) / compositionHeight) * layout.height,
+              width: (renderFullBounds.width / compositionWidth) * layout.width,
+              height: (renderFullBounds.height / compositionHeight) * layout.height,
+            }
+          : null;
+
+        const scaledFontSize = Math.max(12, (clipMeta?.text?.fontSize ?? 64) * fontScale);
+
+        // During move/resize drag, render the image at full bounds with clip-path
+        // (exactly how Remotion renders it). This is a separate layer behind the
+        // overlay controls so it's pixel-perfect regardless of crop.
+        return (
+          <div
+            key={overlay.actionId}
+            data-overlay-hit="true"
+            className="absolute pointer-events-auto"
+            style={style}
+          >
+              {ghostStyle && (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute rounded border border-dashed border-[color:var(--video-editor-stage-ghost-border)] bg-[var(--video-editor-stage-ghost-bg)] opacity-80"
+                  style={ghostStyle}
+                />
+              )}
+              {editingClipId === overlay.actionId && overlay.behavior.supportsInlineTextEdit ? (
+              <textarea
+                data-inline-text-editor="true"
+                className="h-full w-full resize-none rounded border border-[color:var(--video-editor-accent-border-strong)] bg-[var(--video-editor-stage-control-bg-strong)] p-2 text-[color:var(--video-editor-stage-fg)] outline-none"
+                value={editText}
+                style={{
+                  fontSize: scaledFontSize,
+                  color: clipMeta?.text?.color ?? 'var(--video-editor-stage-fg)',
+                  textAlign: clipMeta?.text?.align ?? 'left',
+                }}
+                onChange={(event) => setEditText(event.target.value)}
+                onBlur={commitText}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                    commitText();
+                  }
+                }}
+                autoFocus
+              />
+            ) : (
+              <div
+                role="button"
+                tabIndex={0}
+                className={`group relative h-full w-full rounded text-left transition motion-reduce:transition-none ${isSelected ? 'border border-[color:var(--video-editor-accent-border-strong)] bg-[var(--video-editor-accent-bg)] shadow-[0_0_0_1px_var(--video-editor-accent-border)]' : 'border border-transparent hover:border-[color:var(--video-editor-stage-hover-border)]'}`}
+                style={{ touchAction: previewTouchAction }}
+                aria-label={isSelected ? `Selected overlay ${overlay.label}` : `Select overlay ${overlay.label}`}
+                aria-pressed={isSelected}
+                onPointerDown={(event) => startDrag(event, overlay, 'move')}
+                onDoubleClick={() => {
+                  if (overlay.behavior.doubleClickAction === 'inline-text-edit') {
+                    beginTextEdit(overlay.actionId);
+                  } else if (overlay.behavior.doubleClickAction === 'lightbox' && clipMeta?.asset) {
+                    onDoubleClickAsset?.(clipMeta.asset, overlay.actionId);
+                  }
+                }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSelectClip(overlay.actionId);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') {
+                    return;
+                  }
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onSelectClip(overlay.actionId);
+                }}
+              >
+                {isSelected && allowsDirectManipulationControls && overlay.behavior.allowsBoundsEditing && (['resize-nw', 'resize-ne', 'resize-sw', 'resize-se'] as const).map((mode) => {
+                  const pos = {
+                    'resize-nw': 'left-0 top-0 -translate-x-1/2 -translate-y-1/2 cursor-nwse-resize',
+                    'resize-ne': 'right-0 top-0 translate-x-1/2 -translate-y-1/2 cursor-nesw-resize',
+                    'resize-sw': 'left-0 bottom-0 -translate-x-1/2 translate-y-1/2 cursor-nesw-resize',
+                    'resize-se': 'right-0 bottom-0 translate-x-1/2 translate-y-1/2 cursor-nwse-resize',
+                  }[mode];
+                  return (
+                    <span
+                      key={mode}
+                      aria-hidden="true"
+                      className={`absolute rounded-full border border-[color:var(--video-editor-stage-handle-border)] bg-[var(--video-editor-accent-border-strong)] ${touchPreviewInput ? 'h-11 w-11' : 'h-3 w-3'} ${pos}`}
+                      style={{ touchAction: previewTouchAction }}
+                      onPointerDown={(event) => startDrag(event, overlay, mode)}
+                    />
+                  );
+                })}
+                {isSelected && allowsDirectManipulationControls && overlay.behavior.allowsCrop && ([
+                  {
+                    mode: 'crop-n',
+                    hitClassName: 'left-1.5 right-1.5 top-0 h-3 -translate-y-1/2 cursor-ns-resize',
+                    lineClassName: 'left-1 right-1 top-1/2 h-px -translate-y-1/2',
+                  },
+                  {
+                    mode: 'crop-s',
+                    hitClassName: 'bottom-0 left-1.5 right-1.5 h-3 translate-y-1/2 cursor-ns-resize',
+                    lineClassName: 'bottom-1/2 left-1 right-1 h-px translate-y-1/2',
+                  },
+                  {
+                    mode: 'crop-w',
+                    hitClassName: 'bottom-1.5 left-0 top-1.5 w-3 -translate-x-1/2 cursor-ew-resize',
+                    lineClassName: 'bottom-1 left-1/2 top-1 w-px -translate-x-1/2',
+                  },
+                  {
+                    mode: 'crop-e',
+                    hitClassName: 'bottom-1.5 right-0 top-1.5 w-3 translate-x-1/2 cursor-ew-resize',
+                    lineClassName: 'bottom-1 right-1/2 top-1 w-px translate-x-1/2',
+                  },
+                ] as const).map(({ mode, hitClassName, lineClassName }) => (
+                  <span
+                    key={mode}
+                    aria-hidden="true"
+                    className={`absolute ${touchPreviewInput ? hitClassName.replace('h-3', 'h-11').replace('w-3', 'w-11') : hitClassName}`}
+                    style={{ touchAction: previewTouchAction }}
+                    onPointerDown={(event) => startDrag(event, overlay, mode)}
+                  >
+                    <span
+                      className={`pointer-events-none absolute rounded-full transition motion-reduce:transition-none ${lineClassName} ${isSelected || touchPreviewInput ? 'bg-[var(--video-editor-accent-text-soft)]' : 'bg-transparent group-hover:bg-[var(--video-editor-stage-guide-hover)]'}`}
+                    />
+                  </span>
+                ))}
+                {isSelected && allowsDirectManipulationControls && (
+                  <div
+                    className="absolute right-1 top-1 flex gap-1"
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    {/* Only show reset if the clip has been moved/resized/cropped */}
+                    {(clipMeta?.x !== undefined || clipMeta?.y !== undefined
+                      || clipMeta?.width !== undefined || clipMeta?.height !== undefined
+                      || clipMeta?.cropTop !== undefined || clipMeta?.cropBottom !== undefined
+                      || clipMeta?.cropLeft !== undefined || clipMeta?.cropRight !== undefined) && (
+                      <button
+                        type="button"
+                        title="Reset to original size"
+                        aria-label="Reset overlay to original size"
+                        className={`flex items-center justify-center rounded bg-[var(--video-editor-stage-control-bg-strong)] text-[color:var(--video-editor-stage-fg-muted)] transition motion-reduce:transition-none hover:bg-[var(--video-editor-stage-control-bg-hover-strong)] hover:text-[color:var(--video-editor-stage-fg)] ${touchPreviewInput ? 'h-11 w-11' : 'h-6 w-6'}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // Keep current position (x/y), reset size to composition
+                          // dimensions and clear crop
+                          onOverlayChange(overlay.actionId, {
+                            width: compositionWidth,
+                            height: compositionHeight,
+                            cropTop: undefined,
+                            cropBottom: undefined,
+                            cropLeft: undefined,
+                            cropRight: undefined,
+                          } as Partial<ClipMeta>);
+                        }}
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      title="Fill composition"
+                      aria-label="Fill overlay to composition"
+                      className={`flex items-center justify-center rounded bg-[var(--video-editor-stage-control-bg-strong)] text-[color:var(--video-editor-stage-fg-muted)] transition motion-reduce:transition-none hover:bg-[var(--video-editor-stage-control-bg-hover-strong)] hover:text-[color:var(--video-editor-stage-fg)] ${touchPreviewInput ? 'h-11 w-11' : 'h-6 w-6'}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOverlayChange(overlay.actionId, {
+                          x: 0,
+                          y: 0,
+                          width: compositionWidth,
+                          height: compositionHeight,
+                          cropTop: undefined,
+                          cropBottom: undefined,
+                          cropLeft: undefined,
+                          cropRight: undefined,
+                        } as Partial<ClipMeta>);
+                      }}
+                    >
+                      <Maximize2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Shallow prop equality, ignoring `currentTime` (handled separately below). */
+const propsEqualIgnoringTime = (prev: OverlayEditorProps, next: OverlayEditorProps): boolean => {
+  const prevKeys = Object.keys(prev) as (keyof OverlayEditorProps)[];
+  if (prevKeys.length !== Object.keys(next).length) {
+    return false;
+  }
+  for (const key of prevKeys) {
+    if (key === 'currentTime') continue;
+    if (!Object.is(prev[key], next[key])) return false;
+  }
+  return true;
+};
+
+/**
+ * `React.memo` comparator: true means "skip the re-render".
+ *
+ * Exported for the unit test — the memo boundary is the only place it is used.
+ */
+export const overlayEditorPropsAreEqual = (
+  prev: OverlayEditorProps,
+  next: OverlayEditorProps,
+): boolean => {
+  // Every other prop must be referentially equal — this is the shallow
+  // comparison React.memo would do on its own. It has to be spelled out
+  // because a custom comparator replaces the default one entirely; the
+  // previous version returned `false` whenever currentTime was unchanged,
+  // so the memo never skipped a single parent-driven re-render.
+  if (!propsEqualIgnoringTime(prev, next)) {
+    return false;
+  }
+  if (prev.currentTime === next.currentTime) {
+    return true;
+  }
+  // currentTime moved: still skip when the same clips are on screen, because
+  // nothing this component renders depends on the playhead beyond visibility.
+  return getVisibleClipIds(prev.rows, prev.currentTime) === getVisibleClipIds(next.rows, next.currentTime);
+};
+
+const OverlayEditor = memo(OverlayEditorComponent, overlayEditorPropsAreEqual);
+
+export default OverlayEditor;

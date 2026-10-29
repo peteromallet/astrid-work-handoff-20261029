@@ -1,0 +1,6 @@
+# Kept only for the chat-voice edge function (switched off in the app for now).
+# JWT verification stays on (the default): the function needs a user token.
+project_id = "astrid-app"
+
+[functions.ai-voice-prompt]
+verify_jwt = true

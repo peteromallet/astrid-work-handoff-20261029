@@ -1,0 +1,319 @@
+/**
+ * Shared host-owned service factory for trusted component data-kind
+ * registration (dataKind V1, single bind model — clipType analog).
+ *
+ * One instance per extension, created by the host during context assembly.
+ * `register()` gates on the extension's *declared* `DataKindContribution`s
+ * by `kindId`; undeclared kindIds emit `dataKinds/undeclared-kind` and
+ * return a no-op handle. Declared kindIds copy the contribution fields onto
+ * a `DataKindRegistryRecord` (the renderer lives on the record) and store it
+ * in the shared {@link DataKindRegistry}.
+ */
+
+import type {
+  DataCoordinateDomain,
+  DataItemInspectorProps,
+  DataKindContribution,
+  DataLaneActionDescriptor,
+  DataKindRegistrationOptions,
+  DataKindRegistrationService,
+  DataKindSourceItem,
+  DataLaneRendererProps,
+  DataShape,
+  DisposeHandle,
+  ExtensionDiagnostic,
+  ExtensionDiagnosticsService,
+  AstridExtension,
+} from '@astrid/editor-sdk';
+import { KNOWN_DATA_SHAPES, KNOWN_DATA_DOMAINS } from '@/sdk/video/families/dataKind';
+import type { DataKindRegistry } from '@/tools/video-editor/data-kinds/DataKindRegistry.ts';
+import type { DataKindItemsHost } from '@/tools/video-editor/data-kinds/dataKindItems.ts';
+import type {
+  DataKindProvenance,
+  DataKindRegistryRecord,
+} from '@/tools/video-editor/data-kinds/DataKindRegistry.ts';
+import type {
+  ContributionRenderability,
+  RenderCapability,
+  DeterminismStatus,
+} from '@/tools/video-editor/runtime/renderability.ts';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a {@link ContributionRenderability} from a `DataKindContribution`.
+ *
+ * V1 data kinds are preview-only: no export routes exist for lanes, so
+ * browser-export and worker-export are always blocked (no `allowExport`
+ * fields on the contribution — export roles wait for V3).
+ */
+function buildDataKindRenderability(): ContributionRenderability {
+  const capabilities: RenderCapability[] = [
+    {
+      route: 'preview',
+      status: 'supported',
+      determinism: 'preview-only',
+    },
+    {
+      route: 'browser-export',
+      status: 'blocked',
+      determinism: 'preview-only',
+      blockerReason: 'route-unsupported',
+      message: 'Browser export is not supported for data kinds in V1.',
+    },
+    {
+      route: 'worker-export',
+      status: 'blocked',
+      determinism: 'preview-only',
+      blockerReason: 'route-unsupported',
+      message: 'Worker export is not supported for data kinds in V1.',
+    },
+  ];
+
+  const determinism: DeterminismStatus = 'preview-only';
+
+  return {
+    capabilities: Object.freeze(capabilities.map((c) => Object.freeze(c))),
+    defaultRoute: 'preview',
+    determinism,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+export interface CreateDataKindRegistrationServiceParams {
+  /** The activating extension (manifest supplies the declared contributions). */
+  readonly extension: AstridExtension;
+  /** Shared provider-scoped data-kind registry. */
+  readonly dataKindRegistry: DataKindRegistry;
+  /** Per-extension diagnostics service for gate/validation diagnostics. */
+  readonly diagnosticsService: ExtensionDiagnosticsService;
+  readonly itemsHost?: DataKindItemsHost | null;
+}
+
+/**
+ * Create a {@link DataKindRegistrationService} for a single extension.
+ *
+ * The returned service is typically passed as the `dataKinds` argument to
+ * {@link createExtensionContext} so extensions can imperatively bind lane
+ * renderers during `activate()` via `ctx.dataKinds.register(kindId, ...)`.
+ */
+export function createDataKindRegistrationService(
+  params: CreateDataKindRegistrationServiceParams,
+): DataKindRegistrationService {
+  const { extension, dataKindRegistry, diagnosticsService, itemsHost } = params;
+  const extensionId = extension.manifest.id as string;
+
+  // Index declared dataKind contributions by kindId for O(1) gate lookup.
+  const contributionsByKindId = new Map<string, DataKindContribution>();
+  for (const contrib of extension.manifest.contributions ?? []) {
+    // Manifest-side contribution types widen kindId to `string | undefined`;
+    // validateManifest already rejects blank dataKind kindIds, so this guard
+    // only satisfies the narrowed registry key.
+    if (contrib.kind === 'dataKind' && typeof contrib.kindId === 'string' && contrib.kindId.length > 0) {
+      contributionsByKindId.set(contrib.kindId, contrib as DataKindContribution);
+    }
+  }
+
+  /** Emit a structured diagnostic into the extension's diagnostics service. */
+  function emit(
+    severity: ExtensionDiagnostic['severity'],
+    code: string,
+    message: string,
+    detail?: Record<string, unknown>,
+  ): void {
+    diagnosticsService.report({ severity, code, message, detail });
+  }
+
+  function normalizeLaneActions(
+    kindId: string,
+    actions: readonly DataLaneActionDescriptor[] | undefined,
+  ): readonly DataLaneActionDescriptor[] | undefined {
+    if (!actions) return undefined;
+    const normalized: DataLaneActionDescriptor[] = [];
+    const seen = new Set<string>();
+    for (const [index, action] of actions.entries()) {
+      const valid = action
+        && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(action.id)
+        && action.label.trim().length > 0
+        && action.label.length <= 40
+        && (action.ariaLabel === undefined || (action.ariaLabel.trim().length > 0 && action.ariaLabel.length <= 100))
+        && (action.title === undefined || (action.title.trim().length > 0 && action.title.length <= 160))
+        && typeof action.invoke === 'function'
+        && !seen.has(action.id)
+        && normalized.length < 6;
+      if (!valid) {
+        emit(
+          'warning',
+          'dataKinds/invalid-lane-action',
+          `Ignored invalid or excess lane action at index ${index} for data kind "${kindId}".`,
+          { kindId, extensionId, index },
+        );
+        continue;
+      }
+      seen.add(action.id);
+      normalized.push(Object.freeze({ ...action }));
+    }
+    return normalized.length > 0 ? Object.freeze(normalized) : undefined;
+  }
+
+  function register(
+    kindId: string,
+    laneRenderer: (props: DataLaneRendererProps) => unknown,
+    inspector?: (props: DataItemInspectorProps) => unknown,
+    options?: DataKindRegistrationOptions,
+  ): DisposeHandle {
+    // ---- Gate on the declared contribution ---------------------------------
+    const contrib = contributionsByKindId.get(kindId);
+    if (!contrib) {
+      emit(
+        'error',
+        'dataKinds/undeclared-kind',
+        `Data kind "${kindId}" is not declared as a DataKindContribution in extension "${extensionId}". ` +
+          `Declared data kind IDs: [${[...contributionsByKindId.keys()].join(', ') || '(none)'}].`,
+        { kindId, extensionId },
+      );
+      return { dispose() {} };
+    }
+
+    // ---- Host-validate open-string shape/domain -------
+    // Manifest validation rejects unknown values; this re-check also catches
+    // absent fields, which the public schema permits but the registry record
+    // requires (closed vocabularies feed lane painting).
+    const declaredShape = KNOWN_DATA_SHAPES.includes(contrib.shape as DataShape)
+      ? (contrib.shape as DataShape)
+      : undefined;
+    const declaredDomain = KNOWN_DATA_DOMAINS.includes(contrib.domain as DataCoordinateDomain)
+      ? (contrib.domain as DataCoordinateDomain)
+      : undefined;
+
+    if (!declaredShape) {
+      emit(
+        'error',
+        'dataKinds/invalid-shape',
+        `Data kind "${kindId}" must declare a known shape; got ${JSON.stringify(contrib.shape ?? null)}. ` +
+          `Known shapes: ${KNOWN_DATA_SHAPES.join(', ')}.`,
+        { kindId, extensionId, shape: contrib.shape ?? null },
+      );
+    }
+    if (!declaredDomain) {
+      emit(
+        'error',
+        'dataKinds/invalid-domain',
+        `Data kind "${kindId}" must declare a known coordinate domain; got ${JSON.stringify(contrib.domain ?? null)}. ` +
+          `Known domains: ${KNOWN_DATA_DOMAINS.join(', ')}.`,
+        { kindId, extensionId, domain: contrib.domain ?? null },
+      );
+    }
+    if (!declaredShape || !declaredDomain) {
+      return { dispose() {} };
+    }
+
+    // ---- schemaRef ownership (groken swarm L5-H1) --------------------------
+    // Lane assembly binds items to kinds by schemaRef (first snapshot record
+    // wins). A second extension declaring the same schemaRef would hijack
+    // every payload that schema describes, so ownership is exclusive: the
+    // first extension to REGISTER a schemaRef owns it for this registry.
+    const existingOwner = dataKindRegistry
+      .getSnapshot()
+      .records.find((record) => record.schemaRef === contrib.schemaRef);
+    if (existingOwner && existingOwner.ownerExtensionId !== extensionId) {
+      emit(
+        'error',
+        'dataKinds/schema-ref-taken',
+        `Schema ref "${contrib.schemaRef}" is already owned by data kind ` +
+          `"${existingOwner.kindId}" (extension "${existingOwner.ownerExtensionId ?? '(built-in)'}"). ` +
+          `Extension "${extensionId}" must declare a distinct qualified schemaRef.`,
+        { kindId, extensionId, schemaRef: contrib.schemaRef, owner: existingOwner.ownerExtensionId ?? null },
+      );
+      return { dispose() {} };
+    }
+
+    // ---- Build the DataKindRegistryRecord ----------------------------------
+    const label = options?.label ?? contrib.label ?? kindId;
+    const order = options?.order ?? contrib.order;
+    const laneActions = normalizeLaneActions(kindId, options?.actions);
+    const provenance: DataKindProvenance = 'bundled-extension';
+    const record: DataKindRegistryRecord = {
+      kindId,
+      contributionId: contrib.id,
+      schemaRef: contrib.schemaRef,
+      shape: declaredShape,
+      domain: declaredDomain,
+      laneRenderer,
+      ...(options?.supportsSparseItemWindows === true ? { supportsSparseItemWindows: true } : {}),
+      ...(typeof options?.laneHeight === 'number' && Number.isFinite(options.laneHeight)
+        ? { laneHeight: Math.max(24, Math.min(128, Math.round(options.laneHeight))) }
+        : {}),
+      ...(laneActions ? { laneActions } : {}),
+      ...(inspector ? { inspector } : {}),
+      ownerExtensionId: extensionId,
+      provenance,
+      renderability: buildDataKindRenderability(),
+      status: 'active',
+      ...(label !== undefined ? { label } : {}),
+      ...(order !== undefined ? { order } : {}),
+    };
+
+    // ---- Register with the provider-scoped DataKindRegistry ----------------
+    // DataKindRegistry.register() handles replacement: if an existing record
+    // with the same kindId exists, it is safely disposed first and a
+    // `data-kind-registry/duplicate-kind` warning is emitted.
+    const handle = dataKindRegistry.register(record);
+
+    emit(
+      'info',
+      'dataKinds/registered',
+      `Data kind "${kindId}" registered for extension "${extensionId}".`,
+      { kindId, extensionId, contributionId: contrib.id, status: record.status },
+    );
+
+    // ---- Return a DisposeHandle that disposes exactly once ----------------
+    let disposed = false;
+
+    return {
+      dispose(): void {
+        if (disposed) return;
+        disposed = true;
+
+        try {
+          handle.dispose();
+        } catch (err) {
+          emit(
+            'error',
+            'dataKinds/dispose-error',
+            `Error disposing data kind "${kindId}": ${String(err)}`,
+            { kindId, extensionId, contributionId: contrib.id },
+          );
+        }
+      },
+    };
+  }
+
+  return {
+    register,
+    readPersisted(kindId) {
+      const contribution = contributionsByKindId.get(kindId);
+      if (!contribution || !itemsHost) return [];
+      return itemsHost.readPersisted(contribution.schemaRef);
+    },
+    replacePersisted(kindId: string, items: readonly DataKindSourceItem[]) {
+      const contribution = contributionsByKindId.get(kindId);
+      if (!contribution || !itemsHost) throw new Error(`Data kind "${kindId}" is not available to ${extensionId}.`);
+      if (items.some((item) => item.shape !== contribution.shape || item.domain !== contribution.domain))
+        throw new Error(`Data items must match the declared shape and domain of "${kindId}".`);
+      itemsHost.replacePersisted(contribution.schemaRef, items);
+    },
+    replaceTransient(kindId: string, items: readonly DataKindSourceItem[]) {
+      const contribution = contributionsByKindId.get(kindId);
+      if (!contribution || !itemsHost) throw new Error(`Data kind "${kindId}" is not available to ${extensionId}.`);
+      if (items.some((item) => item.shape !== contribution.shape || item.domain !== contribution.domain))
+        throw new Error(`Data items must match the declared shape and domain of "${kindId}".`);
+      itemsHost.replaceTransient(contribution.schemaRef, items);
+    },
+  };
+}
