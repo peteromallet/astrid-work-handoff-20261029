@@ -1,0 +1,617 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from runpod_lifecycle import api
+from runpod_lifecycle.errors import CleanupPendingError
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, payload: dict, text: str = ""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text or str(payload)
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pods.side_effect = KeyError("data")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            get=lambda *args, **kwargs: FakeResponse(
+                200,
+                [{"id": "p1", "desiredStatus": "RUNNING"}],
+            )
+        ),
+    )
+
+    assert api.list_pods("test") == [{"id": "p1", "desiredStatus": "RUNNING"}]
+
+
+def test_terminate_pod_waits_for_provider_side_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            [{"id": "p1", "desiredStatus": "RUNNING"}],
+            [],
+        ]
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(delete=lambda *args, **kwargs: FakeResponse(204, {})),
+    )
+    monkeypatch.setattr("runpod_lifecycle.api.list_pods", lambda _key: next(responses))
+    monkeypatch.setattr("runpod_lifecycle.api.time.sleep", lambda _seconds: None)
+
+    api.terminate_pod("p1", "test", poll_interval_seconds=0)
+
+
+def test_terminate_pod_rejects_false_terminal_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(delete=lambda *args, **kwargs: FakeResponse(202, {})),
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.list_pods",
+        lambda _key: [{"id": "p1", "desiredStatus": "RUNNING"}],
+    )
+
+    with pytest.raises(CleanupPendingError, match="cleanup_pending") as caught:
+        api.terminate_pod("p1", "test", verify_timeout_seconds=0)
+    assert caught.value.pod_id == "p1"
+    assert caught.value.status == "cleanup_pending"
+
+
+def test_cleanup_pending_reconciles_exact_id_without_deleting_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete_calls: list[str] = []
+    observed = iter([[{"id": "p1"}], []])
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            delete=lambda url, **kwargs: (delete_calls.append(url), FakeResponse(204, {}))[1],
+        ),
+    )
+    monkeypatch.setattr("runpod_lifecycle.api.list_pods", lambda _key: next(observed))
+    monkeypatch.setattr("runpod_lifecycle.api.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(CleanupPendingError) as caught:
+        api.terminate_pod("p1", "test", verify_timeout_seconds=0)
+    assert caught.value.pod_id == "p1"
+    assert len(delete_calls) == 1
+
+    api.reconcile_pod_cleanup("p1", "test", verify_timeout_seconds=0)
+    assert len(delete_calls) == 1
+
+
+def test_start_pod_posts_to_provider_start_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"url": url, **kwargs})
+        return FakeResponse(202, {"id": "p1", "desiredStatus": "RUNNING"})
+
+    monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=fake_post))
+
+    result = api.start_pod("p1", "test")
+
+    assert result["id"] == "p1"
+    assert calls[0]["url"] == "https://rest.runpod.io/v1/pods/p1/start"
+    assert calls[0]["headers"] == {"Authorization": "Bearer test"}
+
+
+def test_start_pod_surfaces_capacity_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            post=lambda *args, **kwargs: FakeResponse(
+                500,
+                {"error": "There are not enough free GPUs on the host machine"},
+                text='{"error":"There are not enough free GPUs on the host machine"}',
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not enough free GPUs"):
+        api.start_pod("p1", "test")
+
+
+def test_create_pod_with_fallbacks_deduplicates_volume_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preferred volume repeated in fallback inputs is attempted once."""
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.find_gpu_type",
+        lambda _gpu_type, _api_key: {"id": "gpu-1", "displayName": "RTX 5090"},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.get_network_volumes",
+        lambda _api_key: [{"name": "Peter", "id": "vol-peter"}],
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_create_pod(**kwargs):
+        calls.append(kwargs)
+        return {"id": "pod-1"}
+
+    monkeypatch.setattr("runpod_lifecycle.api.create_pod", fake_create_pod)
+
+    result = api.create_pod_with_fallbacks(
+        "api-key",
+        ["NVIDIA GeForce RTX 5090"],
+        "image:h3",
+        volume_candidates=["Peter", "Peter"],
+        retry_sleep_seconds=0,
+    )
+
+    assert result["selected_volume_name"] == "Peter"
+    assert len(calls) == 1
+    assert calls[0]["network_volume_id"] == "vol-peter"
+
+
+def test_create_pod_with_fallbacks_preserves_cuda_filter_on_every_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("runpod_lifecycle.api.find_gpu_type", lambda name, key: {"id": name})
+    calls: list[dict[str, object]] = []
+
+    def fake_create_pod(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("not enough capacity")
+        return {"id": "pod-cuda"}
+
+    monkeypatch.setattr("runpod_lifecycle.api.create_pod", fake_create_pod)
+    result = api.create_pod_with_fallbacks(
+        "key", ["gpu-a", "gpu-b"], "image", retry_sleep_seconds=0,
+        allowed_cuda_versions=("13.0",),
+    )
+    assert result["allowed_cuda_versions"] == ["13.0"]
+    assert [call["allowed_cuda_versions"] for call in calls] == [("13.0",), ("13.0",)]
+
+
+def test_create_pod_suppresses_sdk_stdout_with_env_values(runpod_sdk_mock, capsys) -> None:
+    runpod_sdk_mock.create_pod.side_effect = lambda **_kwargs: print(
+        "raw_response: {'env': ['SUPABASE_SERVICE_ROLE_KEY=secret']}"
+    ) or {"id": "pod-1"}
+
+    pod = api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+        env_vars={"SUPABASE_SERVICE_ROLE_KEY": "secret"},
+    )
+
+    assert pod["id"] == "pod-1"
+    assert "secret" not in capsys.readouterr().out
+
+
+def test_create_pod_passes_allowed_cuda_versions_to_provider(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-cuda"}
+
+    pod = api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+        allowed_cuda_versions=(" 12.4", "12.6", "12.4"),
+    )
+
+    assert pod["allowed_cuda_versions"] == ["12.4", "12.6"]
+    assert runpod_sdk_mock.create_pod.call_args.kwargs["allowed_cuda_versions"] == ["12.4", "12.6"]
+
+
+@pytest.mark.parametrize("value", [(), ("",), ("cuda12",), (12.4,)])
+def test_create_pod_rejects_invalid_allowed_cuda_versions(runpod_sdk_mock, value) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        api.create_pod("api-key", "gpu-1", "image", allowed_cuda_versions=value)
+
+
+def test_get_pod_status_handles_explicit_none_runtime(runpod_sdk_mock) -> None:
+    """Regression: SDK returns runtime: None for pods that haven't booted; .get('runtime', {}) returned None."""
+    runpod_sdk_mock.get_pod.return_value = {
+        "id": "p1",
+        "desiredStatus": "RUNNING",
+        "actualStatus": None,
+        "runtime": None,
+        "costPerHr": 0.5,
+    }
+    status = api.get_pod_status("p1", "test")
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["ip"] is None
+    assert status["ports"] == []
+    assert status["uptime_seconds"] == 0
+
+
+def test_get_pod_status_handles_missing_runtime_key(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.get_pod.return_value = {
+        "id": "p1",
+        "desiredStatus": "PROVISIONING",
+        "actualStatus": "PROVISIONING",
+    }
+    status = api.get_pod_status("p1", "test")
+    assert status is not None
+    assert status["ports"] == []
+    assert status["ip"] is None
+
+
+def test_get_pod_status_returns_none_when_sdk_and_graphql_return_no_pod(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.return_value = None
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: FakeResponse(200, {"data": {"pod": None}})),
+    )
+    assert api.get_pod_status("p1", "test") is None
+
+
+def test_get_pod_status_falls_back_to_graphql_when_sdk_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            post=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "RUNNING",
+                            "actualStatus": "RUNNING",
+                            "runtime": {
+                                "ip": "1.2.3.4",
+                                "ports": [
+                                    {"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"},
+                                    {"privatePort": 8888, "publicPort": 88881, "ip": "1.2.3.4"},
+                                ],
+                                "uptimeInSeconds": 42,
+                            },
+                        }
+                    }
+                },
+            )
+        ),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["actual_status"] == "RUNNING"
+    assert status["ip"] == "1.2.3.4"
+    assert status["ports"] == [
+        {"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"},
+        {"privatePort": 8888, "publicPort": 88881, "ip": "1.2.3.4"},
+    ]
+    assert status["uptime_seconds"] == 42
+
+
+def test_get_pod_status_falls_back_to_graphql_when_sdk_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.return_value = None
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            post=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "PROVISIONING",
+                            "actualStatus": None,
+                            "runtime": None,
+                        }
+                    }
+                },
+            )
+        ),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "PROVISIONING"
+    assert status["actual_status"] is None
+    assert status["ports"] == []
+
+
+def test_get_pod_status_retries_with_minimal_graphql_query_on_schema_error(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    responses = iter(
+        [
+            FakeResponse(200, {"errors": [{"message": "Cannot query field sshPassword"}]}),
+            FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "RUNNING",
+                            "actualStatus": "RUNNING",
+                            "runtime": {
+                                "ip": "1.2.3.4",
+                                "ports": [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}],
+                            },
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: next(responses)),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["ports"] == [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}]
+
+
+def test_get_pod_status_retries_with_minimal_graphql_query_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    responses = iter(
+        [
+            FakeResponse(400, {"errors": [{"message": "Cannot query field sshPassword"}]}),
+            FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "RUNNING",
+                            "actualStatus": "RUNNING",
+                            "runtime": {
+                                "ip": "1.2.3.4",
+                                "ports": [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}],
+                            },
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: next(responses)),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["ports"] == [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}]
+
+
+def test_get_pod_status_graphql_uses_schema_safe_fields_and_derives_ip(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    calls: list[dict] = []
+
+    def _post(*_args, **kwargs):
+        calls.append(kwargs["json"])
+        return FakeResponse(
+            200,
+            {
+                "data": {
+                    "pod": {
+                        "id": "p1",
+                        "desiredStatus": "RUNNING",
+                        "runtime": {
+                            "ports": [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}],
+                        },
+                    }
+                }
+            },
+        )
+
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=_post))
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["ip"] == "1.2.3.4"
+    assert "actualStatus" not in calls[0]["query"]
+    assert "runtime {\n              ip" not in calls[0]["query"]
+
+
+# ---------------------------------------------------------------------------
+# create_network_volume
+# ---------------------------------------------------------------------------
+
+
+def test_create_network_volume_posts_correct_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_network_volume POSTs the correct payload to NETWORK_VOLUMES_URL."""
+    post_calls: list[dict] = []
+
+    def fake_post(url, *, json, headers, timeout):
+        post_calls.append({"url": url, "json": json})
+        # Return a valid volume dict
+        return FakeResponse(201, {
+            "id": "vol-created-1",
+            "name": "my-volume",
+            "size": 100,
+            "dataCenterId": "dc-test",
+        })
+
+    monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=fake_post))
+
+    result = api.create_network_volume("fake-key", "my-volume", 100, "dc-test")
+
+    assert result["id"] == "vol-created-1"
+    assert result["name"] == "my-volume"
+    assert len(post_calls) == 1
+    assert post_calls[0]["json"] == {
+        "name": "my-volume",
+        "size": 100,
+        "dataCenterId": "dc-test",
+    }
+    assert "rest.runpod.io/v1/networkvolumes" in post_calls[0]["url"]
+
+
+def test_create_network_volume_raises_on_non_200_201(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_network_volume raises RuntimeError on non-200/201 response."""
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: FakeResponse(400, {"error": "bad request"})),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to create network volume"):
+        api.create_network_volume("fake-key", "bad-vol", 100, "dc-test")
+
+
+def test_create_pod_uses_prior_default_ports_when_none(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-default-ports"}
+    api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+    )
+    kwargs = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert kwargs["ports"] == "22/tcp,8888/http"
+
+
+def test_create_pod_allows_cloud_type_override(runpod_sdk_mock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "community")
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-community"}
+
+    api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+    )
+
+    kwargs = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert kwargs["cloud_type"] == "COMMUNITY"
+
+
+def test_create_pod_passes_custom_ports_through(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-custom-ports"}
+    api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+        ports="8675/http,22/tcp",
+    )
+    kwargs = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert kwargs["ports"] == "8675/http,22/tcp"
+    assert "8675/http" in kwargs["ports"]
+
+
+def test_get_pod_status_normalizes_keys(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.get_pod.return_value = {
+        "id": "p1",
+        "desiredStatus": "RUNNING",
+        "actualStatus": "RUNNING",
+        "runtime": {
+            "ip": "1.2.3.4",
+            "ports": [{"privatePort": 22, "publicPort": 12345}],
+            "sshPassword": "secret",
+            "uptimeInSeconds": 60,
+        },
+        "createdAt": "2026-04-01T00:00:00Z",
+        "lastStatusChange": "2026-04-01T00:01:00Z",
+        "costPerHr": 0.69,
+    }
+    status = api.get_pod_status("p1", "test")
+    assert status == {
+        "runpod_id": "p1",
+        "desired_status": "RUNNING",
+        "actual_status": "RUNNING",
+        "ip": "1.2.3.4",
+        "ports": [{"privatePort": 22, "publicPort": 12345}],
+        "ssh_password": "secret",
+        "created_at": "2026-04-01T00:00:00Z",
+        "last_status_change": "2026-04-01T00:01:00Z",
+        "uptime_seconds": 60,
+        "cost_per_hr": 0.69,
+    }
+
+
+def test_get_pod_status_normalizes_current_rest_port_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            get=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "id": "pod-123",
+                    "desiredStatus": "RUNNING",
+                    "publicIp": "203.0.113.10",
+                    "ports": ["22/tcp", "8888/http"],
+                    "portMappings": {"22": 53603, "8888": 58123},
+                },
+            ),
+            post=pytest.fail,
+        ),
+    )
+
+    status = api.get_pod_status("pod-123", "api-key")
+
+    assert status["ip"] == "203.0.113.10"
+    assert status["ports"] == [
+        {"ip": "203.0.113.10", "privatePort": 22, "publicPort": 53603, "type": "tcp"},
+        {"ip": "203.0.113.10", "privatePort": 8888, "publicPort": 58123, "type": "http"},
+    ]
+
+
+def test_cpu_create_uses_supported_priority_and_public_key(monkeypatch):
+    calls=[]
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse(201, {"id":"cpu-pod"})
+    monkeypatch.setattr(api.httpx,"post",post)
+    result=api.create_pod("test",None,"image",compute_type="CPU",public_key_string="public-test",
+                          data_center_id="EUR-NO-1",network_volume_id="vol")
+    body=calls[0]["json"]
+    assert body["cpuFlavorPriority"]=="custom"
+    assert body["cpuFlavorIds"]==["cpu3c","cpu5c"]
+    assert body["env"]["PUBLIC_KEY"]=="public-test"
+    assert result["id"]=="cpu-pod"
+
+
+@pytest.mark.parametrize("status,message,capacity",[
+    (400,"Invalid cpuFlavorPriority; no available value",False),
+    (401,"There are no longer any instances available with the requested specifications.",False),
+    (500,"There are no longer any instances available with the requested specifications.",True),
+    (500,"Invalid input: There are no longer any instances available with the requested specifications.",False),
+])
+def test_cpu_create_never_treats_rejection_as_capacity(monkeypatch,status,message,capacity):
+    from runpod_lifecycle.errors import ProviderCapacityUnavailable,ProviderRequestRejected
+    monkeypatch.setattr(api.httpx,"post",lambda *args,**kwargs: FakeResponse(status,{"error":message}))
+    with pytest.raises(ProviderRequestRejected) as caught:
+        api.create_pod("test",None,"image",compute_type="CPU")
+    assert isinstance(caught.value,ProviderCapacityUnavailable)==capacity
+    assert message in str(caught.value)
