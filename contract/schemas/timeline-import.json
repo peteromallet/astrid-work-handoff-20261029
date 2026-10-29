@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.local/schemas/timeline-import.json",
+  "title": "Prepared timeline import",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prepared_object_id"],
+      "properties": {
+        "prepared_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeline_id", "name", "publication", "transcripts", "text_bindings", "differences"],
+      "properties": {
+        "timeline_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "publication": { "$ref": "https://astrid.haus/workspace/v1/schemas/shot-composition.json" },
+        "transcripts": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["document_id", "kind", "content"], "properties": { "document_id": { "type": "string" }, "kind": { "const": "media.transcript" }, "content": { "type": "object" } } } },
+        "text_bindings": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["shot_id", "kind", "media_id"], "properties": { "shot_id": { "type": "string" }, "kind": { "enum": ["prompt", "voiceover_script", "transcript"] }, "slot": { "type": ["string", "null"] }, "media_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } } } },
+        "differences": { "type": "object", "additionalProperties": false, "required": ["missing_effects", "different_effects"], "properties": { "missing_effects": { "type": "array", "items": { "$ref": "#/$defs/MissingEffectDifference" } }, "different_effects": { "type": "array", "items": { "$ref": "#/$defs/EffectDifference" } } } }
+      }
+    }
+  ],
+  "$defs": {
+    "MissingEffectDifference": {
+      "oneOf": [
+        { "$ref": "#/$defs/EffectDifference" },
+        {
+          "type": "object",
+          "required": ["packId", "kind", "id", "pinned"],
+          "properties": {
+            "packId": { "const": "" },
+            "kind": { "type": "string", "minLength": 1 },
+            "id": { "type": "string", "minLength": 1 },
+            "revision": { "type": ["string", "null"] },
+            "pinned": { "const": false }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "EffectDifference": {
+      "type": "object",
+      "required": ["packId", "kind", "id"],
+      "properties": {
+        "packId": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": ["string", "null"] },
+        "pinned": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

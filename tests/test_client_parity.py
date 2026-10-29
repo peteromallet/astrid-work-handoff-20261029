@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT / "packages" / "python"))
+from astrid_runtime_client.generated import OPERATIONS as PYTHON_OPERATIONS  # noqa: E402
+from astrid_runtime_client.generated import PROTOCOL as PYTHON_PROTOCOL  # noqa: E402
+from astrid_runtime_client.generated import SCHEMA_DIGEST as PYTHON_SCHEMA_DIGEST  # noqa: E402
+
+
+def _operation_ids() -> list[str]:
+    return [
+        line.split(":", 1)[1].strip()
+        for line in (ROOT / "contract" / "openapi" / "workspace-v1.yaml").read_text().splitlines()
+        if re.match(r"^\s+operationId:", line)
+    ]
+
+
+def _typescript_operations() -> list[str]:
+    source = (ROOT / "packages" / "typescript" / "src" / "contract-metadata.ts").read_text()
+    match = re.search(r"^export const OPERATIONS = (\[.*\]) as const;$", source, re.MULTILINE)
+    assert match, "TypeScript contract metadata must export generated operations"
+    return json.loads(match.group(1))
+
+
+def _python_methods() -> set[str]:
+    source = (ROOT / "packages" / "python" / "astrid_runtime_client" / "generated.py").read_text()
+    module = ast.parse(source)
+    client = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "WorkspaceClient")
+    return {
+        node.name
+        for node in client.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+
+
+def _snake_case(operation: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", operation).lower()
+
+
+def test_product_clients_match_canonical_contract_projection() -> None:
+    manifest = json.loads((ROOT / "contract" / "manifest.json").read_text())
+    component = json.loads((ROOT / "contract" / "component-manifest.json").read_text())
+    typescript_source = (ROOT / "packages" / "typescript" / "src" / "generated.ts").read_text()
+    typescript_methods = set(re.findall(r"^  async (\w+)\(", typescript_source, re.MULTILINE))
+    operation_ids = _operation_ids()
+
+    assert "async listDocuments(projectId: string, cursor?: string, limit = 50, kind?: string)" in typescript_source
+    assert "kind !== undefined ? `&kind=${encodeURIComponent(kind)}`" in typescript_source
+    openapi_source = (ROOT / "contract" / "openapi" / "workspace-v1.yaml").read_text()
+    assert "{ name: kind, in: query, schema: { type: string } }" in openapi_source
+
+    assert manifest["protocol"] == component["protocol"] == "workspace.v1"
+    assert manifest["generated"]["python"] == "packages/python/astrid_runtime_client/generated.py"
+    assert manifest["generated"]["typescript"] == "packages/typescript/src/generated.ts"
+    assert list(PYTHON_OPERATIONS) == operation_ids
+    assert _typescript_operations() == operation_ids
+    # Product-facing clients retain two typed helpers over existing wire routes:
+    # the timeline save helper delegates to canonical document/timeline operations,
+    # and the streaming object helper delegates to canonical project-object ingest.
+    # Neither helper adds a wire operation.
+    assert _python_methods() - {_snake_case(operation) for operation in operation_ids} == {
+        "update_timeline_document",
+        "ingest_project_object_stream",
+    }
+    assert typescript_methods - set(operation_ids) == {"updateTimelineDocument"}
+    assert typescript_methods == set(operation_ids) | {"updateTimelineDocument"}
+    assert "getTimeline" not in typescript_methods
+    assert "getProjectTimeline" in typescript_methods
+    assert {"publishParentComposition", "getProjectShotRevision", "getProjectTimelineRevision"}.issubset(typescript_methods)
+    assert {"publish_parent_composition", "get_project_shot_revision", "get_project_timeline_revision"}.issubset(_python_methods())
+    assert "actual_target?: ExecutionTarget" in typescript_source
+    assert "executor_incarnation?: string" in typescript_source
+    assert "provider_state_unknown" in typescript_source
+    assert "export interface ChildAuthorityRequest" in typescript_source
+    assert "child?: ChildAuthorityChild" in typescript_source
+    assert "derived_inputs?: DerivedInputDescriptor[]" in typescript_source
+    assert "body: ChildAuthorityRequest" in typescript_source
+
+    component_digest = "sha256:" + hashlib.sha256((ROOT / "contract" / "component-manifest.json").read_bytes()).hexdigest()
+    from generators.generate import contract_digest
+
+    contract_digest_value = contract_digest()
+    typescript_metadata = (ROOT / "packages" / "typescript" / "src" / "contract-metadata.ts").read_text()
+    assert PYTHON_PROTOCOL == "workspace.v1"
+    assert PYTHON_SCHEMA_DIGEST == contract_digest_value
+    assert f'COMPONENT_MANIFEST_SHA256 = "{component_digest}"' in typescript_metadata
+    assert f'SCHEMA_DIGEST = "{contract_digest_value}"' in typescript_metadata
+
+
+def test_recoverable_snapshot_client_projection_is_canonical() -> None:
+    typescript = (ROOT / "packages/typescript/src/generated.ts").read_text()
+    python = (ROOT / "packages/python/astrid_runtime_client/generated.py").read_text()
+    assert "publishRecoverableSnapshot" in _operation_ids()
+    assert "publish_recoverable_snapshot" in _python_methods()
+    assert "body: RecoverableSnapshotRequest" in typescript
+    assert "Promise<MutationResult<ManagedOutput>>" in typescript
+    assert '/recoverable-snapshots' in typescript and '/recoverable-snapshots' in python
+    assert 'output: DerivedInputDescriptor' in typescript

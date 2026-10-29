@@ -1,0 +1,1618 @@
+openapi: 3.1.0
+info:
+  title: Astrid Runtime
+  version: 1.0.0
+  description: Product-neutral local workspace protocol.
+  x-protocol-id: workspace.v1
+servers:
+  - url: http://127.0.0.1
+security:
+  - bearerAuth: []
+paths:
+  /v1/health:
+    get:
+      operationId: health
+      security: []
+      responses:
+        '200': { description: Healthy, content: { application/json: { schema: { $ref: './schemas/health.json' } } } }
+  /v1/handshake:
+    post:
+      operationId: handshake
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: './schemas/handshake.json' } } }
+      responses:
+        '200': { description: Scoped session, content: { application/json: { schema: { $ref: '#/components/schemas/HandshakeResponse' } } } }
+  /v1/realm:
+    get:
+      operationId: getRealm
+      responses:
+        '200': { description: Current scoped realm, content: { application/json: { schema: { $ref: './schemas/realm.json' } } } }
+  /v1/doctor:
+    get:
+      operationId: doctor
+      responses:
+        '200': { description: Read-only integrity and support-state report, content: { application/json: { schema: { $ref: './schemas/doctor.json' } } } }
+  /v1/backup:
+    post:
+      operationId: createBackup
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateBackup' } } } }
+      responses: { '201': { description: Verified online backup, content: { application/json: { schema: { $ref: './schemas/backup.json' } } } } }
+  /v1/restore:
+    post:
+      operationId: restoreBackup
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RestoreBackup' } } } }
+      responses: { '201': { description: Prepared inactive restored realm, content: { application/json: { schema: { $ref: './schemas/backup.json' } } } } }
+  /v1/export:
+    get:
+      operationId: exportRealm
+      responses: { '200': { description: Structured realm export, content: { application/json: { schema: { $ref: './schemas/export.json' } } } } }
+  /v1/realm/tombstone:
+    post:
+      operationId: tombstoneRealm
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/LifecycleRequest' } } } }
+      responses: { '200': { description: Logical realm removal, content: { application/json: { schema: { $ref: './schemas/realm-lifecycle.json' } } } } }
+  /v1/realm/recover:
+    post:
+      operationId: recoverRealm
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryRequest' } } } }
+      responses: { '200': { description: Recovered realm tombstone, content: { application/json: { schema: { $ref: './schemas/realm-lifecycle.json' } } } } }
+  /v1/realm/purge:
+    post:
+      operationId: purgeRealm
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PurgeRealm' } } } }
+      responses: { '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects:
+    get:
+      operationId: listProjects
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Projects, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectPage' } } } }
+    post:
+      operationId: createProject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateProject' } } }
+      responses:
+        '201': { description: Created with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/{project_id}:
+    get:
+      operationId: getProject
+      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      responses:
+        '200': { description: Project, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+    patch:
+      operationId: updateProject
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpdateProject' } } }
+      responses:
+        '200': { description: Updated project, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/selection:
+    get:
+      operationId: currentProject
+      responses:
+        '200': { description: Actor's effective project selection, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectSelection' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: selectProject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SelectProject' } } }
+      responses:
+        '200': { description: Persisted actor-scoped selection with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/preferences/{scope}:
+    get:
+      operationId: getPreferences
+      description: Read actor-owned user preferences or preferences for an explicit or selected project. Absent preferences return empty Markdown and version zero without writing. User scope rejects any project_id selector.
+      parameters: [ { $ref: '#/components/parameters/PreferenceScope' }, { $ref: '#/components/parameters/PreferenceProjectId' } ]
+      responses:
+        '200': { description: Preference resource, content: { application/json: { schema: { $ref: '#/components/schemas/PreferenceResource' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: updatePreferences
+      description: Write Markdown with compare-and-swap and durable idempotency. User ownership comes exclusively from bearer identity; user scope rejects any project_id selector. Project scope uses a committed project-document receipt.
+      parameters: [ { $ref: '#/components/parameters/PreferenceScope' }, { $ref: '#/components/parameters/PreferenceProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdatePreferences' } } } }
+      responses:
+        '200': { description: Preference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/PreferenceMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/app-state/user/{key}:
+    get:
+      operationId: getUserAppState
+      description: Read one actor-owned app-state record, a small JSON object an application keeps for its own use (for example a first-run flag). Ownership comes exclusively from bearer identity. Absent state returns null content and version zero without writing.
+      parameters: [ { $ref: '#/components/parameters/AppStateKey' } ]
+      responses:
+        '200': { description: App-state resource, content: { application/json: { schema: { $ref: '#/components/schemas/AppStateResource' } } } }
+    put:
+      operationId: updateUserAppState
+      description: Write one app-state record with compare-and-swap (expected_version 0 creates) and durable idempotency. Content must be a JSON object of at most 16384 bytes once canonicalized. Ownership comes exclusively from bearer identity.
+      parameters: [ { $ref: '#/components/parameters/AppStateKey' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateAppState' } } } }
+      responses:
+        '200': { description: App-state mutation, content: { application/json: { schema: { $ref: '#/components/schemas/AppStateMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/{project_id}/documents:
+    get:
+      operationId: listDocuments
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: kind, in: query, schema: { type: string } } ]
+      responses: { '200': { description: Project documents, content: { application/json: { schema: { $ref: '#/components/schemas/DocumentPage' } } } } }
+    post:
+      operationId: createDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateDocument' } } } }
+      responses: { '201': { description: Versioned document with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/documents/{document_id}:
+    get:
+      operationId: getDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' } ]
+      responses: { '200': { description: Versioned document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } } }
+    patch:
+      operationId: updateDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateDocument' } } } }
+      responses: { '200': { description: Updated document with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/objects:
+    get:
+      operationId: listProjectObjects
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Project-scoped managed objects, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedObjectPage' } } } } }
+    post:
+      operationId: ingestProjectObject
+      description: Ingest bytes into runtime CAS and associate the resulting managed object with this project before task settlement.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+      responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectObjectMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/media-imports:
+    post:
+      operationId: importProjectMedia
+      description: Authenticated Runtime-host image/video ingest and atomic Generation plus original primary Variant settlement. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { name: X-Original-Name, in: header, required: false, schema: { type: string, minLength: 1, maxLength: 512 } }
+        - { name: X-Expected-Digest, in: header, required: false, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+        - { name: X-Media-Width, in: header, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: X-Media-Height, in: header, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: X-Media-Duration-Seconds, in: header, required: false, schema: { type: number, exclusiveMinimum: 0 } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+          image/*: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+          video/*: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+          audio/*: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+      responses:
+        '201': { description: Completed Runtime media import with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/{project_id}/media-imports/{import_operation_id}:
+    get:
+      operationId: getProjectMediaImport
+      description: Recover the durable completed or pending state of one Runtime media import after refresh, timeout, or lost acknowledgement.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { name: import_operation_id, in: path, required: true, description: The caller-persisted project-scoped Idempotency-Key used for the import., schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
+      responses:
+        '200': { description: Durable media import state, content: { application/json: { schema: { $ref: '#/components/schemas/MediaImportOperation' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/projects/{project_id}/tasks:
+    get:
+      operationId: listProjectTasks
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } } }
+  /v1/tasks/{task_id}/managed-outputs:
+    get:
+      operationId: listManagedOutputs
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses: { '200': { description: Runtime-owned managed output associations for a task, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputPage' } } } } }
+  /v1/managed-outputs/{association_id}:
+    get:
+      operationId: getManagedOutput
+      parameters: [ { $ref: '#/components/parameters/AssociationId' } ]
+      responses: { '200': { description: One immutable managed output association and mutable lifecycle readback, content: { application/json: { schema: { $ref: './schemas/managed-output.json' } } } } }
+  /v1/managed-outputs/{association_id}/adopt:
+    post:
+      operationId: adoptManagedOutput
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputAdoption' } } } }
+      responses: { '200': { description: Named managed association adoption with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/objects/{object_id}/location:
+    parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ObjectId' } ]
+    get:
+      operationId: getProjectObjectLocation
+      description: Verify project-owned CAS bytes and return their current local-host path. This lookup is not a portable receipt or a guarantee that the path remains valid after relocation.
+      responses: { '200': { description: Verified local object location, content: { application/json: { schema: { $ref: './schemas/object-location.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/managed-outputs/{association_id}/export:
+    post:
+      operationId: exportManagedOutput
+      description: Materialize exact bytes for one completed durable managed output under the Runtime-configured authorized export root and record its historical provenance. The requested filename is used when available and within the host's temporary-name byte budget; if it already exists or is too long, Runtime chooses a deterministic association-scoped direct filename in that same root and returns it in destination.filename.
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputExportRequest' } } } }
+      responses: { '200': { description: Exact managed-output export with committed provenance receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/managed-outputs/{association_id}/lifecycle:
+    post:
+      operationId: updateManagedOutputLifecycle
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputLifecycle' } } } }
+      responses: { '200': { description: Runtime lifecycle mutation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/runs:
+    get:
+      operationId: listProjectRuns
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Project runs, content: { application/json: { schema: { $ref: '#/components/schemas/RunPage' } } } } }
+  /v1/projects/{project_id}/timelines:
+    post:
+      operationId: createTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateTimeline' } } } }
+      responses: { '201': { description: Timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+    get:
+      operationId: listTimelines
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Timelines, content: { application/json: { schema: { $ref: '#/components/schemas/TimelinePage' } } } } }
+  /v1/projects/{project_id}/timelines/{timeline_id}:
+    get:
+      operationId: getProjectTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      responses: { '200': { description: Project-scoped timeline with its canonical composition head, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      operationId: renameTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RenameTimeline' } } } }
+      responses: { '200': { description: Renamed timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines/import:
+    post:
+      operationId: importTimeline
+      description: Atomically import one prepared timeline closure and its transcripts into this project.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '../schemas/timeline-import.json' } } } }
+      responses: { '201': { description: Imported timeline and committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '422': { $ref: '#/components/responses/ValidationError' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/inspect:
+    post:
+      operationId: inspectTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
+      responses: { '200': { description: Canonical current-head metadata-only inspection of the pinned timeline closure, content: { application/json: { schema: { $ref: './schemas/timeline-inspection-result.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/views:
+    post:
+      operationId: createTimelineView
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
+      responses: { '200': { description: Deterministic metadata-only Markdown/PNG view, content: { application/json: { schema: { $ref: './schemas/timeline-view.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions:
+    get:
+      operationId: listProjectParentCompositionRevisions
+      description: List immutable canonical parent revisions in one project and timeline scope.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses: { '200': { description: Canonical parent-composition history page, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionRevisionPage' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    post:
+      operationId: publishParentComposition
+      description: Atomically publish one complete one-level parent composition and its immutable child/internal revisions.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionPublication' } } } }
+      responses: { '200': { description: Durable parent publication receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/replace-parent-media:
+    post:
+      operationId: replaceParentCompositionMedia
+      description: Replace one clip in an exact immutable parent-composition closure and atomically publish its successor.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionMediaReplacement' } } } }
+      responses: { '200': { description: Durable parent replacement receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions/{revision}:
+    get:
+      operationId: getProjectParentCompositionRevision
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+      responses: { '200': { description: Exact immutable parent composition revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions/{revision}/restore:
+    post:
+      operationId: restoreProjectParentCompositionRevision
+      description: Publish the exact historical parent and dependency closure as a new head using compare-and-swap.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RestoreParentCompositionRevision' } } } }
+      responses: { '200': { description: New parent revision published from the exact historical closure, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timeline-documents:
+    post:
+      operationId: createTimelineDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateTimelineDocument' } } } }
+      responses: { '201': { description: Timeline and composition document committed atomically, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/shots/{shot_id}/revisions/{revision}:
+    get:
+      operationId: getProjectShotRevision
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/ShotId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+      responses: { '200': { description: Exact immutable shot revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/revisions/{revision}:
+    get:
+      operationId: getProjectTimelineRevision
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+      responses: { '200': { description: Exact immutable internal timeline revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/timelines/{timeline_id}:
+    patch:
+      operationId: updateTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTimeline' } } } }
+      responses: { '200': { description: Updated timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/history:
+    get:
+      operationId: listTimelineHistory
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Timeline revisions, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineRevisionPage' } } } } }
+  /v1/timelines/{timeline_id}/replace-clip:
+    post:
+      operationId: replaceTimelineClip
+      description: Atomically replace one explicit composition clip with a managed object owned by the timeline project while preserving authored timing and unrelated document state.
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/timeline-clip-replacement.json' } } } }
+      responses: { '200': { description: Updated canonical timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/diff:
+    get:
+      operationId: diffTimeline
+      parameters:
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: from_version, in: query, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: to_version, in: query, required: true, schema: { type: integer, minimum: 1 } }
+      responses: { '200': { description: Timeline revision diff, content: { application/json: { schema: { $ref: './schemas/timeline-diff.json' } } } } }
+  /v1/timelines/{timeline_id}/archive:
+    post:
+      operationId: archiveTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/recover:
+    post:
+      operationId: recoverTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoverTimeline' } } } }
+      responses: { '200': { description: Recovered timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/shots:
+    post:
+      operationId: createShot
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }
+      responses: { '201': { description: Shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } } }
+  /v1/shots/{shot_id}:
+    get:
+      operationId: getShot
+      parameters: [ { $ref: '#/components/parameters/ShotId' } ]
+      responses: { '200': { description: Shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } } }
+    patch:
+      operationId: updateShot
+      parameters: [ { $ref: '#/components/parameters/ShotId' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateShot' } } } }
+      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/shots/{shot_id}/archive:
+    post:
+      operationId: archiveShot
+      parameters: [ { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/shots/{shot_id}/recover:
+    post:
+      operationId: recoverShot
+      parameters: [ { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Recovered shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/references:
+    post:
+      operationId: createReference
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }
+      responses: { '201': { description: Reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } } }
+  /v1/projects/{project_id}/shots:
+    post:
+      operationId: createProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotCreate' } } } }
+      responses: { '201': { description: Project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+    get:
+      operationId: listProjectShots
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: include_archived, in: query, required: false, schema: { type: boolean, default: false } } ]
+      responses: { '200': { description: Project shots, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotPage' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}:
+    get:
+      operationId: getProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' } ]
+      responses: { '200': { description: Project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+    patch:
+      operationId: updateProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotUpdate' } } } }
+      responses: { '200': { description: Updated project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/archive:
+    post:
+      operationId: archiveProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/recover:
+    post:
+      operationId: recoverProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Recovered project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/items:
+    post:
+      operationId: addShotItem
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotItemCreate' } } } }
+      responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/items/{item_id}:
+    delete:
+      operationId: removeShotItem
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { name: item_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/promote-candidate:
+    post:
+      operationId: promoteProjectShotCandidate
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotCandidatePromotion' } } } }
+      responses: { '200': { description: Atomically promoted shot candidate and stored invalidation report, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/reorder:
+    post:
+      operationId: reorderShotItems
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotReorder' } } } }
+      responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shot-text-bindings:
+    get:
+      operationId: listProjectShotTextBindings
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { name: shot_id, in: query, required: false, schema: { type: string } }, { name: kind, in: query, required: false, schema: { type: string, enum: [prompt, voiceover_script, transcript] } }, { name: slot, in: query, required: false, schema: { type: string } } ]
+      responses: { '200': { description: Project-scoped shot text bindings, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingPage' } } } } }
+    post:
+      operationId: setProjectShotTextBinding
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingSet' } } } }
+      responses: { '200': { description: Set text binding, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shot-text-bindings/{binding_id}:
+    get:
+      operationId: getProjectShotTextBinding
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/BindingId' } ]
+      responses: { '200': { description: Shot text binding, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBinding' } } } } }
+    post:
+      operationId: setProjectShotTextBindingById
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/BindingId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingSetById' } } } }
+      responses: { '200': { description: Set text binding, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shot-text-bindings/{binding_id}/rebind:
+    post:
+      operationId: rebindProjectShotTextBinding
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/BindingId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingRebind' } } } }
+      responses: { '200': { description: Rebound text binding, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/references:
+    post:
+      operationId: createProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferenceCreate' } } } }
+      responses: { '201': { description: Project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+    get:
+      operationId: listProjectReferences
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: include_archived, in: query, required: false, schema: { type: boolean, default: false } } ]
+      responses: { '200': { description: Project references, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferencePage' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}:
+    get:
+      operationId: getProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' } ]
+      responses: { '200': { description: Project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+    patch:
+      operationId: updateProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferenceUpdate' } } } }
+      responses: { '200': { description: Updated project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/archive:
+    post:
+      operationId: archiveProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/recover:
+    post:
+      operationId: recoverProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Recovered project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/associations:
+    post:
+      operationId: associateReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceAssociation' } } } }
+      responses: { '200': { description: Updated reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/primary:
+    post:
+      operationId: setPrimaryReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SetPrimaryReference' } } } }
+      responses: { '200': { description: Updated reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/reference-links:
+    post:
+      operationId: linkReferences
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceLink' } } } }
+      responses: { '200': { description: Reference link mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/references/{reference_id}:
+    get:
+      operationId: getReference
+      parameters: [ { $ref: '#/components/parameters/ReferenceId' } ]
+      responses: { '200': { description: Reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } } }
+    patch:
+      operationId: updateReference
+      parameters: [ { $ref: '#/components/parameters/ReferenceId' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateReference' } } } }
+      responses: { '200': { description: Updated reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/references/{reference_id}/archive:
+    post:
+      operationId: archiveReference
+      parameters: [ { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/references/{reference_id}/recover:
+    post:
+      operationId: recoverReference
+      parameters: [ { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Recovered reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/media-relations:
+    get:
+      operationId: listMediaRelations
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Media relations, content: { application/json: { schema: { $ref: '#/components/schemas/MediaRelationPage' } } } } }
+    post:
+      operationId: createMediaRelation
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateMediaRelation' } } } }
+      responses: { '201': { description: Media relation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/thumbnails/source-frame:
+    get:
+      operationId: getSourceFrameThumbnail
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { name: source_object_id, in: query, required: true, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+        - { name: source_time_seconds, in: query, required: true, schema: { type: number, minimum: 0, maximum: 4000000000, multipleOf: 0.000001 } }
+        - { name: recipe_version, in: query, required: false, schema: { type: integer, const: 1, default: 1 } }
+      responses:
+        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } } }
+    post:
+      operationId: ensureSourceFrameThumbnail
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' } } } }
+      responses:
+        '200': { description: Existing or newly associated source-frame thumbnail, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/objects:
+    post:
+      operationId: ingestObject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/OutputBinding' } ]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+  /v1/objects/{object_id}:
+    get:
+      operationId: getObject
+      parameters: [ { $ref: '#/components/parameters/ObjectId' }, { $ref: '#/components/parameters/Range' } ]
+      responses:
+        '200': { description: Full bytes, headers: { ETag: { $ref: '#/components/headers/ETag' }, Accept-Ranges: { $ref: '#/components/headers/AcceptRanges' } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '206': { description: Byte range, headers: { Content-Range: { $ref: '#/components/headers/ContentRange' }, ETag: { $ref: '#/components/headers/ETag' } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+    head:
+      operationId: headObject
+      parameters: [ { $ref: '#/components/parameters/ObjectId' }, { $ref: '#/components/parameters/Range' } ]
+      responses:
+        '200': { description: Metadata, headers: { ETag: { $ref: '#/components/headers/ETag' }, ContentLength: { $ref: '#/components/headers/ContentLength' }, AcceptRanges: { $ref: '#/components/headers/AcceptRanges' } } }
+        '206': { description: Range metadata, headers: { ContentRange: { $ref: '#/components/headers/ContentRange' }, ETag: { $ref: '#/components/headers/ETag' } } }
+  /v1/tasks:
+    post:
+      operationId: admitTask
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdmitTask' } } } }
+      responses: { '201': { description: Admitted task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/claim:
+    post:
+      operationId: claimTask
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimTask' } } } }
+      responses: { '200': { description: Fenced attempt or a typed waiting result, content: { application/json: { schema: { oneOf: [ { $ref: './schemas/worker.json#/definitions/AttemptFence' }, { $ref: './schemas/worker.json#/definitions/ClaimWaiting' } ] } } } }, '204': { description: No task available } }
+  /v1/delegated-tasks:
+    post:
+      operationId: admitDelegatedTask
+      description: Admit one child task under a live worker-owned parent authority.
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/DelegatedTaskAdmission' } } } }
+      responses: { '201': { description: Admitted delegated task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}:
+    get:
+      operationId: getTask
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses: { '200': { description: Task, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+  /v1/tasks/{task_id}/cancel:
+    post:
+      operationId: cancelTask
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Cancellation requested with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/tasks/{task_id}/retry:
+    post:
+      operationId: retryTask
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Retry requested with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/tasks/{task_id}/placement-recovery:
+    post:
+      operationId: recoverTaskPlacement
+      description: Owner-authorized versioned effective-placement recovery for one immutable targeted task.
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PlacementRecovery' } } } }
+      responses: { '200': { description: Durable placement-recovery decision and task projection, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}/remote-activation:
+    post:
+      operationId: recordRemoteActivation
+      description: Record one owner-qualified remote activation on the resident Runtime service. Requires the owner actor with admin scope.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteActivationQualification' } } } }
+      responses: { '200': { description: Recorded qualification, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteActivationQualification' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}/remote-credential:
+    post:
+      operationId: controlRemoteCredential
+      description: Owner-only resident credential generation, enablement, verification, exact uncommitted cleanup, and drain for an already admitted remote task.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteCredentialControl' } } } }
+      responses: { '200': { description: Credential control result, content: { application/json: { schema: { type: object } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}/remote-activation/revoke:
+    post:
+      operationId: revokeRemoteActivation
+      description: Revoke the current remote activation generation. Requires the owner actor with admin scope.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeRemoteActivation' } } } }
+      responses: { '204': { description: Current activation revoked }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/runs/{run_id}:
+    get:
+      operationId: getRun
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses: { '200': { description: Run, content: { application/json: { schema: { $ref: './schemas/run.json' } } } } }
+  /v1/runs/{run_id}/cancel:
+    post:
+      operationId: cancelRun
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/RunAction' } } } }
+      responses: { '200': { description: Cancelled run, content: { application/json: { schema: { $ref: './schemas/run.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/runs/{run_id}/retry:
+    post:
+      operationId: retryRun
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/RunAction' } } } }
+      responses: { '200': { description: Retried failed children, content: { application/json: { schema: { $ref: './schemas/run.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/runs/{run_id}/events:
+    get:
+      operationId: listRunEvents
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Ordered run events, content: { application/json: { schema: { $ref: '#/components/schemas/EventPage' } } } } }
+  /v1/events:
+    get:
+      operationId: listEvents
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: aggregate_id, in: query, required: false, schema: { type: string } }, { name: from, in: query, required: false, schema: { type: string, enum: [latest] }, description: Start after the newest matching event; returns an empty page and a polling cursor. } ]
+      responses: { '200': { description: Events, content: { application/json: { schema: { $ref: '#/components/schemas/EventPage' } } } } }
+  /v1/executors:
+    post:
+      operationId: registerExecutor
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }
+      responses: { '201': { description: Registered executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } } }
+  /v1/executors/{executor_id}:
+    get:
+      operationId: getExecutor
+      parameters: [ { name: executor_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
+      responses: { '200': { description: Exact owner-observed executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/tasks/{task_id}/settlement:
+    get:
+      operationId: getTaskSettlement
+      parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
+      responses: { '200': { description: Owner-only exact task settlement observation using lifecycle blockers, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/TaskSettlement' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/tasks/{task_id}/abandon:
+    post:
+      operationId: abandonTask
+      description: Explicit owner actor with admin scope only. Canonical cancel must remain provider_state_unknown. Records lost disposition without confirming remote execution or billing stopped.
+      parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/task-abandon.json' } } } }
+      responses: { '200': { description: Durable owner lost disposition and committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAbandonMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/control/local-worker/generation:
+    get:
+      operationId: getLocalWorkerGeneration
+      responses: { '200': { description: Current or pending owner-held local Worker generation, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerGeneration' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/local-worker/start:
+    post:
+      operationId: startLocalWorker
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerStartRequest' } } } }
+      responses: { '200': { description: Exact restarted local Worker generation, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerStartResult' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/control/local-worker/relinquish:
+    post:
+      operationId: relinquishLocalWorker
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerRelinquishRequest' } } } }
+      responses: { '200': { description: Exact local generation relinquished, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerRelinquishResult' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/capabilities:
+    get:
+      operationId: listCapabilities
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Capabilities, content: { application/json: { schema: { $ref: '#/components/schemas/CapabilityPage' } } } } }
+    post:
+      operationId: registerCapability
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Capability' } } } }
+      responses: { '201': { description: Registered capability, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Capability' } } } } }
+  /v1/projects/{project_id}/generations:
+    get:
+      operationId: listGenerations
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Project generations, content: { application/json: { schema: { $ref: '#/components/schemas/GenerationPage' } } } } }
+    post:
+      operationId: createGeneration
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateGeneration' } } } }
+      responses: { '201': { description: Generation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/generations/{generation_id}:
+    get:
+      operationId: getGeneration
+      parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
+      responses: { '200': { description: Generation, content: { application/json: { schema: { $ref: './schemas/generation.json' } } } } }
+  /v1/generations/{generation_id}/variants:
+    get:
+      operationId: listVariants
+      parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Generation variants, content: { application/json: { schema: { $ref: '#/components/schemas/VariantPage' } } } } }
+    post:
+      operationId: createVariant
+      parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateVariant' } } } }
+      responses: { '201': { description: Generation variant with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/generations/{generation_id}/variants/viewed:
+    post:
+      operationId: markGenerationVariantsViewed
+      parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses: { '200': { description: Generation variants with persisted view state, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/variants/{variant_id}:
+    get:
+      operationId: getVariant
+      parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: Generation variant, content: { application/json: { schema: { $ref: '#/components/schemas/Variant' } } } } }
+  /v1/variants/{variant_id}/thumbnail:
+    post:
+      operationId: attachVariantThumbnail
+      parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [thumbnail_object_id, source_object_id, recipe_version], properties: { thumbnail_object_id: { type: string }, source_object_id: { type: string }, recipe_version: { type: integer, const: 1 } } } } } }
+      responses: { '200': { description: Generation variant with attached poster, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/variants/{variant_id}/viewed:
+    post:
+      operationId: markVariantViewed
+      parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses: { '200': { description: Generation variant with persisted view state, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/settle:
+    post:
+      operationId: settleAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Settlement' } } } }
+      responses: { '200': { description: Settled with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/recoverable-snapshots:
+    post:
+      operationId: publishRecoverableSnapshot
+      description: Publish one opaque recoverable state_result revision under the producing Human Review child's frozen parent-policy grant. A durable receipt acknowledges the save; publication does not settle either attempt. Exact committed replay may recover its receipt after closure.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/RecoverableSnapshotRequest' } } } }
+      responses: { '200': { description: Durable recoverable managed-output association and committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/RecoverableSnapshotPublication' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/child-authority:
+    post:
+      operationId: issueChildAuthority
+      description: Issue a short-lived authority for a child admission under the live parent attempt fence.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/ChildAuthorityRequest' } } } }
+      responses: { '200': { description: Child admission authority, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/ChildAuthority' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/prepare-reboot:
+    post:
+      operationId: prepareReboot
+      parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryPrepare' } } } }
+      responses: { '200': { description: Durable recovery authorization, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryAuthorization' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/checkpoint:
+    post:
+      operationId: checkpointAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpoint' } } } }
+      responses: { '201': { description: Durable checkpoint, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpointReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/publish-timeline-render:
+    post:
+      operationId: publishTimelineRender
+      description: Fenced, replay-safe publication of one canonical timeline revision and the render task bound to it.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false, required: [lease_id, fence, runtime_epoch, timeline_id, expected_version, config, registry, render], properties: { lease_id: { type: string }, fence: { type: integer }, runtime_epoch: { type: integer, minimum: 1 }, timeline_id: { type: string }, expected_version: { type: integer, minimum: 1 }, config: { type: object }, registry: { type: object }, render: { type: object }, slug: { type: string }, name: { type: string } } } } } }
+      responses: { '200': { description: Durable timeline/render publication link, content: { application/json: { schema: { type: object } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/fail:
+    post:
+      operationId: failAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AttemptFailure' } } } }
+      responses: { '200': { description: Failed with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/heartbeat:
+    post:
+      operationId: heartbeatAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Heartbeat' } } } }
+      responses: { '200': { description: Lease renewed with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/recovery/reboot:
+    post:
+      operationId: requestReboot
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryRequest' } } } }
+      responses: { '200': { description: Reboot receipt, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/recovery/resume:
+    post:
+      operationId: resumeAttempt
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryRequest' } } } }
+      responses: { '200': { description: Resume receipt and exact attempt, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryResumeReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: workspace-scoped-token }
+  parameters:
+    PreferenceScope:
+      name: scope
+      in: path
+      required: true
+      schema: { type: string, enum: [user, project] }
+    AppStateKey:
+      name: key
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z0-9][a-z0-9._-]{0,63}$' }
+    PreferenceProjectId:
+      name: project_id
+      in: query
+      description: Optional explicit project selector for project scope; forbidden for user scope.
+      schema: { type: string, minLength: 1 }
+    Cursor: { name: cursor, in: query, required: false, schema: { type: string, minLength: 1 } }
+    Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
+    OutputBinding: { name: X-Output-Binding, in: header, required: false, description: Canonical JSON attempt/upload provenance for worker-owned output bytes, schema: { type: string, minLength: 2, maxLength: 8192 } }
+    ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
+    ObjectId: { name: object_id, in: path, required: true, schema: { type: string } }
+    TaskId: { name: task_id, in: path, required: true, schema: { type: string } }
+    AssociationId: { name: association_id, in: path, required: true, schema: { type: string, minLength: 1 } }
+    RunId: { name: run_id, in: path, required: true, schema: { type: string } }
+    AttemptId: { name: attempt_id, in: path, required: true, schema: { type: string } }
+    TimelineId: { name: timeline_id, in: path, required: true, schema: { type: string } }
+    ShotId: { name: shot_id, in: path, required: true, schema: { type: string } }
+    BindingId: { name: binding_id, in: path, required: true, schema: { type: string, minLength: 1 } }
+    ReferenceId: { name: reference_id, in: path, required: true, schema: { type: string } }
+    DocumentId: { name: document_id, in: path, required: true, schema: { type: string } }
+    GenerationId: { name: generation_id, in: path, required: true, schema: { type: string } }
+    Range: { name: Range, in: header, required: false, schema: { type: string, pattern: '^bytes=[0-9]+-[0-9]*$' } }
+  headers:
+    ETag: { description: Strong digest validator, schema: { type: string, pattern: '^"sha256:[0-9a-f]{64}"$' } }
+    AcceptRanges: { description: Supported range unit, schema: { type: string, const: bytes } }
+    ContentRange: { description: Inclusive byte range, schema: { type: string, pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$' } }
+    ContentLength: { description: Number of response bytes, schema: { type: integer, minimum: 0 } }
+  schemas:
+    HandshakeResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol, schema_digest, session_id, actor_id, realm_id, scopes]
+      properties:
+        protocol: { type: string, const: workspace.v1 }
+        schema_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        session_id: { type: string }
+        actor_id: { type: string }
+        realm_id: { type: string }
+        scopes: { type: array, items: { type: string }, uniqueItems: true }
+    CreateProject:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties: { name: { type: string, minLength: 1, maxLength: 512 }, slug: { type: string, minLength: 1, maxLength: 128 }, metadata: { type: object, additionalProperties: true } }
+    UpdateProject:
+      type: object
+      additionalProperties: false
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        name: { type: string, minLength: 1, maxLength: 512 }
+        metadata: { type: object, additionalProperties: true }
+    SelectProject:
+      type: object
+      additionalProperties: false
+      required: [project]
+      properties:
+        project: { type: string, minLength: 1 }
+        scope: { type: string, enum: [workspace, user], default: workspace }
+    ProjectSelection:
+      type: object
+      additionalProperties: false
+      required: [actor_id, scope, project, updated_at]
+      properties:
+        actor_id: { type: string }
+        scope: { type: string, enum: [workspace, user] }
+        project: { $ref: './schemas/project.json' }
+        updated_at: { type: string }
+    MediaImportOperation:
+      type: object
+      additionalProperties: false
+      required: [provider, project, import_operation_id, status, task_id, generation_id, variant_id, asset_id, entry]
+      properties:
+        provider: { type: string, const: runtime }
+        project: { type: string }
+        import_operation_id: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' }
+        status: { type: string, enum: [pending, completed] }
+        task_id: { type: [string, 'null'] }
+        generation_id: { type: [string, 'null'] }
+        variant_id: { type: [string, 'null'] }
+        asset_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        entry:
+          type: object
+          additionalProperties: false
+          required: [object_id, media_type, size, filename]
+          properties:
+            object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            media_type: { type: string }
+            size: { type: integer, minimum: 0, maximum: 5368709120 }
+            filename: { type: [string, 'null'] }
+        provenance: { type: object, additionalProperties: true }
+        actor_id: { type: string }
+        filename: { type: [string, 'null'] }
+        mime_type: { type: string }
+        size: { type: integer, minimum: 0, maximum: 5368709120 }
+        width: { type: [integer, 'null'], minimum: 1 }
+        height: { type: [integer, 'null'], minimum: 1 }
+        duration_seconds: { type: [number, 'null'], exclusiveMinimum: 0 }
+    RunAction:
+      type: object
+      additionalProperties: false
+      properties:
+        selected_task_ids: { type: array, items: { type: string, minLength: 1 }, uniqueItems: true }
+    ProjectPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: './schemas/project.json' } }
+        next_cursor: { type: [string, 'null'] }
+    ExpectedVersion:
+      type: object
+      additionalProperties: false
+      properties: { expected_version: { type: integer, minimum: 1 } }
+    RemoteActivationQualification:
+      type: object
+      additionalProperties: false
+      required: [activation_id, task_id, run_id, credential_actor, binding_digest, deployment_digest, evidence_digest, effective_target, executor_incarnation, runtime_session_id, runtime_epoch, expires_at, observation_digest, authorized_child_lineage]
+      properties:
+        activation_id: { type: string, minLength: 1 }
+        task_id: { type: string, minLength: 1 }
+        run_id: { type: string, minLength: 1 }
+        credential_actor: { type: string, minLength: 1 }
+        binding_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        deployment_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        evidence_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        effective_target: { $ref: './schemas/task.json#/definitions/ExecutionTarget' }
+        executor_incarnation: { type: string, minLength: 1 }
+        runtime_session_id: { type: string, minLength: 1 }
+        runtime_epoch: { type: integer, minimum: 1 }
+        expires_at: { type: string, format: date-time }
+        observation_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        authorized_child_lineage:
+          type: object
+          additionalProperties: false
+          required: [parent_task_id, parent_run_id, max_depth, placement_version, effective_target]
+          properties:
+            parent_task_id: { type: string, minLength: 1 }
+            parent_run_id: { type: string, minLength: 1 }
+            max_depth: { type: integer, const: 1 }
+            placement_version: { type: integer, minimum: 0 }
+            effective_target: { $ref: './schemas/task.json#/definitions/ExecutionTarget' }
+    RevokeRemoteActivation:
+      type: object
+      additionalProperties: false
+      required: [activation_id]
+      properties:
+        activation_id: { type: string, minLength: 1 }
+    RemoteCredentialControl:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action: { type: string, enum: [provision, enable, verify, revoke, revoke-uncommitted, begin-drain, finish-drain] }
+        activation_id: { type: string, minLength: 1 }
+        qualification: { $ref: '#/components/schemas/RemoteActivationQualification' }
+        placement: { type: object }
+    PlacementRecovery:
+      type: object
+      additionalProperties: false
+      required: [schema_version, expected_task_version, expected_placement_version, expected_original_target, expected_current_target, replacement_target, reason, loss_evidence, qualification]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        expected_task_version: { type: integer, minimum: 1 }
+        expected_placement_version: { type: integer, minimum: 0 }
+        expected_original_target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+        expected_current_target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+        replacement_target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+        reason: { type: string, minLength: 1, maxLength: 1024 }
+        loss_evidence:
+          type: object
+          additionalProperties: false
+          required: [source, status, target, observed_at, evidence_digest, no_active_work]
+          properties:
+            source: { type: string, minLength: 1 }
+            status: { type: string, const: absent }
+            target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+            observed_at: { type: string, format: date-time }
+            evidence_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            no_active_work: { type: boolean, const: true }
+        qualification:
+          type: object
+          additionalProperties: false
+          required: [target, verified, evidence_digest, executor_incarnation]
+          properties:
+            target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+            verified: { type: boolean, const: true }
+            evidence_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            executor_incarnation: { type: string, minLength: 1, maxLength: 256 }
+    AdmitTask:
+      type: object
+      additionalProperties: false
+      required: [capability_id, capability_digest, input_object_ids]
+      properties:
+        capability_id: { type: string, minLength: 1 }
+        capability_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        schema_version: { type: string, minLength: 1 }
+        input_object_ids: { type: array, items: { type: string, description: Canonical sha256 object ID already associated with the task project. }, uniqueItems: true }
+        required_facts: { $ref: './schemas/task.json#/definitions/RequiredFacts' }
+        execution_request: { $ref: './schemas/task.json#/definitions/ExecutionRequest', description: Caller-provided execution request; Runtime supplies execution_binding on claim and task readback. }
+        project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
+        spec: { type: object, additionalProperties: true }
+        generation_intent: { type: object, additionalProperties: true, description: Opaque producer intent; GEN owns its semantics. }
+        settlement_effect: { $ref: './schemas/worker.json#/definitions/Effect' }
+        storage_estimate: { $ref: '#/components/schemas/StorageEstimate' }
+        child_delegation: { $ref: './schemas/worker.json#/definitions/ChildDelegationPolicy', description: Parent-owned authorization policy for staged child admission. }
+    StorageEstimate:
+      type: object
+      additionalProperties: false
+      required: [scratch_bytes, output_bytes]
+      properties:
+        scratch_bytes: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        output_bytes: { type: integer, minimum: 0, maximum: 9007199254740991 }
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/event.json' } }, next_cursor: { type: [string, 'null'] } }
+    TaskPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/task.json' } }, next_cursor: { type: [string, 'null'] } }
+    RunPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { type: object, additionalProperties: true } }, next_cursor: { type: [string, 'null'] } }
+    CapabilityPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/worker.json#/definitions/Capability' } }, next_cursor: { type: [string, 'null'] } }
+    CreateTimeline:
+      type: object
+      additionalProperties: false
+      required: [timeline_id]
+      properties: { timeline_id: { type: string, minLength: 1 }, name: { type: string, minLength: 1, maxLength: 120, pattern: '^\S(?:.*\S)?$' } }
+    RenameTimeline:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties: { name: { type: string, minLength: 1, maxLength: 120, pattern: '^\S(?:.*\S)?$' } }
+    CreateTimelineDocument:
+      type: object
+      additionalProperties: false
+      required: [timeline_id, config, registry]
+      properties:
+        timeline_id: { type: string, minLength: 1 }
+        config: { type: object, additionalProperties: true }
+        registry: { type: object, additionalProperties: true }
+        slug: { type: string, minLength: 1 }
+        name: { type: string, minLength: 1 }
+    TimelinePage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/timeline.json' } }, next_cursor: { type: [string, 'null'] } }
+    DocumentPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/document.json' } }, next_cursor: { type: [string, 'null'] } }
+    CreateDocument:
+      type: object
+      required: [document_id, kind, content]
+      properties: { document_id: { type: string }, kind: { type: string }, content: {} }
+      allOf:
+        - if: { properties: { kind: { const: media.transcript } }, required: [kind] }
+          then:
+            properties:
+              document_id: { type: string, pattern: '^transcript:[0-9a-f]{64}$' }
+              content: { $ref: 'https://astrid.haus/workspace/v1/schemas/document.json#/$defs/MediaTranscript' }
+        - if: { properties: { document_id: { pattern: '^transcript:' } }, required: [document_id] }
+          then: { properties: { kind: { const: media.transcript } } }
+    UpdateDocument:
+      type: object
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, kind: { type: string }, content: {} }
+      allOf:
+        - if: { properties: { kind: { const: media.transcript } }, required: [kind] }
+          then: { properties: { content: { $ref: 'https://astrid.haus/workspace/v1/schemas/document.json#/$defs/MediaTranscript' } } }
+    UpdateTimeline:
+      type: object
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, shots: { type: array, items: { $ref: '#/components/schemas/Shot' } }, references: { type: array, items: { $ref: '#/components/schemas/Reference' } } }
+    ManagedObjectPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/managed-object.json' } }, next_cursor: { type: [string, 'null'] } }
+    ManagedOutputPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/managed-output.json' } }, next_cursor: { type: [string, 'null'] } }
+    ManagedOutputAdoption:
+      type: object
+      additionalProperties: false
+      properties:
+        association_id: { type: string, minLength: 1 }
+        manifest_ref: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        size: { type: integer, minimum: 0 }
+        filename: { type: string, minLength: 1 }
+        media_type: { type: string, minLength: 1 }
+        output_port: { type: string, minLength: 1 }
+        selector: { type: object, additionalProperties: true }
+        ordinal: { type: integer, minimum: 0 }
+        role: { type: string, minLength: 1 }
+        durability: { type: string, enum: [durable, temporary] }
+    ManagedOutputExportRequest:
+      type: object
+      additionalProperties: false
+      required: [destination_filename]
+      properties:
+        destination_filename: { type: string, minLength: 1, maxLength: 512 }
+        expected: { type: object, additionalProperties: true }
+    ManagedOutputLifecycle:
+      type: object
+      additionalProperties: false
+      required: [operation, expected_version]
+      properties:
+        operation: { type: string, enum: [lease, release, pin, unpin, expire, reclaim, promote] }
+        expected_version: { type: integer, minimum: 1 }
+        lease_id: { type: string, minLength: 1 }
+        lease_owner: { type: string, minLength: 1 }
+        lease_seconds: { type: integer, minimum: 1 }
+        provenance: { type: object, additionalProperties: true }
+    TimelineRevisionPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/timeline-revision.json' } }, next_cursor: { type: [string, 'null'] } }
+    RecoverTimeline:
+      type: object
+      additionalProperties: false
+      required: [expected_version, version]
+      properties: { expected_version: { type: integer, minimum: 1 }, version: { type: integer, minimum: 1 } }
+    GenerationPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/generation.json' } }, next_cursor: { type: [string, 'null'] } }
+    CreateGeneration:
+      type: object
+      required: [generation_id]
+      properties: { generation_id: { type: string }, source_task_id: { type: [string, 'null'] }, type: { type: string }, status: { type: string }, metadata: { type: object } }
+    Variant:
+      type: object
+      required: [variant_id, generation_id, variant_type, metadata, created_at]
+      properties:
+        variant_id: { type: string }
+        generation_id: { type: string }
+        object_id: { type: [string, 'null'] }
+        variant_type: { type: string }
+        metadata: { type: object }
+        thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] }
+        viewed_at: { type: [string, 'null'] }
+        created_at: { type: string }
+    VariantPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/Variant' } }, next_cursor: { type: [string, 'null'] } }
+    CreateVariant:
+      type: object
+      required: [variant_id]
+      properties: { variant_id: { type: string }, object_id: { type: string }, variant_type: { type: string }, metadata: { type: object } }
+    AttemptFailure:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence, runtime_epoch, error]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 }, error: {} }
+    Shot:
+      type: object
+      additionalProperties: false
+      required: [shot_id, start_ms, duration_ms]
+      properties:
+        shot_id: { type: string, minLength: 1 }
+        start_ms: { type: integer, minimum: 0 }
+        duration_ms: { type: integer, minimum: 1 }
+        reference_ids: { type: array, items: { type: string }, uniqueItems: true }
+        timeline_id: { type: string }
+        project_id: { type: string }
+        version: { type: integer, minimum: 1 }
+        archived: { type: boolean }
+    Reference:
+      type: object
+      additionalProperties: false
+      required: [reference_id, object_id]
+      properties: { reference_id: { type: string, minLength: 1 }, object_id: { type: string, minLength: 1 }, role: { type: string }, timeline_id: { type: string }, project_id: { type: string }, version: { type: integer, minimum: 1 }, archived: { type: boolean } }
+    ReferencePage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/Reference' } }, next_cursor: { type: [string, 'null'] } }
+    ShotPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/Shot' } }, next_cursor: { type: [string, 'null'] } }
+    UpdateShot:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, start_ms: { type: integer, minimum: 0 }, duration_ms: { type: integer, minimum: 1 }, reference_ids: { type: array, items: { type: string }, uniqueItems: true } }
+    UpdateReference:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, object_id: { type: string, minLength: 1 }, role: { type: string } }
+    MediaRelationPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/media-relation.json' } }, next_cursor: { type: [string, 'null'] } }
+    CreateMediaRelation:
+      type: object
+      additionalProperties: false
+      required: [from_object_id, to_object_id, kind]
+      properties: { from_object_id: { type: string, minLength: 1 }, to_object_id: { type: string, minLength: 1 }, kind: { type: string }, ordinal: { type: integer, minimum: 0 }, metadata: { type: object, additionalProperties: true } }
+    ClaimTask:
+      type: object
+      additionalProperties: false
+      required: [executor_id, capability_ids, runtime_epoch]
+      properties: { executor_id: { type: string, minLength: 1 }, capability_ids: { type: array, items: { type: string }, uniqueItems: true }, runtime_epoch: { type: integer, minimum: 1 } }
+    Heartbeat:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence, runtime_epoch]
+      properties:
+        lease_id: { type: string, minLength: 1 }
+        fence: { type: integer, minimum: 1 }
+        runtime_epoch: { type: integer, minimum: 1 }
+        progress:
+          type: object
+          additionalProperties: false
+          properties:
+            phase: { type: string, minLength: 1, maxLength: 128 }
+            percent: { type: number, minimum: 0, maximum: 100 }
+            current: { type: number, minimum: 0 }
+            total: { type: number, minimum: 1 }
+    RecoveryPrepare:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence, runtime_epoch]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 } }
+    RecoveryAuthorization:
+      type: object
+      required: [attempt_id, task_id, executor_id, runtime_epoch, nonce, expires_in_seconds]
+      properties: { attempt_id: { type: string }, task_id: { type: string }, executor_id: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, nonce: { type: string }, expires_in_seconds: { type: integer, minimum: 0 } }
+    RecoveryCheckpoint:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence, nonce, authorization, runtime_epoch]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, nonce: { type: string }, authorization: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, checkpoint: { type: object }, state: { type: object } }
+    RecoveryCheckpointReceipt:
+      type: object
+      required: [checkpoint_id, attempt_id, task_id, runtime_epoch, nonce, digest, size, state]
+      properties: { checkpoint_id: { type: string }, attempt_id: { type: string }, task_id: { type: string }, runtime_epoch: { type: integer }, nonce: { type: string }, digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, size: { type: integer, minimum: 0 }, state: { type: string }, path: { type: string } }
+    RecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [nonce, authorization, runtime_epoch]
+      properties: { checkpoint_id: { type: string }, attempt_id: { type: string }, nonce: { type: string }, authorization: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, command: { type: string } }
+    RecoveryReceipt:
+      type: object
+      required: [type, checkpoint_id, attempt_id, task_id, runtime_epoch, command, status]
+      properties: { type: { type: string }, version: { type: integer }, checkpoint_id: { type: string }, attempt_id: { type: string }, task_id: { type: string }, runtime_epoch: { type: integer }, command: { type: string }, status: { type: string }, checkpoint_digest: { type: string }, executor_result: {} }
+    RecoveryResumeReceipt:
+      type: object
+      required: [receipt, attempt]
+      properties: { receipt: { $ref: '#/components/schemas/RecoveryReceipt' }, attempt: { $ref: './schemas/worker.json#/definitions/AttemptFence' } }
+    CreateBackup:
+      type: object
+      additionalProperties: false
+      required: [destination]
+      properties: { destination: { type: string, minLength: 1 } }
+    RestoreBackup:
+      type: object
+      additionalProperties: false
+      required: [backup, destination]
+      properties: { backup: { type: string, minLength: 1 }, destination: { type: string, minLength: 1 } }
+    LifecycleRequest:
+      type: object
+      additionalProperties: false
+      properties: { reason: { type: string }, expected_version: { type: integer, minimum: 1 } }
+    RecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_realm_id, expected_version]
+      properties:
+        expected_realm_id: { type: string, minLength: 1 }
+        expected_version: { type: integer, minimum: 1 }
+        confirmation: { type: string, minLength: 1 }
+        noninteractive: { type: boolean }
+    PurgeRealm:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties: { confirmation: { type: string, minLength: 1 } }
+    ShotItem:
+      type: object
+      additionalProperties: false
+      required: [item_id, media_id, sort_key]
+      properties: { item_id: { type: string }, media_id: { type: string }, sort_key: { type: string }, source_frame: { type: [integer, 'null'] }, metadata: { type: object } }
+    ProjectShot:
+      type: object
+      additionalProperties: false
+      required: [shot_id, project_id, name, metadata, version, items, archived]
+      properties: { shot_id: { type: string }, project_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object }, version: { type: integer, minimum: 1 }, items: { type: array, items: { $ref: '#/components/schemas/ShotItem' } }, archived: { type: boolean }, revision_id: { type: string }, internal_timeline_revision_id: { type: string }, content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, created_at: { type: string }, updated_at: { type: string } }
+    PreferenceResource:
+      $ref: './schemas/preferences.json'
+    UpdatePreferences:
+      type: object
+      additionalProperties: false
+      required: [content, expected_version]
+      properties: { content: { type: string }, expected_version: { type: integer, minimum: 0 } }
+    AppStateResource:
+      $ref: './schemas/app-state.json'
+    UpdateAppState:
+      type: object
+      additionalProperties: false
+      required: [content, expected_version]
+      properties: { content: { type: object }, expected_version: { type: integer, minimum: 0 } }
+    AppStateMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: '#/components/schemas/AppStateResource' }
+        receipt: { type: 'null' }
+    PreferenceMutation:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [data, receipt]
+          properties:
+            data:
+              allOf: [ { $ref: '#/components/schemas/PreferenceResource' }, { properties: { scope: { const: user } } } ]
+            receipt: { type: 'null' }
+        - allOf:
+            - { $ref: '#/components/schemas/CommittedMutation' }
+            - properties:
+                data:
+                  allOf: [ { $ref: '#/components/schemas/PreferenceResource' }, { properties: { scope: { const: project } } } ]
+    CommittedMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { type: object }
+        receipt:
+          type: object
+          additionalProperties: false
+          required: [receipt_id, command_kind, idempotency_key, request_hash, project_id, project_seq, event_ids, result, created_at]
+          properties: { receipt_id: { type: string }, command_kind: { type: string }, idempotency_key: { type: string }, request_hash: { type: string }, project_id: { type: string }, project_seq: { type: array, minItems: 2, maxItems: 2, items: { type: integer, minimum: 1 } }, event_ids: { type: array, items: { type: string } }, result: {}, created_at: { type: string } }
+    TaskAbandonMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/task-abandon.json#/definitions/AbandonResult' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
+    RecoverableSnapshotPublication:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/managed-output.json' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
+    ProjectObjectMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/managed-object.json' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
+    ProjectShotCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties: { shot_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object } }
+    ProjectShotUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, name: { type: string }, metadata: { type: object } }
+    ShotItemCreate:
+      type: object
+      additionalProperties: false
+      required: [media_id]
+      properties: { item_id: { type: string }, media_id: { type: string }, position: { type: integer, minimum: 0 }, source_frame: { type: integer, minimum: 0 }, metadata: { type: object } }
+    ShotCandidatePromotion:
+      type: object
+      additionalProperties: false
+      required: [candidate_item_id, expected_head_seq]
+      properties:
+        candidate_item_id: { type: string, minLength: 1 }
+        expected_head_seq: { type: integer, minimum: 1 }
+        timeline_assets: { type: array, items: { type: object } }
+    ShotReorder:
+      type: object
+      additionalProperties: false
+      required: [expected_version, item_ids]
+      properties: { expected_version: { type: integer, minimum: 1 }, item_ids: { type: array, items: { type: string }, uniqueItems: true } }
+    ProjectShotPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/ProjectShot' } }, next_cursor: { type: [string, 'null'] } }
+    ImmutableRevision:
+      type: object
+      required: [revision_id, project_id, content_digest, payload, created_at]
+      properties:
+        revision_id: { type: string, minLength: 1 }
+        project_id: { type: string, minLength: 1 }
+        shot_id: { type: string }
+        timeline_id: { type: string }
+        internal_timeline_revision_id: { type: string }
+        content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        payload: { type: object }
+        created_at: { type: string }
+    ParentCompositionRevision:
+      type: object
+      additionalProperties: false
+      required: [revision_id, project_id, timeline_id, content_digest, created_at, is_current_head]
+      properties:
+        revision_id: { type: string, minLength: 1 }
+        project_id: { type: string, minLength: 1 }
+        timeline_id: { type: string, minLength: 1 }
+        content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        created_at: { type: string }
+        is_current_head: { type: boolean }
+    ParentCompositionRevisionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ParentCompositionRevision' } }
+        next_cursor: { type: [string, 'null'] }
+    RestoreParentCompositionRevision:
+      type: object
+      additionalProperties: false
+      required: [expected_head]
+      properties:
+        expected_head: { type: [string, 'null'] }
+    ParentCompositionPublication:
+      type: object
+      additionalProperties: false
+      required: [project_id, timeline_id, expected_head, parent_composition]
+      properties:
+        project_id: { type: string, minLength: 1 }
+        timeline_id: { type: string, minLength: 1 }
+        expected_head: { type: [string, 'null'] }
+        parent_revision_id: { type: string, minLength: 1 }
+        content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        parent_composition: { type: object }
+        shot_revisions: { type: array, items: { type: object } }
+        internal_timeline_revisions: { type: array, items: { type: object } }
+        dependency_manifest: { type: object }
+    ParentCompositionMediaReplacement:
+      type: object
+      additionalProperties: false
+      required: [occurrence_id, clip_id, source_object_id, expected_head]
+      properties:
+        occurrence_id: { type: string, minLength: 1 }
+        clip_id: { type: string, minLength: 1 }
+        source_object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        expected_head: { type: string, minLength: 1 }
+        timing: { type: string, const: preserve-duration, default: preserve-duration }
+    ShotTextBinding:
+      type: object
+      additionalProperties: false
+      required: [binding_id, project_id, shot_id, kind, media_id, event_stream_id, head, content_hash, mime_type, byte_size, created_at, updated_at]
+      properties: { binding_id: { type: string }, project_id: { type: string }, shot_id: { type: string }, kind: { type: string, enum: [prompt, voiceover_script, transcript] }, slot: { type: [string, 'null'] }, media_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, event_stream_id: { type: string }, head: { type: integer, minimum: 1 }, content_hash: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, mime_type: { type: string }, byte_size: { type: integer, minimum: 0, maximum: 1048576 }, created_at: { type: string }, updated_at: { type: string } }
+    ShotTextBindingPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/ShotTextBinding' } }, next_cursor: { type: [string, 'null'] } }
+    ShotTextBindingSet:
+      type: object
+      additionalProperties: false
+      required: [shot_id, kind, expected_head, text]
+      properties: { binding_id: { type: string }, shot_id: { type: string }, kind: { type: string, enum: [prompt, voiceover_script, transcript] }, slot: { type: [string, 'null'] }, expected_head: { type: integer, minimum: 0 }, text: { type: string, maxLength: 1048576 } }
+    ShotTextBindingSetById:
+      type: object
+      additionalProperties: false
+      required: [expected_head, text]
+      properties: { binding_id: { type: string }, expected_head: { type: integer, minimum: 1 }, text: { type: string, maxLength: 1048576 } }
+    ShotTextBindingRebind:
+      type: object
+      additionalProperties: false
+      required: [media_id, expected_head]
+      properties: { binding_id: { type: string }, shot_id: { type: string }, kind: { type: string }, slot: { type: [string, 'null'] }, media_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, expected_head: { type: integer, minimum: 1 } }
+    ReferenceAssociation:
+      type: object
+      additionalProperties: false
+      required: [media_id, role]
+      properties: { association_id: { type: string }, media_id: { type: string }, role: { type: string }, metadata: { type: object } }
+    ProjectReference:
+      type: object
+      additionalProperties: false
+      required: [reference_id, project_id, kind, name, description, metadata, version, media_references, links, archived]
+      properties: { reference_id: { type: string }, project_id: { type: string }, kind: { type: string }, name: { type: string }, description: { type: string }, metadata: { type: object }, version: { type: integer, minimum: 1 }, media_references: { type: array, items: { $ref: '#/components/schemas/ReferenceAssociation' } }, links: { type: array, items: { $ref: '#/components/schemas/ReferenceLink' } }, archived: { type: boolean }, created_at: { type: string }, updated_at: { type: string } }
+    ProjectReferenceCreate:
+      type: object
+      additionalProperties: false
+      required: [kind, name, media_id]
+      properties: { reference_id: { type: string }, kind: { type: string }, name: { type: string }, media_id: { type: string }, description: { type: string }, metadata: { type: object } }
+    ProjectReferenceUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, name: { type: string }, description: { type: string }, metadata: { type: object } }
+    ProjectReferencePage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/ProjectReference' } }, next_cursor: { type: [string, 'null'] } }
+    SetPrimaryReference:
+      type: object
+      additionalProperties: false
+      required: [association_id, expected_version]
+      properties: { association_id: { type: string }, expected_version: { type: integer, minimum: 1 } }
+    ReferenceLink:
+      type: object
+      additionalProperties: false
+      required: [from_reference_id, to_reference_id, kind]
+      properties: { from_reference_id: { type: string }, to_reference_id: { type: string }, kind: { type: string }, metadata: { type: object } }
+  responses:
+    NotFound:
+      description: Resource not found
+      content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }
+    Conflict:
+      description: Conflict or idempotency mismatch
+      content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }
+    RangeNotSatisfiable:
+      description: Invalid byte range
+      content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }

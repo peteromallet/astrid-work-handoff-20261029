@@ -1,0 +1,11 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {"names": ["pidfd_open"], "action": "SCMP_ACT_ERRNO", "errnoRet": 38},
+    {"names": ["pidfd_send_signal", "pidfd_getfd"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1},
+    {"names": ["kill"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1,
+     "args": [{"index": 0, "value": 2147483648, "valueTwo": 2147483648, "op": "SCMP_CMP_MASKED_EQ"}]},
+    {"names": ["kill"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1,
+     "args": [{"index": 0, "value": 0, "op": "SCMP_CMP_EQ"}]}
+  ]
+}

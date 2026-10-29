@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import urllib.error
+import urllib.request
+
+import pytest
+
+from astrid_runtime.bootstrap import BootstrapConfig, BootstrapError, SourceProfile, bootstrap
+from astrid_runtime.paths import RuntimePaths
+from runtime_protocol.errors import AuthorizationError, ConflictError, LeaseError
+from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
+from runtime_protocol.daemon import RuntimeDaemon
+from astrid_runtime_client import WorkspaceClient
+
+
+def test_targeted_mutations_replay_the_same_committed_receipt(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "contract", "name": "Contract"})
+        document_body = {"document_id": "doc", "kind": "notes", "content": {"v": 1}}
+        document = service.create_document(project["id"], document_body, idempotency_key="doc-create")
+        assert document["receipt"]["command_kind"] == "document.create"
+        assert service.create_document(project["id"], document_body, idempotency_key="doc-create") == document
+        with pytest.raises(ConflictError):
+            service.create_document(project["id"], {**document_body, "content": {"v": 2}}, idempotency_key="doc-create")
+
+        # Generations and variants are now published only by admitted
+        # settlement effects; direct calls must not create receipt-backed rows.
+        with pytest.raises(ConflictError, match="direct generation publication is disabled"):
+            service.create_generation(project["id"], {"generation_id": "generation", "metadata": {"seed": 1}}, idempotency_key="generation-create")
+        with pytest.raises(ConflictError, match="direct variant publication is disabled"):
+            service.create_variant("generation", {"variant_id": "variant", "metadata": {}}, idempotency_key="variant-create")
+        assert service.list_generations(project["id"])["items"] == []
+
+        left = service.ingest(project["id"], b"left", idempotency_key="left-object")["data"]["digest"]
+        right = service.ingest(project["id"], b"right", idempotency_key="right-object")["data"]["digest"]
+        relation_body = {"from_object_id": left, "to_object_id": right, "kind": "derived_from", "ordinal": 1}
+        relation = service.create_media_relation(project["id"], relation_body, idempotency_key="relation-create")
+        assert relation["receipt"]["command_kind"] == "media_relation.create"
+        assert service.create_media_relation(project["id"], relation_body, idempotency_key="relation-create") == relation
+
+        timeline = service.create_timeline(project["id"], "timeline", idempotency_key="timeline-create")
+        updated = service.update_timeline("timeline", {"expected_version": 1, "shots": []}, idempotency_key="timeline-update")
+        assert updated["receipt"]["event_ids"]
+        assert service.update_timeline("timeline", {"expected_version": 1, "shots": []}, idempotency_key="timeline-update") == updated
+        archived = service.archive_timeline("timeline", {"expected_version": 2}, idempotency_key="timeline-archive")
+        recovered = service.recover_timeline("timeline", {"expected_version": 3, "version": 2}, idempotency_key="timeline-recover")
+        assert archived["receipt"]["project_seq"][0] <= recovered["receipt"]["project_seq"][1]
+    finally:
+        service.close()
+
+
+def test_executor_reregistration_is_identity_and_epoch_fenced(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
+    service = RuntimeService(tmp_path / "realm")
+    identity = {"actor": "executor-a", "scopes": ["worker:register"]}
+    try:
+        service.register_executor({"executor_id": "executor-a", "capabilities": ["render.basic"]}, idempotency_key="executor-initial", identity=identity)
+        epoch = service.health()["runtime_epoch"]
+        refreshed = service.register_executor(
+            {"executor_id": "executor-a", "capabilities": ["render.basic"], "readiness": "not_ready", "readiness_reason": "warming", "runtime_epoch": epoch},
+            idempotency_key="executor-refresh", identity=identity,
+        )
+        assert refreshed["readiness"] == "not_ready"
+        with pytest.raises(AuthorizationError):
+            service.register_executor(
+                {"executor_id": "executor-a", "capabilities": ["render.basic"], "runtime_epoch": epoch},
+                idempotency_key="executor-hijack", identity={"actor": "other", "scopes": ["worker:register"]},
+            )
+        with pytest.raises(LeaseError):
+            service.register_executor(
+                {"executor_id": "executor-a", "capabilities": ["render.basic"]},
+                idempotency_key="executor-no-epoch", identity=identity,
+            )
+    finally:
+        service.close()
+
+
+def test_source_profile_requires_pinned_runtime_and_rejects_authority_fields() -> None:
+    with pytest.raises(BootstrapError, match="runtime_checkout"):
+        SourceProfile.from_mapping({"profile": "astrid", "source_checkout": "/source"})
+    with pytest.raises(BootstrapError, match="runtime authority"):
+        SourceProfile.from_mapping({"profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source", "realm_root": "/attacker"})
+    with pytest.raises(BootstrapError, match="runtime_command"):
+        SourceProfile.from_mapping({"profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source", "runtime_command": ["sh", "-c", "evil"]})
+
+
+def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "0")
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
+    paths = RuntimePaths.sandbox(tmp_path)
+    profile = SourceProfile("astrid", "/runtime", "/source")
+
+    class FailingBoundary:
+        stopped = False
+
+        def create(self, **kwargs):
+            RealmStore.initialize(
+                kwargs["realm_root"],
+                realm_id=kwargs["realm_id"],
+                display_name=kwargs["display_name"],
+            ).close()
+            return {"state": "created", "realm_id": kwargs["realm_id"], "root": str(kwargs["realm_root"])}
+
+        def start(self, **kwargs):
+            assert (kwargs["realm_root"] / "realm.sqlite3").is_file()
+            return {"endpoint": "http://127.0.0.1:43100", "pid": 101, "runtime_instance_id": "instance", "protocol_version": "workspace.v1", "schema_version": "workspace-schema-v1"}
+
+        def inspect(self, **kwargs):
+            return RealmStore.inspect_realm(kwargs["realm_root"])
+
+        def health(self, **kwargs):
+            return True
+
+        def owner_startup_identity(self, *, endpoint, instance_id):
+            return {
+                "runtime_instance_id": "instance",
+                "identity": {"release": 0, "managed_by": None},
+            }
+
+        def connect(self, **kwargs):
+            raise RuntimeError("handoff failed")
+
+        def stop(self):
+            self.stopped = True
+
+    boundary = FailingBoundary()
+    from astrid_runtime.workspace import configure_workspace
+    root = paths.realms_dir / "explicit-realm"
+    configure_workspace(
+        paths, boundary, BootstrapConfig(source_profile=profile), mode="create",
+        realm_root=root, realm_id="explicit-realm",
+    )
+    with pytest.raises(RuntimeError, match="handoff failed"):
+        bootstrap(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert boundary.stopped
+    assert root.is_dir()
+    assert paths.catalog_path.exists()
+    assert not paths.discovery_path.exists()
+    assert not paths.instance_lock_path.exists()
+
+
+def test_http_target_mutations_require_idempotency_key(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Strict mutation", idempotency_key="strict-project")
+        client.create_timeline(project.project_id, "strict-timeline", idempotency_key="strict-timeline")
+        request = urllib.request.Request(
+            f"{daemon.endpoint}/v1/timelines/strict-timeline",
+            data=json.dumps({"expected_version": 1, "shots": []}).encode(),
+            method="PATCH",
+            headers={"Authorization": f"Bearer {daemon.token}", "Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 400
+        assert json.loads(error.value.read())["code"] == "protocol_error"
+    finally:
+        daemon.stop()
