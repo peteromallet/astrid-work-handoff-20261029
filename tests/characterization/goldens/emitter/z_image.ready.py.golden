@@ -1,0 +1,90 @@
+# vibecomfy: generated
+# For hand-editing, run: python -m vibecomfy.cli copy-to-recipe <id>
+# vibecomfy: surface=canonical
+"""Auto-generated ready_template — use python -m vibecomfy.cli copy-to-recipe <id> for hand-editing."""
+from __future__ import annotations
+
+from vibecomfy.templates import InputSpec, OutputSpec, ReadyMetadata, new_workflow, ref
+from vibecomfy.workflow import VibeWorkflow
+from vibecomfy.nodes.core import CLIPLoader, CLIPTextEncode, EmptySD3LatentImage, KSampler, ModelSamplingAuraFlow, SaveImage, UNETLoader, VAEDecode, VAELoader
+
+
+CLIP_NAME = 'qwen_3_4b.safetensors'
+DEFAULT_PROMPT = 'A fashion photography work full of surreal romanticism, using a low-angle upward shooting composition, with a clear light blue sky as the background, and the visual focus concentrated on the fantasy blue vegetation and the model walking through it.\n\nThe vegetation in the picture is processed into varying shades of blue, from light ice blue to deep cobalt blue. The textures of the leaves and branches are delicate and realistic. The warm brown tree trunks form a sharp contrast with the cool blue leaves, resembling a dreamy forest from another world. An African-American model wearing a yellow and white vertical striped long dress walks slowly on the sand. The warm tones of the dress echo with the surrounding cool blue vegetation. The noon sun casts clear shadows on the sand, enhancing the sense of space and reality in the picture.\n\nThe entire scene, with its clean and transparent colors and fantasy settings, not only exudes the vastness of the natural wilderness but also presents a quiet and poetic high-fashion sense due to the surreal vegetation.'
+DEFAULT_SEED = 770044821593082
+GUIDE_STRENGTH = 4
+UNET_NAME = 'z_image_bf16.safetensors'
+VAE_NAME = 'ae.safetensors'
+
+
+PUBLIC_INPUT_METADATA = {
+    'model': InputSpec(node=ref('unetloader'), field='unet_name', default=None, infer_type=False),
+    'prompt': InputSpec(node=ref('cliptextencode'), field='text', default=None, infer_type=False),
+    'seed': InputSpec(node=ref('ksampler'), field='seed', default=None, infer_type=False),
+    'steps': InputSpec(node=ref('ksampler'), field='steps', default=None, infer_type=False),
+}
+
+
+READY_METADATA = ReadyMetadata.build(
+    capability='image',
+    template_id='image/z_image',
+    inputs=PUBLIC_INPUT_METADATA,
+    requirements={'models': ['ae.safetensors', 'qwen_3_4b.safetensors', 'z_image_bf16.safetensors']},
+    source_path='ready_templates/sources/official/image/z_image.json',
+    source_id='image/z_image',
+    upstream_source_id='z_image',
+    source_type='api',
+    source_workflow_path='ready_templates/sources/official/image/z_image.json',
+    output_mode='ready_template',
+    ready_id='image/z_image',
+    provenance={'source_path': 'ready_templates/sources/official/image/z_image.json', 'source_id': 'image/z_image', 'upstream_source_id': 'z_image', 'source_type': 'api', 'source_workflow_path': 'ready_templates/sources/official/image/z_image.json', 'output_mode': 'ready_template', 'ready_id': 'image/z_image', 'source_workflow': 'ready_templates/sources/official/image/z_image.json'},
+)
+
+def build() -> VibeWorkflow:
+    """Build the workflow (auto-generated)."""
+    with new_workflow(READY_METADATA, source_path=__file__) as wf:
+
+        # Loaders
+        cliploader = CLIPLoader(clip_name=CLIP_NAME, type='lumina2')
+        vaeloader = VAELoader(vae_name=VAE_NAME)
+        unetloader = UNETLoader(unet_name=UNET_NAME, weight_dtype='default')
+
+        # Sampling
+        emptysd3latentimage = EmptySD3LatentImage(width=1024, height=1024, batch_size=1)
+
+        # Conditioning
+        cliptextencode = CLIPTextEncode(
+            text=DEFAULT_PROMPT,
+            clip=cliploader.out('CLIP'),
+        )
+
+        modelsamplingauraflow = ModelSamplingAuraFlow(
+            shift=3,
+            model=unetloader.out('MODEL'),
+        )
+
+        cliptextencode_2 = CLIPTextEncode(text='', clip=cliploader.out('CLIP'))
+
+        ksampler = KSampler(
+            seed=DEFAULT_SEED,
+            steps=25,
+            cfg=GUIDE_STRENGTH,
+            sampler_name='res_multistep',
+            scheduler='simple',
+            denoise=1,
+            latent_image=emptysd3latentimage.out('LATENT'),
+            model=modelsamplingauraflow.out('MODEL'),
+            negative=cliptextencode_2.out('CONDITIONING'),
+            positive=cliptextencode.out('CONDITIONING'),
+        )
+
+        # Decode
+        vaedecode = VAEDecode(samples=ksampler.out('LATENT'), vae=vaeloader.out('VAE'))
+
+        # Outputs
+        saveimage = SaveImage(filename_prefix='z-image', images=vaedecode.out('IMAGE'))
+
+        wf = wf.finalize(PUBLIC_INPUT_METADATA, outputs=[OutputSpec(node=saveimage, output_type='SaveImage', name='image', artifact_kind='image', mime_type='image/png', filename_prefix='z-image', expected_cardinality='one')])
+        wf.strict_types = False
+        return wf
+

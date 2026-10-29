@@ -1,0 +1,592 @@
+"""Dependency preparation for the local workflow runner.
+
+Model downloads and node-pack installation keep their existing authorities;
+this module only gives them one ordered, inspectable lifecycle after canonical
+workflow reconciliation has succeeded.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+class PreparationError(RuntimeError):
+    """A dependency could not be planned or realized before queueing."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparationPlan:
+    workflow: str
+    models: tuple[dict[str, Any], ...] = ()
+    custom_nodes: tuple[str, ...] = ()
+    actions: tuple[dict[str, Any], ...] = ()
+    runtime: dict[str, Any] | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        result = {
+            "workflow": self.workflow,
+            "models": [dict(entry) for entry in self.models],
+            "custom_nodes": list(self.custom_nodes),
+            "actions": [dict(action) for action in self.actions],
+        }
+        if self.runtime is not None:
+            result["runtime"] = dict(self.runtime)
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class PreparationResult:
+    plan: PreparationPlan
+    model_paths: tuple[str, ...] = ()
+    model_evidence: tuple[dict[str, Any], ...] = ()
+    node_results: tuple[dict[str, Any], ...] = ()
+    receipt_path: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "plan": self.plan.to_json(),
+            "model_paths": list(self.model_paths),
+            "model_evidence": [dict(entry) for entry in self.model_evidence],
+            "node_results": [dict(result) for result in self.node_results],
+            "receipt_path": self.receipt_path,
+            "diagnostics": dict(self.diagnostics),
+        }
+
+
+def _normalise_names(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple, set)):
+        raise PreparationError("custom_nodes must be an array")
+    return tuple(sorted({str(item) for item in value if str(item).strip()}))
+
+
+def _model_entries(workflow: Any) -> tuple[dict[str, Any], ...]:
+    if workflow is None:
+        return ()
+    metadata = getattr(workflow, "metadata", {})
+    authored = metadata.get("model_assets") if isinstance(metadata, Mapping) else None
+    requirements = getattr(workflow, "requirements", None)
+    declared = getattr(requirements, "models", ())
+    runtime = getattr(requirements, "runtime", None)
+    runtime_models = getattr(runtime, "models", ()) if runtime is not None else ()
+    # Preparation consumes only source-backed rows already present in the
+    # canonical IR.  In particular, it must not turn a picker filename into a
+    # URL by consulting a model registry.  Metadata is preferred because it is
+    # the rich canonical representation; requirements.models is the explicit
+    # fallback for older envelopes.
+    if isinstance(authored, list) and authored:
+        entries = authored
+    elif isinstance(declared, (list, tuple)) or isinstance(runtime_models, (list, tuple)):
+        source_entries = list(declared) + list(runtime_models)
+        entries = [
+            item if isinstance(item, Mapping) else {"name": item}
+            for item in source_entries
+            if isinstance(item, (Mapping, str))
+        ]
+    else:
+        entries = []
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_entry in entries:
+        if not isinstance(raw_entry, Mapping):
+            raise PreparationError("model declarations must contain objects")
+        entry = dict(raw_entry)
+        name = str(entry.get("name", entry.get("filename", "")))
+        subdir = str(entry.get("subdir", entry.get("directory", "")))
+        target = str(entry.get("target_path", f"{subdir}/{name}"))
+        identity = (target, json.dumps(entry, sort_keys=True, default=str))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(entry)
+    return tuple(normalized)
+
+
+def build_plan(
+    workflow: Any,
+    *,
+    reference: str | Path,
+    ensure_models: bool = True,
+    ensure_packs: bool = True,
+) -> PreparationPlan:
+    models = _model_entries(workflow)
+    requirements = getattr(workflow, "requirements", None)
+    runtime = getattr(requirements, "runtime", None)
+    custom_nodes_raw = list(getattr(requirements, "custom_nodes", ()))
+    if runtime is not None:
+        custom_nodes_raw.extend(
+            str(item.get("name", item.get("slug", "")))
+            for item in getattr(runtime, "custom_nodes", ())
+            if isinstance(item, Mapping)
+        )
+    custom_nodes = _normalise_names(custom_nodes_raw)
+    runtime_decl = getattr(runtime, "to_dict", lambda: None)() if runtime is not None else None
+    actions: list[dict[str, Any]] = []
+    if ensure_packs and custom_nodes:
+        actions.append({"kind": "custom_nodes", "status": "planned", "count": len(custom_nodes)})
+    if ensure_models and models:
+        actions.append({"kind": "models", "status": "planned", "count": len(models)})
+    return PreparationPlan(
+        workflow=str(reference),
+        models=models,
+        custom_nodes=custom_nodes,
+        runtime=runtime_decl,
+        actions=tuple(actions),
+    )
+
+
+def prepare_workflow(
+    workflow: Any,
+    *,
+    reference: str | Path,
+    runtime_root: str | Path | None,
+    ensure_models: bool = True,
+    ensure_packs: bool = True,
+    session_id: str | None = None,
+    download_workers: int | None = None,
+    quiet: bool = False,
+    runtime_dependency_report: Mapping[str, Any] | None = None,
+    dependency_mode: str = "reuse",
+    runtime_target: Mapping[str, Any] | None = None,
+    server_url: str | None = None,
+    offline: bool | None = None,
+    remote_adapter: Any | None = None,
+    sync_packages: tuple[str, ...] | list[str] | None = None,
+) -> PreparationResult:
+    """Prepare once per runtime root, serializing setup across callers."""
+    from vibecomfy.runtime.locks import resource_lock
+
+    root = (
+        Path(runtime_root).expanduser().resolve(strict=False)
+        if runtime_root is not None
+        else Path.cwd().resolve(strict=False)
+    )
+    with resource_lock(root / "out" / "preparations"):
+        return _prepare_workflow_unlocked(
+            workflow,
+            reference=reference,
+            runtime_root=runtime_root,
+            ensure_models=ensure_models,
+            ensure_packs=ensure_packs,
+            session_id=session_id,
+            download_workers=download_workers,
+            quiet=quiet,
+            runtime_dependency_report=runtime_dependency_report,
+            dependency_mode=dependency_mode,
+            runtime_target=runtime_target,
+            server_url=server_url,
+            offline=offline,
+            remote_adapter=remote_adapter,
+            sync_packages=sync_packages,
+        )
+
+
+def _prepare_workflow_unlocked(
+    workflow: Any,
+    *,
+    reference: str | Path,
+    runtime_root: str | Path | None,
+    ensure_models: bool = True,
+    ensure_packs: bool = True,
+    session_id: str | None = None,
+    download_workers: int | None = None,
+    quiet: bool = False,
+    runtime_dependency_report: Mapping[str, Any] | None = None,
+    dependency_mode: str = "reuse",
+    runtime_target: Mapping[str, Any] | None = None,
+    server_url: str | None = None,
+    offline: bool | None = None,
+    remote_adapter: Any | None = None,
+    sync_packages: tuple[str, ...] | list[str] | None = None,
+) -> PreparationResult:
+    """Prepare canonical dependencies and persist one receipt before queueing."""
+    root = (
+        Path(runtime_root).expanduser().resolve(strict=False)
+        if runtime_root is not None
+        else Path.cwd().resolve(strict=False)
+    )
+    from vibecomfy import fetch as fetch_assets
+
+    model_root = root / "ComfyUI" / "models" if runtime_root is not None else fetch_assets.models_root()
+    plan = build_plan(workflow, reference=reference, ensure_models=ensure_models, ensure_packs=ensure_packs)
+    from vibecomfy.runtime.dependencies import (
+        RuntimeDependencyError,
+        compare_runtime,
+        runtime_requirements_from_workflow,
+        sync_runtime,
+    )
+    runtime_requirements = runtime_requirements_from_workflow(workflow)
+    if dependency_mode not in {"reuse", "sync"}:
+        raise PreparationError("dependency mode must be reuse or sync")
+    external_target = server_url is not None and not (
+        isinstance(runtime_target, Mapping) and runtime_target.get("managed") is True
+    )
+    runtime_report = compare_runtime(
+        runtime_requirements,
+        target=runtime_target if runtime_target is not None else ({} if external_target else None),
+        runtime_root=None if external_target else runtime_root,
+    )
+    if runtime_dependency_report is not None:
+        # Preserve the caller's earlier target observation and actions, but
+        # refresh the compatibility result against the selected target.
+        supplied = dict(runtime_dependency_report)
+        for key in (
+            "mode", "actions", "synced", "managed", "changes",
+            "partial", "selected_packages", "remaining_mismatches",
+            "attempt_deviation",
+        ):
+            if key in supplied:
+                runtime_report[key] = supplied[key]
+    runtime_report["mode"] = dependency_mode
+
+    if remote_adapter is not None:
+        try:
+            remote_plan = plan.to_json()
+            if sync_packages is not None:
+                remote_plan["dependency_selection"] = list(sync_packages)
+            remote_result = remote_adapter.prepare(
+                workflow_reference=reference,
+                dependency_mode=dependency_mode,
+                runtime_root=runtime_root,
+                ensure_models=ensure_models,
+                ensure_packs=ensure_packs,
+                offline=(os.environ.get("VIBECOMFY_OFFLINE") == "1") if offline is None else bool(offline),
+                plan=remote_plan,
+                runtime_target=dict(runtime_target) if isinstance(runtime_target, Mapping) else None,
+            )
+        except Exception as exc:
+            raise PreparationError(f"remote lifecycle preparation failed: {exc}") from exc
+        if not isinstance(remote_result, Mapping):
+            raise PreparationError("remote lifecycle preparation returned an invalid result")
+        receipt_dir = root / "out" / "preparations"
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        suffix = session_id or "one-shot"
+        receipt_path = receipt_dir / f"{Path(str(reference)).stem}-{suffix}.json"
+        diagnostics: dict[str, Any] = {
+            "runtime_root": str(root),
+            "session_id": session_id,
+            "python_executable": (
+                runtime_target.get("python_executable")
+                if isinstance(runtime_target, Mapping)
+                else None
+            ),
+            "runtime_dependency": dict(runtime_report),
+            "remote_lifecycle": dict(remote_result),
+        }
+        result = PreparationResult(
+            plan=plan,
+            receipt_path=str(receipt_path),
+            diagnostics=diagnostics,
+        )
+        receipt_path.write_text(json.dumps(result.to_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return result
+
+    if dependency_mode == "sync" and runtime_requirements is not None:
+        if external_target:
+            raise PreparationError(
+                "--deps sync is unavailable for an explicit external server; use --deps reuse"
+            )
+        try:
+            # Only a report explicitly marked as synchronized represents a
+            # completed install transaction. A compatibility observation from
+            # the coordinator must not suppress the requested sync.
+            if not bool(runtime_report.get("synced")):
+                runtime_report = sync_runtime(
+                    runtime_requirements,
+                    runtime_root=runtime_root,
+                    target=runtime_target,
+                    offline=(os.environ.get("VIBECOMFY_OFFLINE") == "1") if offline is None else offline,
+                    launch_flags=list(runtime_requirements.launch_flags),
+                )
+            elif (
+                runtime_report.get("status") not in {"matching", "unverified"}
+                and not bool(runtime_report.get("partial"))
+            ):
+                raise RuntimeDependencyError(
+                    "runtime dependencies are not compatible with this target: "
+                    + "; ".join(str(item) for item in runtime_report.get("mismatches", ()))
+                )
+        except RuntimeDependencyError as exc:
+            raise PreparationError(str(exc)) from exc
+
+    _validate_model_destinations(plan.models, model_root)
+    _validate_model_entries(plan.models, root=model_root)
+
+    lockfile_path = root / "custom_nodes.lock"
+    packs: list[Any] = []
+    restore_entries: list[Any] = []
+    if ensure_packs:
+        from vibecomfy.node_packs import (
+            build_install_refs_by_name,
+            missing_packs_for_workflow,
+            preflight_pip_requirements,
+            read_lockfile,
+            validate_install_refs,
+        )
+        from vibecomfy.custom_node_refs import effective_lock_entries
+
+        try:
+            restore_entries = effective_lock_entries(workflow, read_lockfile(lockfile_path))
+            packs, unresolved = missing_packs_for_workflow(
+                workflow, lockfile_path=lockfile_path
+            )
+        except Exception as exc:
+            raise PreparationError(f"custom-node planning failed: {exc}") from exc
+        if unresolved:
+            raise PreparationError(
+                "custom-node planning could not resolve class types: "
+                + ", ".join(sorted(unresolved))
+            )
+        if sync_packages is not None:
+            requested = {
+                str(name).casefold().replace("_", "-")
+                for name in sync_packages
+            }
+            known_runtime = {
+                str(name).casefold().replace("_", "-")
+                for name, _constraint in (runtime_requirements.packages if runtime_requirements is not None else ())
+            }
+            known_nodes = {
+                str(getattr(pack, "name", "")).casefold().replace("_", "-")
+                for pack in packs
+                if str(getattr(pack, "name", "")).strip()
+            }
+            known_nodes.update(
+                str(name).casefold().replace("_", "-")
+                for name in getattr(getattr(workflow, "requirements", None), "custom_nodes", ())
+            )
+            known_nodes.update(
+                str(item.get("name", item.get("slug", ""))).casefold().replace("_", "-")
+                for item in getattr(getattr(workflow, "requirements", None), "custom_node_refs", ())
+                if isinstance(item, Mapping) and str(item.get("name", item.get("slug", ""))).strip()
+            )
+            if runtime is not None:
+                known_nodes.update(
+                    str(item.get("name", item.get("slug", ""))).casefold().replace("_", "-")
+                    for item in getattr(runtime, "custom_nodes", ())
+                    if isinstance(item, Mapping) and str(item.get("name", item.get("slug", ""))).strip()
+                )
+            unknown = sorted(requested - known_runtime - known_nodes)
+            if unknown:
+                raise PreparationError(
+                    "unknown dependency selected for synchronization: "
+                    + ", ".join(unknown)
+                    + "; choose from declared runtime packages or custom-node packs"
+                )
+            # ``--deps-sync-package`` is intentionally a narrow mutation
+            # selector.  Runtime package names are handled by sync_runtime;
+            # only selected custom-node packs reach the install seam.
+            packs = [
+                pack for pack in packs
+                if str(getattr(pack, "name", "")).casefold().replace("_", "-") in requested
+            ]
+        try:
+            install_refs_by_name = build_install_refs_by_name(workflow, packs)
+            ref_error = validate_install_refs(
+                packs,
+                install_refs_by_name,
+                restore_entries,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PreparationError(f"custom-node planning failed: {exc}") from exc
+        if ref_error is not None:
+            raise PreparationError(ref_error)
+        if packs:
+            preflight = preflight_pip_requirements(packs)
+            if not preflight.ok:
+                raise PreparationError(
+                    "custom-node dependency preflight failed: "
+                    + (preflight.error or "pip preflight failed")
+                )
+
+    if download_workers is None:
+        raw_workers = os.environ.get("VIBECOMFY_DOWNLOAD_WORKERS", "2")
+        try:
+            download_workers = int(raw_workers)
+        except ValueError as exc:
+            raise PreparationError(
+                "VIBECOMFY_DOWNLOAD_WORKERS must be a positive integer"
+            ) from exc
+    if isinstance(download_workers, bool) or download_workers < 1:
+        raise PreparationError("download_workers must be a positive integer")
+
+    model_paths: list[str] = []
+    model_evidence: list[dict[str, Any]] = []
+    model_future: Future[list[Path]] | None = None
+    model_executor: ThreadPoolExecutor | None = None
+    if ensure_models and plan.models:
+        from vibecomfy import fetch as fetch_assets
+
+        present_local_models = [
+            str(fetch_assets.local_path(entry, root=model_root))
+            for entry in plan.models
+            if not isinstance(entry.get("url"), str) or not entry.get("url", "").strip()
+        ]
+        download_entries = [
+            entry for entry in plan.models
+            if isinstance(entry.get("url"), str) and entry.get("url", "").strip()
+        ]
+        model_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="vibecomfy-prepare")
+            if download_entries else None
+        )
+
+        def download_models() -> list[Path]:
+            try:
+                return fetch_assets.download_many(
+                    download_entries,
+                    root=model_root,
+                    max_workers=download_workers,
+                    quiet=quiet,
+                )
+            except TypeError as exc:
+                # Keep small embedders that provide the pre-existing fetch
+                # seam compatible while the optional concurrency parameter
+                # rolls out.
+                if "max_workers" not in str(exc):
+                    raise
+                return fetch_assets.download_many(download_entries, root=model_root)
+
+        if model_executor is not None:
+            model_future = model_executor.submit(download_models)
+
+    try:
+        node_results: list[dict[str, Any]] = []
+        if packs:
+            from vibecomfy.node_packs import (
+                install_required_packs,
+            )
+            batch = install_required_packs(
+                packs,
+                install_root=root / "custom_nodes",
+                lockfile_path=lockfile_path,
+                restore_entries=restore_entries,
+                install_refs_by_name=install_refs_by_name,
+                runtime_requirements=(
+                    tuple(f"{name}{constraint}" for name, constraint in runtime_requirements.packages)
+                    if runtime_requirements is not None else ()
+                ),
+            )
+            node_results = [
+                {
+                    "name": result.name,
+                    "status": result.status,
+                    "git_commit_sha": result.git_commit_sha,
+                    "error": result.error,
+                }
+                for result in batch.results
+            ]
+            if not batch.ok:
+                details = "; ".join(
+                    f"{item['name']}: {item['error'] or item['status']}" for item in node_results
+                )
+                raise PreparationError(f"custom-node preparation failed: {details}")
+        if model_future is not None:
+            try:
+                model_paths = [*present_local_models, *[str(path) for path in model_future.result()]]
+                for entry in download_entries:
+                    receipt = fetch_assets.read_resolution_receipt(entry, root=model_root)
+                    if receipt is not None:
+                        model_evidence.append(receipt)
+            except Exception as exc:
+                raise PreparationError(f"model preparation failed: {exc}") from exc
+    finally:
+        if model_executor is not None:
+            model_executor.shutdown(wait=True)
+
+    receipt_dir = root / "out" / "preparations"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    suffix = session_id or "one-shot"
+    receipt_path = receipt_dir / f"{Path(str(reference)).stem}-{suffix}.json"
+    diagnostics = {
+        "runtime_root": str(root),
+        "session_id": session_id,
+        "python_executable": sys.executable,
+    }
+    if runtime_requirements is not None:
+        diagnostics["runtime_dependency"] = dict(runtime_report)
+    result = PreparationResult(
+        plan=plan,
+        model_paths=tuple(model_paths),
+        model_evidence=tuple(model_evidence),
+        node_results=tuple(node_results),
+        receipt_path=str(receipt_path),
+        diagnostics=diagnostics,
+    )
+    receipt_path.write_text(json.dumps(result.to_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return result
+
+
+def _validate_model_entries(
+    entries: tuple[dict[str, Any], ...], *, root: Path | None = None
+) -> None:
+    from vibecomfy import fetch as fetch_assets
+
+    missing = [
+        str(entry.get("name", entry.get("filename", "<unnamed>")))
+        for entry in entries
+        if (
+            not isinstance(entry.get("url"), str)
+            or not entry["url"].strip()
+        )
+        and (root is None or not fetch_assets.is_present(entry, root=root))
+    ]
+    if missing:
+        raise PreparationError(
+            "model planning could not resolve URLs: " + ", ".join(sorted(set(missing)))
+        )
+    for entry in entries:
+        if not isinstance(entry.get("url"), str) or not entry["url"].strip():
+            continue
+        revision = entry.get("hf_revision") or entry.get("revision")
+        if revision is None or revision == "":
+            continue
+        name = str(entry.get("name", entry.get("filename", "<unnamed>")))
+        try:
+            fetch_assets._effective_fetch_url(str(entry["url"]), revision)
+        except (TypeError, ValueError) as exc:
+            raise PreparationError(f"model {name} has an unsupported revision selector: {exc}") from exc
+
+
+def _validate_model_destinations(
+    entries: tuple[dict[str, Any], ...], root: Path
+) -> None:
+    """Reject ambiguous metadata before any download can partially run."""
+    from vibecomfy import fetch as fetch_assets
+
+    seen: dict[Path, tuple[Any, ...]] = {}
+    for entry in entries:
+        try:
+            destination = fetch_assets.local_path(entry, root=root)
+        except Exception as exc:
+            raise PreparationError(f"invalid model declaration: {exc}") from exc
+        identity = (
+            entry.get("url"),
+            entry.get("sha256"),
+            entry.get("hf_revision"),
+            entry.get("size_bytes"),
+            entry.get("gated"),
+        )
+        previous = seen.get(destination)
+        if previous is not None and previous != identity:
+            raise PreparationError(
+                f"model destination collision at {destination}; declarations disagree"
+            )
+        seen[destination] = identity
+
+
+__all__ = [
+    "PreparationError",
+    "PreparationPlan",
+    "PreparationResult",
+    "build_plan",
+    "prepare_workflow",
+]

@@ -1,0 +1,688 @@
+from __future__ import annotations
+
+import ast
+from dataclasses import replace
+from typing import Any, Mapping
+
+from vibecomfy.porting.edit.ops import EditOp
+from vibecomfy.porting.edit._session_types import (
+    BatchResult,
+    StatementResult,
+    _ExpandedStatement,
+    _diag,
+    _freeze_operation_tuple,
+)
+from vibecomfy.porting.edit._parse import (
+    _parse_and_validate_batch,
+)
+from vibecomfy.porting.edit._ir_utils import _uids_for_op
+
+
+_IDENTITY_DIAGNOSTIC_CODES = frozenset(
+    {
+        "unknown_graph_name",
+        "unknown_source_name",
+        "unknown_target_name",
+        "unbound_graph_name",
+        "stale_graph_name",
+    }
+)
+
+
+def _is_idempotent_rewire_batch(operations: tuple[EditOp, ...]) -> bool:
+    """Return whether an empty result can mean the requested wiring already exists."""
+
+    return bool(operations) and all(
+        getattr(operation, "op", None) == "upsert_link" for operation in operations
+    )
+
+
+def _unexpected_value_changes(
+    pre: Any,
+    post: Any,
+    ops: tuple[EditOp, ...],
+    *,
+    schema_provider: Any = None,
+) -> tuple[dict[str, Any], ...]:
+    """Return list/dict/scalar field mutations not claimed by canonical ops."""
+    from vibecomfy.porting.edit.ops import AddNodeOp, RemoveNodeOp, SetNodeFieldOp
+
+    allowed: set[tuple[str, str]] = set()
+    removed: set[str] = set()
+    added: set[str] = set()
+    pre_nodes = {
+        str(getattr(node, "uid", "")): node
+        for node in (getattr(pre, "nodes", {}) or {}).values()
+    }
+    for op in ops:
+        if isinstance(op, SetNodeFieldOp):
+            uid = str(op.target.uid)
+            field_path = str(op.target.field_path)
+            allowed.add((uid, field_path))
+            node = pre_nodes.get(uid)
+            if node is not None and schema_provider is not None:
+                from vibecomfy.schema import schema_for
+
+                schema = schema_for(
+                    schema_provider, str(getattr(node, "class_type", ""))
+                )
+                schema_inputs = getattr(schema, "inputs", {}) or {}
+                widget_order = tuple(
+                    getattr(schema, "widget_input_order", ()) or ()
+                )
+                positions = tuple(
+                    index
+                    for index, name in enumerate(widget_order)
+                    if name == field_path
+                )
+                positional_field = (
+                    f"widget_{positions[0]}"
+                    if field_path in schema_inputs and len(positions) == 1
+                    else None
+                )
+                # A canonical schema field may still live in the retained
+                # positional ingress carrier. Attribute only that one proven
+                # carrier; never bless every widget_N alias or derive a field
+                # name from its numeric index.
+                if positional_field is not None and (
+                    positional_field in (getattr(node, "widgets", {}) or {})
+                    or positional_field in (getattr(node, "inputs", {}) or {})
+                ):
+                    allowed.add((uid, positional_field))
+            if op.target.field_path == "widgets_values":
+                positional_carriers = {
+                    str(name)
+                    for channel in (
+                        getattr(node, "inputs", {}) or {},
+                        getattr(node, "widgets", {}) or {},
+                    )
+                    for name in channel
+                    if str(name).startswith("widget_")
+                    and str(name).removeprefix("widget_").isdigit()
+                }
+                allowed.update((uid, name) for name in positional_carriers)
+        elif isinstance(op, AddNodeOp) and op.uid:
+            added.add(str(op.uid))
+        elif isinstance(op, RemoveNodeOp):
+            removed.add(str(op.target.uid))
+    changes: list[dict[str, Any]] = []
+    post_nodes = {str(getattr(node, "uid", "")): node for node in (getattr(post, "nodes", {}) or {}).values()}
+    for uid in sorted(set(pre_nodes) & set(post_nodes)):
+        before = pre_nodes[uid]
+        after = post_nodes[uid]
+        before_fields = {**(getattr(before, "inputs", {}) or {}), **(getattr(before, "widgets", {}) or {})}
+        after_fields = {**(getattr(after, "inputs", {}) or {}), **(getattr(after, "widgets", {}) or {})}
+        for field in sorted(set(before_fields) | set(after_fields)):
+            if before_fields.get(field) != after_fields.get(field) and (uid, str(field)) not in allowed:
+                changes.append({"uid": uid, "field": str(field)})
+    return tuple(changes)
+
+
+class _ParseExecuteMixin:
+
+    def apply_batch(self, code: str) -> BatchResult:
+        """Apply one Python batch through ``interpret(pre, batch)``.
+
+        Mutation authority is the immutable interpreter.  The retained IR
+        is the only session graph.  Query statements (search / python /
+        tools) are overlaid after interpret so the agent still sees typed
+        catalog results.
+        """
+        from vibecomfy.porting.edit._ir_utils import _cow_workflow_copy
+        from vibecomfy.porting.edit._interpret import interpret
+
+        parsed = _parse_and_validate_batch(
+            code,
+            max_batch_bytes=self.max_batch_bytes,
+            max_statements=self.max_statements,
+            max_expanded_statements=self.max_expanded_statements,
+            max_for_iterations=self.max_for_iterations,
+        )
+        if parsed.diagnostics:
+            return BatchResult(
+                ok=False,
+                statements=parsed.statements,
+                diagnostics=parsed.diagnostics,
+            )
+        snapshot = self._snapshot_mutable_state()
+        try:
+            if self.workflow is None:
+                raise RuntimeError("EditSession.apply_batch requires a retained IR")
+            pre_ir = _cow_workflow_copy(self.workflow)
+            cas_old = self._cas_snapshot(pre_ir)
+            interpreted = interpret(
+                pre_ir,
+                code,
+                schema_provider=self.schema_provider,
+                max_batch_bytes=self.max_batch_bytes,
+                max_statements=self.max_statements,
+                max_expanded_statements=self.max_expanded_statements,
+                max_for_iterations=self.max_for_iterations,
+                cas_old=cas_old,
+                name_hints=self._transient_name_index,
+                value_default_context=self.value_default_context,
+            )
+            interpretation_schema_provider = (
+                interpreted.schema_provider or self.schema_provider
+            )
+            landed_ops = tuple(interpreted.landed_ops)
+            frozen_landed_ops = _freeze_operation_tuple(landed_ops)
+            lint_result = getattr(interpreted, "lint_result", None)
+            transitions = getattr(interpreted, "transitions", None)
+            missing_report_parts = []
+            if lint_result is None:
+                missing_report_parts.append("lint_result")
+            elif getattr(lint_result, "transitions", None) is None:
+                missing_report_parts.append("lint_result.transitions")
+            if transitions is None:
+                missing_report_parts.append("transitions")
+            if missing_report_parts:
+                # The canonical interpreter owns ordered transition/lint
+                # evidence.  An adapter must never manufacture an empty
+                # report from statements after that boundary: doing so could
+                # make an unproven candidate look publishable.  No session
+                # state has been touched yet, so fail closed atomically.
+                return BatchResult(
+                    ok=False,
+                    statements=(),
+                    diagnostics=(
+                        _diag(
+                            "internal_interpretation_contract",
+                            "canonical interpreter omitted required transition/lint evidence; batch was not published",
+                            severity="error",
+                            detail={
+                                "missing": tuple(missing_report_parts),
+                                "atomic": True,
+                            },
+                        ),
+                    ),
+                    landed_ops=(),
+                    field_changes=(),
+                    apply_eligible=False,
+                    transitions=(),
+                    occurrence_to_statement_index={},
+                )
+            statement_results = [
+                self._statement_result_from_outcome(outcome)
+                for outcome in interpreted.statements
+            ]
+            statement_results = self._overlay_query_results(
+                parsed.expanded, statement_results
+            )
+            identity_diagnostics = tuple(
+                diagnostic
+                for outcome in interpreted.statements
+                for diagnostic in tuple(getattr(outcome, "diagnostics", ()) or ())
+                if getattr(diagnostic, "code", "") in _IDENTITY_DIAGNOSTIC_CODES
+            )
+            if identity_diagnostics:
+                names = sorted(
+                    {
+                        str(diagnostic.detail.get("name"))
+                        for diagnostic in identity_diagnostics
+                        if diagnostic.detail.get("name") is not None
+                    }
+                )
+                rejection = _diag(
+                    "batch_identity_rejected",
+                    (
+                        "Batch rejected before commit because it references "
+                        "unbound or stale graph names: "
+                        + (", ".join(repr(name) for name in names) or "unknown")
+                        + ". Re-render and use only names or uids present in the "
+                        "current graph."
+                    ),
+                    severity="error",
+                    detail={"names": names, "atomic": True, "retryable": True},
+                )
+                statement_results = self._enrich_statement_results(statement_results)
+                for index, statement in enumerate(statement_results):
+                    if statement.landed:
+                        statement_results[index] = replace(
+                            statement,
+                            ok=False,
+                            landed=False,
+                            status="rejected",
+                            reason="batch_identity_rejected",
+                            diagnostics=statement.diagnostics + (rejection,),
+                        )
+                return BatchResult(
+                    ok=False,
+                    statements=tuple(statement_results),
+                    diagnostics=interpreted.diagnostics + identity_diagnostics + (rejection,),
+                    landed_ops=(),
+                    field_changes=(),
+                    apply_eligible=False,
+                )
+            apply_gate_eligible = True
+            if interpreted.ok and landed_ops:
+                from vibecomfy.porting.edit.apply_gate import verify_apply
+
+                gate = verify_apply(
+                    pre_ir,
+                    interpreted.workflow,
+                    delta=code,
+                    landed_ops=landed_ops,
+                    schema_provider=interpretation_schema_provider,
+                    name_hints=self._transient_name_index,
+                    value_default_context=self.value_default_context,
+                )
+                apply_gate_eligible = gate.apply_eligible
+                if (
+                    gate.ok
+                    and not gate.apply_eligible
+                    and gate.reason == "empty_delta"
+                    and _is_idempotent_rewire_batch(landed_ops)
+                ):
+                    # An idempotent rewire is already true in the retained IR.
+                    # It is not a failed edit and must not poison a later
+                    # done() in the same agent conversation. Keep the batch
+                    # successful, but do not claim a newly landed operation or
+                    # append a duplicate delta to history.
+                    for index, item in enumerate(statement_results):
+                        if not item.landed:
+                            continue
+                        statement_results[index] = replace(
+                            item,
+                            ok=True,
+                            landed=False,
+                            status="skipped",
+                            reason="already_applied",
+                            detail={
+                                **item.detail,
+                                "status": "skipped",
+                                "reason": "already_applied",
+                            },
+                        )
+                    statement_results = self._enrich_statement_results(
+                        statement_results
+                    )
+                    query_diagnostics = tuple(
+                        diagnostic
+                        for statement in statement_results
+                        if statement.op_kind in {"query", "done"}
+                        for diagnostic in statement.diagnostics
+                        if diagnostic.severity in {"error", "warning"}
+                    )
+                    return BatchResult(
+                        ok=all(statement.ok for statement in statement_results),
+                        statements=tuple(statement_results),
+                        diagnostics=interpreted.diagnostics + query_diagnostics,
+                        landed_ops=(),
+                        field_changes=(),
+                        apply_eligible=False,
+                    )
+                if gate.reason != "no_op" and (
+                    not gate.ok or not gate.apply_eligible
+                ):
+                    rejected = tuple(
+                        StatementResult(
+                            statement_index=item.statement_index,
+                            source=item.source,
+                            ok=False,
+                            landed=False,
+                            op_kind=item.op_kind,
+                            diagnostics=item.diagnostics + gate.diagnostics,
+                            detail=dict(item.detail),
+                            touched_uids=item.touched_uids,
+                            dependency_cause=item.dependency_cause,
+                            teaching_hint=item.teaching_hint,
+                            status="rejected",
+                            reason=gate.reason or "apply_gate_rejected",
+                        )
+                        if item.landed
+                        else item
+                        for item in statement_results
+                    )
+                    return BatchResult(
+                        ok=False,
+                        statements=rejected,
+                        diagnostics=interpreted.diagnostics + gate.diagnostics,
+                        landed_ops=(),
+                        apply_eligible=False,
+                    )
+                unexpected = _unexpected_value_changes(
+                    pre_ir,
+                    interpreted.workflow,
+                    landed_ops,
+                    schema_provider=interpretation_schema_provider,
+                )
+                if unexpected:
+                    evidence = _diag(
+                        "unattributed_value_change",
+                        "canonical post-state contains a value mutation not claimed by the submitted operations",
+                        severity="error",
+                        detail={"changes": unexpected},
+                    )
+                    return BatchResult(
+                        ok=False,
+                        statements=tuple(statement_results),
+                        diagnostics=interpreted.diagnostics + (evidence,),
+                        landed_ops=(),
+                        apply_eligible=False,
+                        transitions=tuple(getattr(lint_result, "transitions", ()) or ()),
+                        lint_result=lint_result,
+                    )
+            if not interpreted.ok:
+                # Interpretation is transactional.  Even if a malformed
+                # integration result happens to carry landed_ops, a failed
+                # report is never publishable and must not mutate session
+                # workflow/history/custody.
+                rejected = tuple(
+                    StatementResult(
+                        statement_index=item.statement_index,
+                        source=item.source,
+                        ok=False,
+                        landed=False,
+                        op_kind=item.op_kind,
+                        diagnostics=item.diagnostics,
+                        detail=dict(item.detail),
+                        touched_uids=item.touched_uids,
+                        dependency_cause=item.dependency_cause,
+                        teaching_hint=item.teaching_hint,
+                        status="rejected" if item.landed else item.status,
+                        reason="batch_interpretation_failed" if item.landed else item.reason,
+                    )
+                    if item.landed else item
+                    for item in statement_results
+                )
+                return BatchResult(
+                    ok=False,
+                    statements=rejected,
+                    diagnostics=interpreted.diagnostics,
+                    landed_ops=(),
+                    field_changes=(),
+                    apply_eligible=False,
+                    transitions=tuple(getattr(lint_result, "transitions", ()) or ()),
+                    lint_result=lint_result,
+                    occurrence_to_statement_index=dict(
+                        getattr(interpreted, "occurrence_to_statement_index", {}) or {}
+                    ),
+                )
+            if landed_ops:
+                self.workflow = interpreted.workflow
+                # Persist the exact immutable schema generation that admitted
+                # this batch. Apply replay, later history replay, and receipt
+                # construction must not reconstruct it from a live catalog.
+                self.schema_provider = interpretation_schema_provider
+                self.value_default_context = interpreted.value_default_context
+                # The accepted batch IS the Δ.  Each history entry records
+                # (wf_i, source, landed_ops) — the Python-surface source AND
+                # the typed ops the grammar yields are the same batch value.
+                self._history.append(
+                    (pre_ir, code, frozen_landed_ops)
+                )
+                self.landed_ops.extend(frozen_landed_ops)
+                self._revision += 1
+                self.resolved_ops = []
+                for op in frozen_landed_ops:
+                    touched_uids, touched_node_ids = self._collect_touched_nodes((op,))
+                    self.touched_uids.update(touched_uids)
+                    self.touched_node_ids.update(touched_node_ids)
+                for outcome in interpreted.statements:
+                    if outcome.status == "applied" and outcome.op_kind == "node_call":
+                        name = outcome.detail.get("target_name")
+                        uid = outcome.detail.get("minted_uid")
+                        if isinstance(name, str) and isinstance(uid, str):
+                            self._register_transient_name(name, uid)
+                    if outcome.status == "rejected" and outcome.op_kind == "node_call":
+                        name = outcome.detail.get("target_name")
+                        if isinstance(name, str):
+                            self._mark_name_unbound(name)
+            statement_results = self._enrich_statement_results(statement_results)
+            field_changes, statement_results = self._build_field_changes(
+                landed_ops,
+                tuple(statement_results),
+            )
+            query_diagnostics = tuple(
+                diagnostic
+                for statement in statement_results
+                if statement.op_kind in {"query", "done"}
+                for diagnostic in statement.diagnostics
+                if diagnostic.severity in {"error", "warning"}
+            )
+            diagnostics = interpreted.diagnostics + query_diagnostics
+            batch_ok = interpreted.ok and all(
+                statement.ok for statement in statement_results
+            )
+            return BatchResult(
+                ok=batch_ok,
+                statements=statement_results,
+                diagnostics=diagnostics,
+                landed_ops=frozen_landed_ops,
+                field_changes=field_changes,
+                apply_eligible=batch_ok and bool(landed_ops) and apply_gate_eligible,
+                transitions=tuple(getattr(lint_result, "transitions", ()) or ()),
+                lint_result=lint_result,
+                occurrence_to_statement_index=dict(
+                    getattr(interpreted, "occurrence_to_statement_index", {}) or {}
+                ),
+            )
+        except Exception:
+            self._restore_snapshot(snapshot)
+            raise
+
+    @staticmethod
+    def _statement_result_from_outcome(outcome: Any) -> StatementResult:
+        status = getattr(outcome, "status", None)
+        reason = getattr(outcome, "reason", None)
+        detail = dict(getattr(outcome, "detail", {}) or {})
+        if status:
+            detail.setdefault("status", status)
+        if reason:
+            detail.setdefault("reason", reason)
+        if getattr(outcome, "op", None) is not None:
+            detail.setdefault("edit_op", outcome.op)
+        return StatementResult(
+            statement_index=outcome.statement_index,
+            source=outcome.source,
+            ok=status != "rejected",
+            landed=status == "applied" or (
+                status == "skipped" and reason == "cas_unchanged"
+            ),
+            op_kind=outcome.op_kind,
+            diagnostics=tuple(getattr(outcome, "diagnostics", ()) or ()),
+            detail=detail,
+            status=status,
+            reason=reason,
+        )
+
+    def _overlay_query_results(
+        self,
+        expanded: tuple[_ExpandedStatement, ...],
+        results: list[StatementResult] | tuple[StatementResult, ...],
+    ) -> list[StatementResult]:
+        """Run search/python/tool statements interpret skipped as non-edits."""
+        by_index = {item.statement_index: item for item in expanded}
+        overlaid: list[StatementResult] = []
+        for result in results:
+            if result.op_kind == "done":
+                overlaid.append(result)
+                continue
+            if result.op_kind != "query" or result.landed:
+                overlaid.append(result)
+                continue
+            item = by_index.get(result.statement_index)
+            node = getattr(item, "node", None) if item is not None else None
+            call = getattr(node, "value", None) if isinstance(node, ast.Expr) else None
+            if not isinstance(call, ast.Call):
+                overlaid.append(result)
+                continue
+            query = self._resolve_query_statement(
+                statement_index=item.statement_index,
+                source=item.source,
+                call=call,
+                env=item.env,
+            )
+            status = "skipped" if query.ok else "rejected"
+            reason = (
+                None
+                if query.ok
+                else (query.diagnostics[0].code if query.diagnostics else "query_failed")
+            )
+            overlaid.append(
+                StatementResult(
+                    statement_index=query.statement_index,
+                    source=query.source,
+                    ok=query.ok,
+                    landed=False,
+                    op_kind=query.op_kind,
+                    diagnostics=query.diagnostics,
+                    detail=dict(query.detail),
+                    touched_uids=query.touched_uids,
+                    dependency_cause=query.dependency_cause,
+                    teaching_hint=query.teaching_hint,
+                    status=status,
+                    reason=reason,
+                )
+            )
+        return overlaid
+
+    def _enrich_statement_results(
+        self,
+        results: list[StatementResult] | tuple[StatementResult, ...],
+    ) -> list[StatementResult]:
+        enriched: list[StatementResult] = []
+        for result in results:
+            op = result.detail.get("edit_op") if isinstance(result.detail, Mapping) else None
+            touched = result.touched_uids
+            if result.landed and op is not None:
+                uids, _ = self._collect_touched_nodes((op,))
+                if uids:
+                    touched = tuple(uids)
+            cause = result.dependency_cause or self._dependency_cause(result)
+            hint = result.teaching_hint
+            if hint is None:
+                for diagnostic in result.diagnostics:
+                    if diagnostic.teaching_hint:
+                        hint = diagnostic.teaching_hint
+                        break
+            enriched.append(
+                StatementResult(
+                    statement_index=result.statement_index,
+                    source=result.source,
+                    ok=result.ok,
+                    landed=result.landed,
+                    op_kind=result.op_kind,
+                    diagnostics=result.diagnostics,
+                    detail=dict(result.detail),
+                    touched_uids=touched,
+                    dependency_cause=cause,
+                    teaching_hint=hint,
+                    status=result.status,
+                    reason=result.reason,
+                )
+            )
+        return enriched
+
+    def _merge_project_diagnostics(
+        self,
+        results: list[StatementResult],
+        project_diags: tuple[Any, ...],
+    ) -> list[StatementResult]:
+        extras = [
+            diagnostic
+            for diagnostic in project_diags
+            if getattr(diagnostic, "code", "") == "splice_anchor_no_group"
+        ]
+        if not extras:
+            return results
+        merged: list[StatementResult] = []
+        attached = False
+        for result in results:
+            if not attached and result.op_kind == "node_call" and result.landed:
+                merged.append(
+                    StatementResult(
+                        statement_index=result.statement_index,
+                        source=result.source,
+                        ok=result.ok,
+                        landed=result.landed,
+                        op_kind=result.op_kind,
+                        diagnostics=result.diagnostics + tuple(extras),
+                        detail=dict(result.detail),
+                        touched_uids=result.touched_uids,
+                        dependency_cause=result.dependency_cause,
+                        teaching_hint=result.teaching_hint,
+                        status=result.status,
+                        reason=result.reason,
+                    )
+                )
+                attached = True
+            else:
+                merged.append(result)
+        return merged
+
+    def _snapshot_mutable_state(self) -> dict:
+        from vibecomfy.porting.edit._ir_utils import _cow_workflow_copy
+
+        workflow = getattr(self, "workflow", None)
+        return {
+            "landed_ops": list(self.landed_ops),
+            "touched_uids": set(self.touched_uids),
+            "touched_node_ids": set(self.touched_node_ids),
+            "uid_by_name": None,
+            "name_by_uid": None,
+            "transient_name_index": dict(getattr(self, "_transient_name_index", {})),
+            "transient_uid_index": dict(getattr(self, "_transient_uid_index", {})),
+            "unbound_names": set(self.unbound_names),
+            "value_default_context": self.value_default_context,
+            "schema_provider": self.schema_provider,
+            "workflow": (
+                _cow_workflow_copy(workflow) if workflow is not None else None
+            ),
+            "history": list(self._history),
+            "resolved_ops": list(self.resolved_ops),
+            "render_count": self.render_count,
+            "last_rendered_source": self.last_rendered_source,
+            "last_rendered_workflow": self.last_rendered_workflow,
+            "last_render_diagnostics": self.last_render_diagnostics,
+            "revision": self._revision,
+        }
+
+    def _restore_snapshot(self, snapshot: dict) -> None:
+        self.landed_ops = list(snapshot["landed_ops"])
+        self.touched_uids = set(snapshot["touched_uids"])
+        self.touched_node_ids = set(snapshot["touched_node_ids"])
+        self._transient_name_index = dict(snapshot.get("transient_name_index", {}))
+        self._transient_uid_index = dict(snapshot.get("transient_uid_index", {}))
+        self.unbound_names = set(snapshot["unbound_names"])
+        self.value_default_context = snapshot["value_default_context"]
+        self.schema_provider = snapshot["schema_provider"]
+        self.workflow = snapshot["workflow"]
+        if "history" in snapshot:
+            self._history = list(snapshot["history"])
+        self.resolved_ops = list(snapshot["resolved_ops"])
+        if "render_count" in snapshot:
+            self.render_count = snapshot["render_count"]
+            self.last_rendered_source = snapshot["last_rendered_source"]
+            self.last_rendered_workflow = snapshot["last_rendered_workflow"]
+            self.last_render_diagnostics = snapshot["last_render_diagnostics"]
+        if "revision" in snapshot:
+            self._revision = snapshot["revision"]
+
+    def _collect_touched_nodes(
+        self,
+        ops: tuple[EditOp, ...],
+    ) -> tuple[set[str], set[str]]:
+        """Track touched identity once, retaining nested scope in the UID."""
+        from vibecomfy.identity.uid import make_uid
+        from vibecomfy.porting.edit._ir_utils import RecursiveEditError, build_recursive_edit_index
+
+        touched_uids: set[str] = set()
+        touched_node_ids: set[str] = set()
+        workflow = getattr(self, "workflow", None)
+        index = build_recursive_edit_index(workflow) if workflow is not None else None
+        for op in ops:
+            for scope_path, uid in _uids_for_op(op):
+                touched_uids.add(make_uid(scope_path, uid))
+                if index is None:
+                    continue
+                scope = index.scopes.get(scope_path)
+                if scope is None:
+                    raise RecursiveEditError("scope_unknown", f"unknown touched scope {scope_path!r}")
+                ref = scope.nodes.get(uid)
+                if ref is not None:
+                    touched_node_ids.add(ref.node_id)
+                elif scope_path:
+                    raise RecursiveEditError("unknown_target", f"unknown touched node {uid!r} in {scope_path!r}")
+        return touched_uids, touched_node_ids

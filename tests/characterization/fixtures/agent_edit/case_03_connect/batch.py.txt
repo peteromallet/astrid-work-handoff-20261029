@@ -1,0 +1,1 @@
+ksampler.positive = cliptextencode_2.CONDITIONING_0

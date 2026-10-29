@@ -1,0 +1,1725 @@
+"""Live agentic harness runner for VibeComfy headless scenarios.
+
+Scenarios run CONCURRENTLY — each in its own subprocess (process isolation +
+kill-on-timeout), bounded by ``--max-workers``. Modeled on the subagent-launcher
+fanout: one process per task, a bounded pool, a per-task timeout. ``--single``
+is the per-scenario subprocess entry point.
+
+Each scenario child runs in its OWN PROCESS GROUP with stdout/stderr going to
+regular temp files (never pipes), mirroring ``runtime.py``'s ``_run_worker_subprocess``
+(PR-A): a grandchild (model HTTP call / research subprocess) that inherits the
+child's stdio fds can no longer hold a captured pipe open past the timeout, so
+the per-scenario timeout actually fires. On timeout the whole group is
+SIGTERM'd (short grace) then SIGKILL'd and the direct child is reaped before
+the timeout is reported. If the child already wrote a valid ``--single-out``
+summary before hanging (the flow SUCCEEDED but shutdown wedged), the summary is
+recovered and annotated ``post_flow_exit_cleanup`` instead of fabricating
+``infra_timeout``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from vibecomfy.agent.deepseek_usage import (
+    add_deepseek_usage,
+    coerce_deepseek_usage,
+    combine_deepseek_cost_bases,
+)
+
+from .failure_analysis import (
+    DEFAULT_AGENT_TIMEOUT_S,
+    DEFAULT_ANALYSIS_MODEL,
+    DEFAULT_ANALYSIS_WORKERS,
+    DEFAULT_RECOMMENDATIONS_MODEL,
+    analyze_failures,
+    prepare_failure_analysis,
+    recommendations_for_run,
+)
+from .scenario_manifest import discover_manifest_scenarios
+from .output_paths import authorized_output_dir
+from .adapter import _HARNESS_DEFAULT_TRANSPORT, _TRANSPORT_SELECTING_ENV_KEYS
+from .scenario_obligations import scenario_expects_graph_changed
+
+DEFAULT_MAX_WORKERS = 6
+DEFAULT_PER_SCENARIO_TIMEOUT = 1200  # seconds; kills a wedged/over-slow scenario
+DEFAULT_PROGRESS_EVERY = 10
+DEFAULT_INFRA_RETRIES = 1
+MAX_INFRA_RETRIES = 1
+DEFAULT_FIRST_PHASE_TIMEOUT = 300.0
+_RETRYABLE_INFRA_CLASSES = frozenset({"infra_empty_response", "infra_timeout"})
+# T3.1/D5+D6 freeze: the harness is the SOLE timeout-retry owner (cap 1, fresh
+# attempt identity); the vocabulary matches the 480s fixture and runtime stamps.
+HARNESS_RETRY_OWNER = "harness_infrastructure"
+_SCENARIO_KILL_GRACE_SECONDS = float(os.getenv("VIBECOMFY_RUNNER_KILL_GRACE", "2"))
+REPO = Path(__file__).resolve().parents[2]
+_PROFILER_LOG_ENV = "VIBECOMFY_PROFILER_LOG_PATH"
+
+
+class _ScenarioWatchdogTimeout(subprocess.TimeoutExpired):
+    """Runner timeout carrying the durable lifecycle observed before kill."""
+
+    def __init__(
+        self,
+        *,
+        cmd: list[str],
+        timeout: float,
+        output: str,
+        stderr: str,
+        timeout_scope: str,
+        lifecycle: Mapping[str, Any],
+    ) -> None:
+        super().__init__(cmd=cmd, timeout=timeout, output=output, stderr=stderr)
+        self.timeout_scope = timeout_scope
+        self.lifecycle = dict(lifecycle)
+
+
+def _read_lifecycle_checkpoint(path: str | Path | None) -> dict[str, Any]:
+    """Summarize the append-only profiler journal without inventing attempts."""
+    checkpoint: dict[str, Any] = {
+        "phase_entered": None,
+        "model_dispatch_started": False,
+        "last_event": None,
+        "event_count": 0,
+    }
+    if path is None:
+        return checkpoint
+    journal = Path(path)
+    try:
+        lines = journal.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return checkpoint
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, Mapping):
+            continue
+        event_name = str(event.get("event") or "")
+        checkpoint["event_count"] += 1
+        checkpoint["last_event"] = event_name or None
+        if event_name == "executor.phase.start":
+            phase = event.get("phase")
+            if isinstance(phase, str) and phase:
+                checkpoint["phase_entered"] = phase
+        if event_name in {
+            "executor.model_turn.start",
+            "runtime.worker_subprocess.start",
+        }:
+            checkpoint["model_dispatch_started"] = True
+            phase = event.get("phase") or event.get("backend_phase")
+            if isinstance(phase, str) and phase:
+                checkpoint["phase_entered"] = phase
+    return checkpoint
+
+
+def _lifecycle_has_first_phase(checkpoint: Mapping[str, Any]) -> bool:
+    return bool(
+        checkpoint.get("phase_entered")
+        or checkpoint.get("model_dispatch_started") is True
+    )
+
+
+def _pinned_child_env(transport: str | None) -> dict[str, str]:
+    """Return the child environment with transport-selecting keys pinned.
+
+    With an explicit ``--transport`` the child must not inherit ANY ambient
+    transport-selecting variable (base URL, model force-overs, endpoint pins):
+    the explicit selector is the only authority and the adapter re-establishes
+    the pinned values from it.  Credential keys (OPENROUTER_API_KEY /
+    DEEPSEEK_API_KEY) are preserved — they supply keys, they do not select
+    transport.  ``run_tag``/``run_single`` resolve the no-flag default to the
+    canonical OpenRouter route BEFORE calling this, so a plain run never
+    inherits an ambient ``VIBECOMFY_TRANSPORT``; the ``None`` pass-through is
+    only reachable by direct callers, where an operator's deliberate
+    ``VIBECOMFY_TRANSPORT`` pin still applies.
+    """
+    if transport is None:
+        return dict(os.environ)
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _TRANSPORT_SELECTING_ENV_KEYS
+    }
+
+def _scenario_paths(
+    scenarios_dir: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> list[Path]:
+    if not scenarios_dir.is_dir():
+        raise FileNotFoundError(f"scenario directory is missing: {scenarios_dir}")
+    return discover_manifest_scenarios(scenarios_dir, manifest_path=manifest_path)
+
+
+def _load_scenario(path: Path) -> dict[str, Any]:
+    if path.suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    import yaml
+
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _output_dir_for(output_base: Any, tag: str, scenario_id: str) -> Path:
+    return authorized_output_dir(output_base, tag, scenario_id)
+
+
+def _run_dir_for(output_base: Any, tag: str) -> Path:
+    return authorized_output_dir(output_base, tag)
+
+
+def _trim(s: str) -> str:
+    return s if len(s) <= 400 else s[-400:]
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _terminate_scenario_group(pid: int) -> None:
+    """Terminate the scenario child's process GROUP and let the caller reap it.
+
+    The child is spawned with ``start_new_session=True``, so it is a session
+    leader whose process-group id equals its pid; signalling the group reaches
+    every grandchild that inherited the child's stdio fds (the cluster-A pipe
+    hang: ``subprocess.run(timeout=...)`` blocked in ``communicate()`` forever
+    because a grandchild held the captured pipe open). SIGTERM first with a
+    short grace so a well-behaved child can flush; then SIGKILL, which is
+    uncatchable, so the caller's subsequent ``wait()`` cannot hang.
+
+    ``PermissionError`` (EPERM) from ``killpg`` is treated like ESRCH: macOS
+    returns EPERM for a process group whose members are all zombies (nothing
+    left to signal), which is exactly the "already gone" state we probe for.
+    """
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return  # already gone, or only zombies remain
+    deadline = time.monotonic() + _SCENARIO_KILL_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return  # group exited during the grace window
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _run_scenario_subprocess(
+    command: list[str],
+    *,
+    cwd: str,
+    env: Mapping[str, str],
+    timeout: float,
+    stdout_path: str,
+    stderr_path: str,
+    before_terminate: Callable[[], None] | None = None,
+    first_phase_timeout: float | None = None,
+    lifecycle_path: str | None = None,
+) -> tuple[int, str, str]:
+    """Run *command* in its own process group; return (returncode, stdout, stderr).
+
+    stdout/stderr go to regular temp FILES, never pipes: a grandchild that
+    inherits the child's stdio fds cannot keep a pipe open past our timeout, so
+    the per-scenario timeout actually fires (mirrors ``runtime.py``'s
+    ``_run_worker_subprocess``, PR-A). On timeout the whole process GROUP is
+    terminated (SIGTERM → short grace → SIGKILL), the direct child is reaped
+    before ``subprocess.TimeoutExpired`` is re-raised, and the timeout carries
+    the captured temp-file tails so the caller can build its failure summary.
+    """
+    with open(stdout_path, "w", encoding="utf-8") as out_fh, open(
+        stderr_path, "w", encoding="utf-8"
+    ) as err_fh:
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_fh,
+            stderr=err_fh,
+            close_fds=True,
+            start_new_session=True,
+        )
+        started = time.monotonic()
+        timeout_scope: str | None = None
+        lifecycle: dict[str, Any] = _read_lifecycle_checkpoint(lifecycle_path)
+        try:
+            if first_phase_timeout is None:
+                proc.wait(timeout=timeout)
+            else:
+                overall_deadline = started + timeout
+                setup_deadline = started + min(max(0.0, first_phase_timeout), timeout)
+                while proc.poll() is None:
+                    now = time.monotonic()
+                    lifecycle = _read_lifecycle_checkpoint(lifecycle_path)
+                    if now >= setup_deadline and not _lifecycle_has_first_phase(lifecycle):
+                        timeout_scope = "setup"
+                        break
+                    if now >= overall_deadline:
+                        timeout_scope = "scenario"
+                        break
+                    time.sleep(min(0.1, max(0.01, overall_deadline - now)))
+                if timeout_scope is not None:
+                    raise subprocess.TimeoutExpired(command, timeout)
+        except subprocess.TimeoutExpired:
+            if before_terminate is not None:
+                try:
+                    before_terminate()
+                except Exception:  # noqa: BLE001 - timeout termination must proceed
+                    pass
+            _terminate_scenario_group(proc.pid)
+            try:
+                proc.wait(timeout=5.0)  # bounded reap after SIGKILL
+            except subprocess.TimeoutExpired:
+                pass  # group already SIGKILLed; a lingering zombie is harmless
+            with open(stdout_path, encoding="utf-8", errors="replace") as fh:
+                stdout_text = fh.read()
+            with open(stderr_path, encoding="utf-8", errors="replace") as fh:
+                stderr_text = fh.read()
+            lifecycle = _read_lifecycle_checkpoint(lifecycle_path)
+            raise _ScenarioWatchdogTimeout(
+                cmd=command,
+                timeout=(first_phase_timeout if timeout_scope == "setup" else timeout),
+                output=stdout_text,
+                stderr=stderr_text,
+                timeout_scope=timeout_scope or "scenario",
+                lifecycle=lifecycle,
+            ) from None
+    with open(stdout_path, encoding="utf-8", errors="replace") as fh:
+        stdout_text = fh.read()
+    with open(stderr_path, encoding="utf-8", errors="replace") as fh:
+        stderr_text = fh.read()
+    return proc.returncode, stdout_text, stderr_text
+
+
+def _load_valid_summary(path: Path) -> dict[str, Any] | None:
+    """Load *path* as a summary dict, or None when missing or not valid JSON.
+
+    Used for post-flow recovery: a summary the child already wrote before it
+    wedged during shutdown is real evidence the flow completed, so a timeout
+    must recover it instead of fabricating an infrastructure failure.
+    """
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _timeout_tail(exc: subprocess.TimeoutExpired, attr: str) -> str:
+    """Text of *attr* (``"output"``/``"stderr"``) on a TimeoutExpired, decoded."""
+    value = getattr(exc, attr)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def _scenario_expect_graph_changed(scenario: dict[str, Any] | None) -> bool:
+    return scenario_expects_graph_changed(scenario or {})
+
+
+def _score_class_from_summary(summary: Mapping[str, Any]) -> str:
+    """Derive a score class without collapsing an undetermined assessment.
+
+    Persisted summaries from older harness versions may lack the explicit
+    ``score_class`` field.  In that case the assessment verdict remains the
+    authoritative tri-state source; only a genuinely absent/unknown verdict
+    falls back to the historical success/product-failure distinction.
+    """
+    guard = summary.get("guard")
+    guard = guard if isinstance(guard, Mapping) else {}
+    verdict = guard.get("verdict")
+    if verdict == "undetermined":
+        return "undetermined"
+    if guard.get("score_class") == "undetermined":
+        return "undetermined"
+    explicit = summary.get("score_class") or guard.get("score_class")
+    if explicit:
+        return str(explicit)
+    if guard.get("live_agentic_success") is True:
+        return "pass"
+    return "product_fail"
+
+
+def _synthetic_guard(
+    detail: str,
+    *,
+    failure_class: str = "runner_error",
+    expect_graph_changed: bool = False,
+) -> dict[str, Any]:
+    """A failing guard for scenarios that errored/timed out in the runner itself."""
+    return {
+        "live_agentic_success": False,
+        "metadata_success": False,
+        "failure_class": failure_class,
+        "score_class": "infra_blocked" if failure_class.startswith("infra_") else "product_fail",
+        "assessment": {
+            "passed": False,
+            "verdict": "fail",
+            "expect_graph_changed": expect_graph_changed,
+            "issue_count": 1,
+            "error_count": 1,
+            "issues": [
+                {
+                    "check": "runner",
+                    "severity": "error",
+                    "detail": detail,
+                    "failure_class": failure_class,
+                }
+            ],
+        },
+    }
+
+
+def _failure_summary(
+    scenario_id: str,
+    output_base: Any,
+    tag: str,
+    detail: str,
+    *,
+    failure_class: str = "runner_error",
+    attempt: int | None = None,
+    expect_graph_changed: bool = False,
+    stdout_tail: str | None = None,
+    stderr_tail: str | None = None,
+    elapsed_s: float | None = None,
+    killed_before_first_attempt: bool | None = None,
+    pre_attempt_reason: str | None = None,
+    timeout_scope: str | None = None,
+    in_flight_phase: str | None = None,
+    model_dispatch_started: bool | None = None,
+    lifecycle_path: str | None = None,
+    lifecycle_checkpoint: Mapping[str, Any] | None = None,
+    agent_exercised: bool = False,
+) -> dict[str, Any]:
+    summary = {
+        "scenario_id": scenario_id,
+        "status": "error",
+        "ok": False,
+        "error": detail,
+        "output_dir": str(_output_dir_for(output_base, tag, scenario_id)),
+        "guard": _synthetic_guard(
+            detail,
+            failure_class=failure_class,
+            expect_graph_changed=expect_graph_changed,
+        ),
+        "failure_class": failure_class,
+        "score_class": "infra_blocked" if failure_class.startswith("infra_") else "product_fail",
+        "retryable_infra": failure_class in _RETRYABLE_INFRA_CLASSES,
+        "agent_exercised": agent_exercised,
+        "attempt": attempt,
+        "elapsed_s": elapsed_s,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "model_attempts": [],
+        "deepseek_usage": {},
+        "deepseek_est_cost_usd": 0.0,
+        "deepseek_cost_basis": "not_available",
+    }
+    if killed_before_first_attempt is not None:
+        summary["killed_before_first_attempt"] = killed_before_first_attempt
+    if pre_attempt_reason is not None:
+        summary["pre_attempt_reason"] = pre_attempt_reason
+    if timeout_scope is not None:
+        summary["timeout_scope"] = timeout_scope
+    if in_flight_phase is not None:
+        summary["in_flight_phase"] = in_flight_phase
+    if model_dispatch_started is not None:
+        summary["model_dispatch_started"] = model_dispatch_started
+    if lifecycle_path is not None:
+        summary["lifecycle_path"] = lifecycle_path
+    if lifecycle_checkpoint is not None:
+        summary["lifecycle_checkpoint"] = dict(lifecycle_checkpoint)
+    return summary
+
+
+def _canonicalize_summary_output(
+    summary: dict[str, Any],
+    *,
+    output_base: Any,
+    tag: str,
+    scenario_id: str,
+) -> Path:
+    """Bind child-reported identity and output location to runner authority."""
+    output_dir = _output_dir_for(output_base, tag, scenario_id)
+    summary["scenario_id"] = scenario_id
+    summary["output_dir"] = str(output_dir)
+    guard = summary.get("guard")
+    if isinstance(guard, dict) and "output_dir" in guard:
+        guard["output_dir"] = str(output_dir)
+    return output_dir
+
+
+def _persist_scenario_summary(
+    summary: dict[str, Any],
+    output_base: Any,
+    tag: str,
+    *,
+    summary_path_dir: Path | None = None,
+    canonical_tag: str | None = None,
+) -> None:
+    scenario_id = str(summary.get("scenario_id") or "")
+    if not scenario_id:
+        return
+    output_dir = _canonicalize_summary_output(
+        summary,
+        output_base=output_base,
+        tag=canonical_tag or tag,
+        scenario_id=scenario_id,
+    )
+    destination_dir = summary_path_dir or output_dir
+    _write_json_atomic(destination_dir / "agentic_summary.json", summary)
+
+
+
+
+
+def _attempt_tag(tag: str, scenario_id: str, attempt: int) -> str:
+    return f"{tag}/attempts/{scenario_id}/attempt_{attempt}"
+
+
+def _attempt_record(
+    summary: dict[str, Any],
+    *,
+    attempt: int,
+    attempt_identity: str,
+    attempt_deadline_seconds: float,
+) -> dict[str, Any]:
+    live_ok = (summary.get("guard") or {}).get("live_agentic_success") is True
+    failure_class = (
+        summary.get("failure_class")
+        or (summary.get("guard") or {}).get("failure_class")
+        or (None if live_ok else "product_or_assessment_failure")
+    )
+    # T3.1/D6 freeze: the harness is the SOLE owner that may retry a timed-out
+    # scenario, exactly once, always under a NEW attempt identity (fresh tag +
+    # output dir). Same-identity retry is never safe: completion requests carry
+    # no request-level idempotency key, so a timed-out request's remote state
+    # is unknowable. The fixture vocabulary
+    # (owner/deadline/remote_uncertainty/retry_disposition) is recorded on
+    # every live attempt below.
+    if failure_class == "infra_timeout":
+        retry_disposition = "not_safe_to_retry_same_identity"
+        remote_uncertainty = "timeout_before_response"
+    elif summary.get("retryable_infra") is True:
+        retry_disposition = "retry_new_identity_only"
+        remote_uncertainty = None
+    else:
+        retry_disposition = "terminal"
+        remote_uncertainty = None
+    return {
+        "attempt": attempt,
+        "scenario_id": summary.get("scenario_id"),
+        "status": summary.get("status"),
+        "ok": summary.get("ok"),
+        "output_dir": summary.get("output_dir"),
+        "error": summary.get("error"),
+        "failure_class": failure_class,
+        "score_class": _score_class_from_summary(summary),
+        "retryable_infra": bool(summary.get("retryable_infra")),
+        "agent_exercised": summary.get("agent_exercised"),
+        "elapsed_s": summary.get("elapsed_s"),
+        "live_agentic_success": (summary.get("guard") or {}).get("live_agentic_success"),
+        "model_attempts": summary.get("model_attempts", []),
+        "killed_before_first_attempt": summary.get("killed_before_first_attempt") is True,
+        "pre_attempt_reason": summary.get("pre_attempt_reason"),
+        "timeout_scope": summary.get("timeout_scope"),
+        "in_flight_phase": summary.get("in_flight_phase"),
+        "model_dispatch_started": summary.get("model_dispatch_started"),
+        "lifecycle_path": summary.get("lifecycle_path"),
+        "lifecycle_checkpoint": summary.get("lifecycle_checkpoint"),
+        "retry_ownership": {
+            "owner": HARNESS_RETRY_OWNER,
+            "attempt_identity": attempt_identity,
+            "attempt_deadline_seconds": attempt_deadline_seconds,
+            "same_identity_retry": False,
+            "retry_disposition": retry_disposition,
+            "remote_uncertainty": remote_uncertainty,
+            # Model completions are side-effect-free but unkeyed; recorded so
+            # evidence consumers never have to assume it.
+            "request_idempotency_key": None,
+        },
+    }
+
+
+def _latest_failed_model_attempt(summary: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Latest UNRECOVERED failed attempt — a later success supersedes it.
+
+    DEEP-AUDIT-REVIEW-3 finding 004: scanning for any historical failure let
+    a RECOVERED classify timeout (a later successful attempt in the same
+    phase) reclassify a later product/assessment failure as retryable
+    infrastructure. Only failures that remain terminal for their phase — no
+    later successful attempt in that phase — may drive infra classification.
+    """
+    attempts = summary.get("model_attempts")
+    if not isinstance(attempts, (list, tuple)):
+        return None
+    records = [attempt for attempt in attempts if isinstance(attempt, Mapping)]
+    for index in range(len(records) - 1, -1, -1):
+        attempt = records[index]
+        if attempt.get("outcome") != "failure":
+            continue
+        phase = attempt.get("phase")
+        if any(
+            later.get("outcome") == "success" and later.get("phase") == phase
+            for later in records[index + 1 :]
+        ):
+            continue
+        return attempt
+    return None
+
+
+def _summary_completion_tokens(summary: dict[str, Any]) -> int | None:
+    """Observed completion tokens of the attempt's model call, or None when absent.
+
+    The attempt summary (agentic_summary) carries ``deepseek_usage`` at the top
+    level — the executor result's usage dict.  ``completion_tokens == 0`` is the
+    structured evidence of an empty/transport response; absence of the record is
+    NOT evidence, so it never classifies as infra.
+    """
+    attempt = _latest_failed_model_attempt(summary)
+    usage = attempt.get("token_usage") if isinstance(attempt, Mapping) else None
+    if not isinstance(usage, Mapping):
+        # Doc-contract: the attempt summary also carries ``deepseek_usage``
+        # at the top level. Absence of BOTH records is not evidence.
+        top = summary.get("deepseek_usage")
+        usage = top if isinstance(top, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return None
+    value = usage.get("completion_tokens")
+    if not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _typed_failure_kind(summary: Mapping[str, Any]) -> str | None:
+    """Return the product envelope's typed failure kind when present."""
+    kind = summary.get("failure_kind")
+    if isinstance(kind, str) and kind.strip():
+        return kind.strip()
+    guard = summary.get("guard")
+    if isinstance(guard, Mapping):
+        kind = guard.get("failure_kind")
+        if isinstance(kind, str) and kind.strip():
+            return kind.strip()
+    return None
+
+
+def _provider_infra_failure_class(summary: dict[str, Any]) -> str | None:
+    """Map only canonical typed attempt evidence; never inspect response prose."""
+    if _typed_failure_kind(summary) == "AuthError":
+        return None
+    attempt = _latest_failed_model_attempt(summary)
+    if attempt is None:
+        # Clean-exit TimeoutError: the worker stamped a typed envelope and
+        # the subprocess exited 0, so the comparison lane records
+        # timed_out=false. Classify from the envelope + 0-token evidence.
+        kind = summary.get("failure_kind")
+        if not isinstance(kind, str):
+            guard = summary.get("guard")
+            if isinstance(guard, Mapping):
+                kind = guard.get("failure_kind")
+        if kind == "TimeoutError" and _summary_completion_tokens(summary) == 0:
+            return "infra_timeout"
+        parse_reason = summary.get("parse_reason")
+        if parse_reason == "empty" and _summary_completion_tokens(summary) == 0:
+            return "infra_empty_response"
+        return None
+    failure_type = attempt.get("failure_type")
+    if failure_type == "empty_response":
+        if _summary_completion_tokens(summary) == 0:
+            return "infra_empty_response"
+        raw = str(attempt.get("raw_response_preview") or attempt.get("raw_response") or "")
+        if "<think>" in raw.lower() or attempt.get("parse_reason") == "empty":
+            return "infra_empty_response"
+    if failure_type == "timeout":
+        return "infra_timeout"
+    if failure_type == "provider_failure":
+        return "infra_provider_capacity"
+    return None
+
+
+def _mark_summary_as_infra(summary: dict[str, Any], failure_class: str) -> None:
+    summary["failure_class"] = failure_class
+    summary["score_class"] = "infra_blocked"
+    summary["retryable_infra"] = failure_class in _RETRYABLE_INFRA_CLASSES
+    guard = summary.get("guard")
+    if isinstance(guard, dict):
+        guard["failure_class"] = failure_class
+        guard["score_class"] = "infra_blocked"
+        assessment = guard.get("assessment")
+        if isinstance(assessment, dict):
+            assessment.setdefault("issues", []).append(
+                {
+                    "check": "infra_classification",
+                    "severity": "warning",
+                    "detail": (
+                        f"{failure_class} failure was classified as "
+                        "infrastructure, not product quality."
+                    ),
+                    "failure_class": failure_class,
+                }
+            )
+
+
+def _clear_stale_retryable_infra_markers(summary: dict[str, Any]) -> None:
+    """Drop inherited retryable-infra markers the canonical evidence no longer supports.
+
+    ``failure_class``/``retryable_infra`` are authoritative ONLY while they are
+    re-derived from the canonical ``model_attempts`` evidence on the same
+    summary. A summary that previously persisted ``infra_empty_response`` (from
+    an earlier attempt or a resumed run) must not keep claiming retryability
+    when the typed evidence is now, say, ``malformed_json`` (oracle finding 4).
+    """
+    stale_retryable = (
+        summary.get("failure_class") == "infra_empty_response"
+        or summary.get("retryable_infra") is True
+    )
+    if summary.get("failure_class") == "infra_empty_response":
+        del summary["failure_class"]
+    if summary.get("retryable_infra") is True:
+        summary["retryable_infra"] = False
+    if stale_retryable and summary.get("score_class") == "infra_blocked":
+        del summary["score_class"]
+    guard = summary.get("guard")
+    if isinstance(guard, dict):
+        if guard.get("failure_class") == "infra_empty_response":
+            del guard["failure_class"]
+        if stale_retryable and guard.get("score_class") == "infra_blocked":
+            del guard["score_class"]
+
+
+def _classify_retryable_infra_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Re-derive infra classification from canonical typed evidence only.
+
+    Never trusts inherited ``failure_class``/``retryable_infra`` flags: when the
+    canonical ``model_attempts`` evidence supports an infra class the summary is
+    marked; otherwise stale retryable-infra markers are cleared so persisted
+    summaries cannot mislead later decisions.
+    """
+    if summary.get("guard", {}).get("live_agentic_success") is True:
+        _clear_stale_retryable_infra_markers(summary)
+        return summary
+    if _is_outer_timeout_before_first_attempt(summary):
+        _mark_summary_as_infra(summary, "infra_timeout")
+        return summary
+    failure_class = _provider_infra_failure_class(summary)
+    if failure_class is not None:
+        _mark_summary_as_infra(summary, failure_class)
+    else:
+        _clear_stale_retryable_infra_markers(summary)
+    return summary
+
+
+def _is_outer_timeout_before_first_attempt(summary: Mapping[str, Any]) -> bool:
+    """True only for a runner-owned timeout lacking terminal attempt evidence."""
+    attempts = summary.get("model_attempts")
+    return (
+        summary.get("failure_class") == "infra_timeout"
+        and (
+            summary.get("timeout_scope") in {"setup", "scenario"}
+            or summary.get("killed_before_first_attempt") is True
+        )
+        and isinstance(attempts, (list, tuple))
+        and not attempts
+    )
+
+
+def _is_retryable_infra_summary(summary: dict[str, Any]) -> bool:
+    """Decide retryability from the CANONICAL typed evidence on every call.
+
+    The decision is the latest failed ``model_attempts`` entry's failure type
+    plus the observed completion tokens, or the runner's explicit outer-kill
+    marker with an empty attempt list — never the inherited
+    ``failure_class``/``retryable_infra`` flags, which can be stale from an
+    earlier attempt. A succeeded scenario is never retried.
+    """
+    _classify_retryable_infra_summary(summary)
+    if summary.get("guard", {}).get("live_agentic_success") is True:
+        return False
+    return (
+        _is_outer_timeout_before_first_attempt(summary)
+        or _provider_infra_failure_class(summary) in _RETRYABLE_INFRA_CLASSES
+    )
+
+
+# Pre-attempt kill reasons (I-B).  A zero-attempt outer kill is classified from
+# the killed child's typed stderr/stdout tail: only exact research-path markers
+# (GitHub code search / registry / Hivemind / research stage) classify as
+# ``research_hang`` — the v5-batch-3 #1/#7 mechanism where api.github.com/
+# search/code ate the whole 1200s wall before a first model attempt.  Any other
+# tail leaves the reason None, so the retry keeps its plain full-budget shape.
+_RESEARCH_HANG_MARKERS = (
+    "api.github.com/search/code",
+    "api.comfy.org",
+    "registry sub-budget",
+    "hivemind",
+    "research stage",
+)
+_IMPLEMENT_STAGE_MARKERS = (
+    "backend_phase=batch",
+    "backend_phase=implement",
+    "phase=implement",
+    'phase="implement"',
+)
+
+
+def _infer_pre_attempt_reason(
+    stderr_text: str | None,
+    stdout_text: str | None = None,
+) -> str | None:
+    """Classify a zero-attempt outer kill's likely pre-attempt stall.
+
+    Only the bounded current tails from the killed child are considered.  A
+    current implement-stage marker wins over an older research marker, so
+    historical GitHub/registry text cannot misclassify a later implement
+    timeout as a research hang.
+    """
+    current = "\n".join(
+        part for part in (_trim(stderr_text or ""), _trim(stdout_text or "")) if part
+    ).lower()
+    if not current:
+        return None
+    if any(marker in current for marker in _IMPLEMENT_STAGE_MARKERS):
+        return None
+    if any(marker in current for marker in _RESEARCH_HANG_MARKERS):
+        return "research_hang"
+    return None
+
+
+def _research_hang_kill_summary(summary: Mapping[str, Any] | None) -> bool:
+    """True for a zero-attempt outer kill whose reason was a research hang.
+
+    This is the I-B retry lever: the retry must NOT be a second 1200s black
+    hole, so the child research path is hard-bounded below.
+    """
+    return bool(
+        summary is not None
+        and _is_outer_timeout_before_first_attempt(summary)
+        and summary.get("timeout_scope") != "setup"
+        and summary.get("pre_attempt_reason") == "research_hang"
+    )
+
+
+def _bound_research_child_env(child_env: dict[str, str]) -> dict[str, str]:
+    """Hard-bounded research env for the retry of a research-hang kill.
+
+    The research phase itself is skipped on this one retry.  GitHub and the
+    registry are also bounded defensively in case an older child entrypoint
+    does not understand the phase-skip switch.  The retry still runs classify,
+    implement, reply, and every product gate; only the already-proven hanging
+    infrastructure phase is omitted.
+    """
+    env = dict(child_env)
+    env["VIBECOMFY_RESEARCH_HANG_RETRY_SKIP"] = "1"
+    env["VIBECOMFY_REGISTRY_SKIP_GITHUB"] = "1"
+    env["VIBECOMFY_REGISTRY_SUB_BUDGET"] = "8"
+    return env
+
+
+def _build_run_summary(
+    tag: str,
+    summaries: list[dict[str, Any]],
+    *,
+    total_scenarios: int,
+    complete: bool,
+    transport: str | None = None,
+) -> dict[str, Any]:
+    passed = sum(1 for summary in summaries if summary["guard"].get("live_agentic_success") is True)
+    failed = len(summaries) - passed
+    raw_first_attempt_passed = sum(
+        1
+        for summary in summaries
+        if summary.get("raw_first_attempt_success", summary["guard"].get("live_agentic_success")) is True
+    )
+    infra_failures = sum(
+        1
+        for summary in summaries
+        if summary["guard"].get("live_agentic_success") is not True
+        and str(summary.get("failure_class") or "").startswith("infra_")
+    )
+    score_classes: dict[str, int] = {}
+    for summary in summaries:
+        score_class = _score_class_from_summary(summary)
+        score_classes[str(score_class)] = score_classes.get(str(score_class), 0) + 1
+    deepseek_usage = add_deepseek_usage(
+        *[coerce_deepseek_usage(summary.get("deepseek_usage")) for summary in summaries]
+    )
+    deepseek_est_cost_usd = float(
+        sum(float(summary.get("deepseek_est_cost_usd") or 0.0) for summary in summaries)
+    )
+    deepseek_cost_basis = combine_deepseek_cost_bases(
+        [summary.get("deepseek_cost_basis") for summary in summaries]
+    )
+    return {
+        "tag": tag,
+        "transport": transport,
+        "scenario_count": len(summaries),
+        "total_scenarios": total_scenarios,
+        "completed": len(summaries),
+        "pending": max(total_scenarios - len(summaries), 0),
+        "passed": passed,
+        "failed": failed,
+        "final_score": f"{passed}/{len(summaries)}",
+        "raw_first_attempt_passed": raw_first_attempt_passed,
+        "raw_first_attempt_failed": len(summaries) - raw_first_attempt_passed,
+        "raw_first_attempt_score": f"{raw_first_attempt_passed}/{len(summaries)}",
+        "infra_failures": infra_failures,
+        "product_or_assessment_failures": failed - infra_failures,
+        "score_classes": score_classes,
+        "overall_success": complete and failed == 0 and len(summaries) == total_scenarios,
+        "complete": complete,
+        "deepseek_usage": deepseek_usage,
+        "deepseek_est_cost_usd": deepseek_est_cost_usd,
+        "deepseek_cost_basis": deepseek_cost_basis,
+        "scenarios": summaries,
+    }
+
+
+def _persist_run_summary(
+    tag: str,
+    results: list[dict[str, Any] | None],
+    output_base: Any,
+    *,
+    total_scenarios: int,
+    complete: bool,
+    transport: str | None = None,
+) -> dict[str, Any]:
+    summaries = [r for r in results if r]
+    summary = _build_run_summary(
+        tag,
+        summaries,
+        total_scenarios=total_scenarios,
+        complete=complete,
+        transport=transport,
+    )
+    run_dir = _run_dir_for(output_base, tag)
+    if complete:
+        _write_json_atomic(run_dir / "run_summary.json", summary)
+        partial = run_dir / "run_summary.partial.json"
+        if partial.exists():
+            partial.unlink()
+    else:
+        _write_json_atomic(run_dir / "run_summary.partial.json", summary)
+    return summary
+
+
+def _analysis_index_path_for_summary(run_summary_path: Path) -> Path:
+    if run_summary_path.name in {"run_summary.json", "run_summary.partial.json"}:
+        return run_summary_path.parent / "failure_analysis" / "index.json"
+    return run_summary_path.with_suffix("") / "failure_analysis" / "index.json"
+
+
+def _run_failure_analysis_from_summary(
+    run_summary_path: Path,
+    *,
+    scenarios_dir: Path,
+    analyze_failures_enabled: bool,
+    prepare_only: bool,
+    recommend_fixes: bool,
+    analysis_model: str,
+    analysis_max_workers: int,
+    analysis_timeout: int,
+    resume_failure_analysis: bool,
+    recommendations_model: str,
+    recommendations_timeout: int,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "run_summary_path": str(run_summary_path),
+        "analysis_index_path": None,
+        "recommendations_path": None,
+    }
+    index_path = _analysis_index_path_for_summary(run_summary_path)
+    should_prepare = prepare_only or analyze_failures_enabled or (recommend_fixes and not index_path.exists())
+    if should_prepare:
+        if analyze_failures_enabled:
+            index = analyze_failures(
+                run_summary_path,
+                scenarios_dir=scenarios_dir,
+                model=analysis_model,
+                max_workers=analysis_max_workers,
+                timeout_s=analysis_timeout,
+                resume=resume_failure_analysis,
+            )
+        else:
+            index = prepare_failure_analysis(run_summary_path, scenarios_dir=scenarios_dir)
+        result["analysis_index_path"] = str(index_path)
+        result["failed_count"] = index.get("failed_count", 0)
+    elif index_path.exists():
+        result["analysis_index_path"] = str(index_path)
+    if recommend_fixes:
+        meta = recommendations_for_run(
+            run_summary_path,
+            model=recommendations_model,
+            timeout_s=recommendations_timeout,
+        )
+        result["recommendations_path"] = meta["output_path"]
+        result["recommendations_returncode"] = meta["returncode"]
+    return result
+
+
+def _guard_scenario_output(
+    output_dir: str | Path,
+    *,
+    scenario: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load the heavyweight assessment stack only after agent execution."""
+    from .guard import guard_output_dir
+
+    return guard_output_dir(output_dir, scenario=scenario)
+
+
+def run_single(
+    scenario_path: str,
+    tag: str,
+    output_base: Any,
+    out_file: Path | None,
+    transport: str | None = None,
+    profile: str | None = None,
+    pipeline_mode: str | None = None,
+) -> dict[str, Any]:
+    """Run ONE scenario in-process; write its summary JSON to *out_file* if given.
+
+    This is the entry point invoked by the per-scenario subprocess in parallel mode.
+    ``transport=None`` resolves to the canonical OpenRouter product route
+    (``_HARNESS_DEFAULT_TRANSPORT``), never to an ambient credential.
+    """
+    transport = transport or _HARNESS_DEFAULT_TRANSPORT
+    if output_base is not None:
+        output_base = Path(output_base).absolute()
+    from .adapter import run_headless_scenario
+    path = Path(scenario_path)
+    scenario = _load_scenario(path)
+    scenario.setdefault("id", path.stem)
+    scenario_id = str(scenario.get("id") or path.stem)
+    scenario["id"] = scenario_id
+    if profile == "baseline":
+        from .baseline_lane import run_baseline_scenario
+        baseline = run_baseline_scenario(
+            scenario, tag=tag, output_base=output_base
+        )
+        baseline["guard"] = {
+            "assessment": {"verdict": baseline.get("judge_verdict"),
+                           "pass": baseline.get("ok")},
+            "live_agentic_success": bool(baseline.get("ok")),
+        }
+        baseline.setdefault("transport", transport)
+        _persist_scenario_summary(baseline, output_base, tag)
+        if out_file is not None:
+            _write_json_atomic(out_file, baseline)
+        return baseline
+    headless_kwargs = {
+        "output_base": output_base,
+        "tag": tag,
+        "transport": transport,
+    }
+    effective_pipeline_mode = pipeline_mode or scenario.get("pipeline_mode")
+    if effective_pipeline_mode is not None:
+        headless_kwargs["pipeline_mode"] = effective_pipeline_mode
+    summary = run_headless_scenario(scenario, **headless_kwargs)
+    if summary.get("lane") == "baseline":
+        # Baseline has no graph artifacts; write the canonical summary file the
+        # runner's aggregation reads (agentic_summary.json) directly.
+        out_dir = summary.get("output_dir")
+        if out_dir:
+            from pathlib import Path as _P
+            _pd = _P(out_dir)
+            _pd.mkdir(parents=True, exist_ok=True)
+            (_pd / "agentic_summary.json").write_text(json.dumps(summary, indent=1))
+    else:
+        _canonicalize_summary_output(
+            summary,
+            output_base=output_base,
+            tag=tag,
+            scenario_id=scenario_id,
+        )
+    summary.setdefault("transport", transport)
+    if summary.get("lane") == "baseline":
+        summary["guard"] = {
+            "assessment": {"verdict": summary.get("judge_verdict"),
+                           "pass": summary.get("ok")},
+            "live_agentic_success": bool(summary.get("ok")),
+        }
+    else:
+        summary["guard"] = _guard_scenario_output(
+            summary["output_dir"],
+            scenario=scenario,
+        )
+    _classify_retryable_infra_summary(summary)
+    _persist_scenario_summary(summary, output_base, tag)
+    if out_file is not None:
+        # Atomic (temp+rename) so a runner that kills us mid-write never
+        # observes a truncated summary — it either sees the full valid summary
+        # (post-flow recovery) or nothing at all.
+        _write_json_atomic(out_file, summary)
+    return summary
+
+
+def run_tag(
+    tag: str,
+    *,
+    scenarios_dir: Path | None = None,
+    output_base: Path | str | None = None,
+    profile: str | None = None,
+    pipeline_mode: str | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    per_scenario_timeout: int = DEFAULT_PER_SCENARIO_TIMEOUT,
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
+    infra_retries: int = DEFAULT_INFRA_RETRIES,
+    manifest_path: Path | None = None,
+    transport: str | None = None,
+) -> dict[str, Any]:
+    """Run every scenario under *scenarios_dir* CONCURRENTLY — each in its own
+    subprocess (process-isolated + kill-on-timeout), bounded by *max_workers*.
+
+    *transport* (``"openrouter"`` / ``"native"`` / ``None``) is forwarded
+    explicitly onto every child command line and the child environment is
+    pinned against ambient transport-selecting variables, so the selector
+    survives subprocess isolation into every profile phase.  ``None`` resolves
+    to the canonical OpenRouter product route (``_HARNESS_DEFAULT_TRANSPORT``)
+    — the no-flag default is pinned to OpenRouter, never an ambient/native pin.
+    """
+    # Anchor the parent-selected base before child execution changes CWD.
+    if output_base is None:
+        output_base = REPO / "out" / "agentic"
+    else:
+        output_base = Path(output_base).absolute()
+    transport = transport or _HARNESS_DEFAULT_TRANSPORT
+    if scenarios_dir is None:
+        scenarios_dir = Path(__file__).with_name("scenarios")
+    paths = _scenario_paths(scenarios_dir, manifest_path=manifest_path)
+    results: list[dict[str, Any] | None] = [None] * len(paths)
+    # Persist liveness before any child can block in imports, research, or a
+    # model call.  Previously the first partial summary appeared only after a
+    # scenario completed, making a healthy long-running dispatch look wedged.
+    _persist_run_summary(
+        tag,
+        results,
+        output_base,
+        total_scenarios=len(paths),
+        complete=False,
+        transport=transport,
+    )
+    sem = threading.Semaphore(max(1, max_workers))
+    lock = threading.Lock()
+    tmpdir = Path(tempfile.mkdtemp(prefix="vibecomfy-runner-"))
+    try:
+        def record_result(idx: int, summary: dict[str, Any]) -> None:
+            sid = paths[idx].stem
+            attempt = int(summary.get("attempt") or 1)
+            _canonicalize_summary_output(
+                summary,
+                output_base=output_base,
+                tag=_attempt_tag(tag, sid, attempt),
+                scenario_id=sid,
+            )
+            results[idx] = summary
+            results[idx].setdefault("transport", transport)
+            _persist_scenario_summary(
+                results[idx],
+                output_base,
+                tag,
+                summary_path_dir=_output_dir_for(output_base, tag, sid),
+                canonical_tag=_attempt_tag(tag, sid, attempt),
+            )
+            with lock:
+                completed = sum(1 for r in results if r)
+                run_summary = _persist_run_summary(
+                    tag,
+                    results,
+                    output_base,
+                    total_scenarios=len(paths),
+                    complete=False,
+                    transport=transport,
+                )
+                if progress_every > 0 and (
+                    completed == len(paths) or completed % progress_every == 0
+                ):
+                    print(
+                        "[agentic-progress] "
+                        f"tag={tag} completed={completed}/{len(paths)} "
+                        f"passed={run_summary['passed']} failed={run_summary['failed']} "
+                        f"pending={run_summary['pending']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        def worker(idx: int, path: Path) -> None:
+            sid = path.stem
+            scenario_for_synthetic = _load_scenario(path)
+            expect_graph_changed = _scenario_expect_graph_changed(scenario_for_synthetic)
+            attempts: list[dict[str, Any]] = []
+            with sem:
+                # A timeout/empty-response retry is deliberately bounded to
+                # one fresh attempt.  Callers may disable it with zero, but
+                # cannot turn a flaky provider into an unbounded retry loop.
+                max_attempts = 1 + min(MAX_INFRA_RETRIES, max(0, infra_retries))
+                final_summary: dict[str, Any] | None = None
+                for attempt in range(1, max_attempts + 1):
+                    attempt_run_tag = _attempt_tag(tag, sid, attempt)
+                    out_file = tmpdir / f"{idx:03d}-{attempt}.json"
+                    stdout_path = tmpdir / f"{idx:03d}-{attempt}.out.log"
+                    stderr_path = tmpdir / f"{idx:03d}-{attempt}.err.log"
+                    cmd = [
+                        sys.executable, "-m", "tests.live_agentic_harness.runner",
+                        "--single", str(path), "--tag", attempt_run_tag,
+                        "--single-out", str(out_file),
+                    ]
+                    if output_base is not None:
+                        cmd += ["--output-base", str(output_base)]
+                    if transport is not None:
+                        cmd += ["--transport", transport]
+                    if profile is not None:
+                        cmd += ["--profile", profile]
+                    if pipeline_mode is not None:
+                        cmd += ["--pipeline-mode", pipeline_mode]
+                    child_env = _pinned_child_env(transport)
+                    # I-B: the retry of a zero-attempt research-hang kill must
+                    # NOT be a second 1200s black hole — the research path is
+                    # hard-bounded (GitHub tier off, tiny registry sub-budget).
+                    if attempt > 1 and _research_hang_kill_summary(final_summary):
+                        child_env = _bound_research_child_env(child_env)
+                    # Reserve the durable attempt path before Popen.  The
+                    # headless artifact writer creates it only after executor
+                    # completion, which left no on-disk proof that dispatch
+                    # had happened during a long child startup/model phase.
+                    _output_dir_for(output_base, attempt_run_tag, sid).mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    attempt_output_dir = _output_dir_for(
+                        output_base, attempt_run_tag, sid
+                    )
+                    lifecycle_path = attempt_output_dir / "runner-lifecycle.jsonl"
+                    child_env[_PROFILER_LOG_ENV] = str(lifecycle_path)
+                    started = time.monotonic()
+
+                    def persist_outer_timeout_marker() -> None:
+                        # Best-effort: read whatever stderr the child flushed so
+                        # the persisted marker can carry a pre_attempt_reason.
+                        stderr_tail = ""
+                        stdout_tail = ""
+                        try:
+                            stderr_tail = Path(stderr_path).read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        except OSError:
+                            pass
+                        try:
+                            stdout_tail = Path(stdout_path).read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        except OSError:
+                            pass
+                        partial = _failure_summary(
+                            sid,
+                            output_base,
+                            attempt_run_tag,
+                            f"scenario exceeded {per_scenario_timeout}s; terminating",
+                            failure_class="infra_timeout",
+                            attempt=attempt,
+                            expect_graph_changed=expect_graph_changed,
+                            elapsed_s=time.monotonic() - started,
+                            killed_before_first_attempt=True,
+                            pre_attempt_reason=_infer_pre_attempt_reason(
+                                stderr_tail, stdout_tail
+                            ),
+                            lifecycle_path=str(lifecycle_path),
+                            lifecycle_checkpoint=_read_lifecycle_checkpoint(
+                                lifecycle_path
+                            ),
+                        )
+                        _persist_scenario_summary(
+                            partial,
+                            output_base,
+                            attempt_run_tag,
+                        )
+
+                    try:
+                        returncode, stdout_text, stderr_text = _run_scenario_subprocess(
+                            cmd,
+                            cwd=str(REPO),
+                            env=child_env,
+                            timeout=per_scenario_timeout,
+                            stdout_path=str(stdout_path),
+                            stderr_path=str(stderr_path),
+                            before_terminate=persist_outer_timeout_marker,
+                            first_phase_timeout=DEFAULT_FIRST_PHASE_TIMEOUT,
+                            lifecycle_path=str(lifecycle_path),
+                        )
+                        elapsed_s = time.monotonic() - started
+                        recovered = _load_valid_summary(out_file)
+                        if recovered is not None:
+                            final_summary = recovered
+                            final_summary["attempt"] = attempt
+                            final_summary["elapsed_s"] = elapsed_s
+                            final_summary["agent_exercised"] = True
+                        else:
+                            tail = _trim(stderr_text or "")
+                            final_summary = _failure_summary(
+                                sid,
+                                output_base,
+                                attempt_run_tag,
+                                f"runner produced no summary (rc={returncode}); {tail}",
+                                failure_class="infra_no_summary",
+                                attempt=attempt,
+                                expect_graph_changed=expect_graph_changed,
+                                stdout_tail=_trim(stdout_text or ""),
+                                stderr_tail=tail,
+                                elapsed_s=elapsed_s,
+                            )
+                    except subprocess.TimeoutExpired as exc:
+                        elapsed_s = time.monotonic() - started
+                        recovered = _load_valid_summary(out_file)
+                        if recovered is not None:
+                            # Post-flow exit cleanup: the child wrote a valid
+                            # summary BEFORE wedging during shutdown, so the
+                            # flow itself completed. Recover the summary and
+                            # annotate the exit-cleanup hiccup instead of
+                            # fabricating an infra_timeout.
+                            final_summary = recovered
+                            final_summary["attempt"] = attempt
+                            final_summary["elapsed_s"] = elapsed_s
+                            final_summary["agent_exercised"] = True
+                            final_summary["failure_class"] = "post_flow_exit_cleanup"
+                            if isinstance(final_summary.get("guard"), dict):
+                                final_summary["guard"].setdefault(
+                                    "failure_class", "post_flow_exit_cleanup"
+                                )
+                        else:
+                            stderr_tail = _timeout_tail(exc, "stderr")
+                            stdout_tail = _timeout_tail(exc, "output")
+                            lifecycle = getattr(
+                                exc,
+                                "lifecycle",
+                                _read_lifecycle_checkpoint(lifecycle_path),
+                            )
+                            timeout_scope = str(
+                                getattr(exc, "timeout_scope", "scenario")
+                            )
+                            phase_entered = lifecycle.get("phase_entered")
+                            dispatch_started = (
+                                lifecycle.get("model_dispatch_started") is True
+                            )
+                            killed_before_first_attempt = not bool(
+                                phase_entered or dispatch_started
+                            )
+                            final_summary = _failure_summary(
+                                sid,
+                                output_base,
+                                attempt_run_tag,
+                                (
+                                    "scenario child stalled before first executor phase "
+                                    f"for {DEFAULT_FIRST_PHASE_TIMEOUT}s and was killed"
+                                    if timeout_scope == "setup"
+                                    else f"scenario exceeded {per_scenario_timeout}s and was killed"
+                                ),
+                                failure_class="infra_timeout",
+                                attempt=attempt,
+                                expect_graph_changed=expect_graph_changed,
+                                stdout_tail=_trim(stdout_tail),
+                                stderr_tail=_trim(stderr_tail),
+                                elapsed_s=elapsed_s,
+                                killed_before_first_attempt=killed_before_first_attempt,
+                                pre_attempt_reason=_infer_pre_attempt_reason(
+                                    stderr_tail, stdout_tail
+                                ),
+                                timeout_scope=timeout_scope,
+                                in_flight_phase=(
+                                    str(phase_entered) if phase_entered else None
+                                ),
+                                model_dispatch_started=dispatch_started,
+                                lifecycle_path=str(lifecycle_path),
+                                lifecycle_checkpoint=lifecycle,
+                                agent_exercised=not killed_before_first_attempt,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — isolate one failure
+                        elapsed_s = time.monotonic() - started
+                        final_summary = _failure_summary(
+                            sid,
+                            output_base,
+                            attempt_run_tag,
+                            _trim(str(exc)),
+                            failure_class="infra_runner_exception",
+                            attempt=attempt,
+                            expect_graph_changed=expect_graph_changed,
+                            elapsed_s=elapsed_s,
+                        )
+
+                    _canonicalize_summary_output(
+                        final_summary,
+                        output_base=output_base,
+                        tag=attempt_run_tag,
+                        scenario_id=sid,
+                    )
+                    _persist_scenario_summary(
+                        final_summary,
+                        output_base,
+                        attempt_run_tag,
+                    )
+                    retryable_infra = _is_retryable_infra_summary(final_summary)
+                    attempts.append(_attempt_record(
+                        final_summary,
+                        attempt=attempt,
+                        attempt_identity=attempt_run_tag,
+                        attempt_deadline_seconds=float(per_scenario_timeout),
+                    ))
+                    if not retryable_infra:
+                        break
+
+                if final_summary is None:
+                    final_summary = _failure_summary(
+                        sid,
+                        output_base,
+                        _attempt_tag(tag, sid, 1),
+                        "runner produced no attempt result",
+                        failure_class="infra_runner_exception",
+                        attempt=1,
+                        expect_graph_changed=expect_graph_changed,
+                    )
+                    attempts.append(_attempt_record(
+                        final_summary,
+                        attempt=1,
+                        attempt_identity=_attempt_tag(tag, sid, 1),
+                        attempt_deadline_seconds=float(per_scenario_timeout),
+                    ))
+
+                final_summary["attempts"] = attempts
+                final_summary["attempt_count"] = len(attempts)
+                final_summary["final_attempt"] = attempts[-1]["attempt"]
+                final_summary["raw_first_attempt_success"] = attempts[0].get("live_agentic_success") is True
+                final_summary["final_success"] = final_summary["guard"].get("live_agentic_success") is True
+                # S4: attempt-2 of the same timeout stays infra_timeout, never product.
+                _prior_infra_timeout = any(a.get("failure_class") == "infra_timeout" or (isinstance(a.get("model_attempts"), (list, tuple)) and any(isinstance(ma, dict) and ma.get("failure_type") == "timeout" for ma in a.get("model_attempts", []))) for a in attempts[:-1])
+                _final_is_timeoutish = (final_summary.get("failure_class") == "infra_timeout" or final_summary.get("failure_class") == "post_flow_exit_cleanup" or any(isinstance(ma, dict) and ma.get("failure_type") == "timeout" for ma in (final_summary.get("model_attempts") or [])) or final_summary.get("failure_kind") == "TimeoutError")
+                if _prior_infra_timeout and _final_is_timeoutish:
+                    final_summary["failure_class"] = "infra_timeout"
+                    final_summary["score_class"] = "infra_blocked"
+                    if isinstance(final_summary.get("guard"), dict):
+                        final_summary["guard"]["failure_class"] = "infra_timeout"
+                        final_summary["guard"]["score_class"] = "infra_blocked"
+                if final_summary["guard"].get("live_agentic_success") is True:
+                    final_summary.setdefault("failure_class", None)
+                else:
+                    final_summary.setdefault(
+                        "failure_class",
+                        attempts[-1].get("failure_class")
+                        or "product_or_assessment_failure",
+                    )
+                final_summary.setdefault(
+                    "score_class",
+                    attempts[-1].get("score_class") or (
+                        "pass"
+                        if final_summary["guard"].get("live_agentic_success") is True
+                        else "product_fail"
+                    ),
+                )
+                # Normalize recovered/legacy summaries at the persistence
+                # boundary too; a stale explicit product score must not mask
+                # the guard's undetermined verdict in durable truth.
+                final_summary["score_class"] = _score_class_from_summary(final_summary)
+                if (
+                    isinstance(final_summary.get("guard"), dict)
+                    and final_summary["guard"].get("verdict") == "undetermined"
+                ):
+                    final_summary["guard"]["score_class"] = "undetermined"
+                record_result(idx, final_summary)
+
+        threads = [
+            threading.Thread(target=worker, args=(i, p), daemon=True)
+            for i, p in enumerate(paths)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        for f in tmpdir.iterdir():
+            try:
+                if f.is_file():
+                    f.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            tmpdir.rmdir()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _persist_run_summary(
+        tag,
+        results,
+        output_base,
+        total_scenarios=len(paths),
+        complete=True,
+        transport=transport,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m tests.live_agentic_harness.runner")
+    parser.add_argument("--tag", default=None, help="Run tag (used in evidence path).")
+    parser.add_argument(
+        "--scenarios-dir",
+        default=None,
+        help="Directory containing scenario YAML/JSON files.",
+    )
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help=(
+            "Authoritative scenario manifest (default: scenario_manifest.json "
+            "beside the scenarios directory)."
+        ),
+    )
+    parser.add_argument(
+        "--output-base",
+        default=None,
+        help="Base evidence directory (default: out/agentic).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON summary instead of a short report.",
+    )
+    parser.add_argument(
+        "--single",
+        default=None,
+        help="Run a SINGLE scenario file (subprocess entry point for parallel mode).",
+    )
+    parser.add_argument(
+        "--single-out",
+        default=None,
+        help="Path to write the single-scenario summary JSON (used with --single).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=DEFAULT_MAX_WORKERS,
+        help=f"max concurrent scenarios (default {DEFAULT_MAX_WORKERS}).",
+    )
+    parser.add_argument(
+        "--per-scenario-timeout",
+        type=int,
+        default=DEFAULT_PER_SCENARIO_TIMEOUT,
+        help=f"per-scenario seconds before kill (default {DEFAULT_PER_SCENARIO_TIMEOUT}).",
+    )
+    parser.add_argument(
+        "--infra-retries",
+        type=int,
+        default=DEFAULT_INFRA_RETRIES,
+        help=(
+            "retry subprocess-level infrastructure failures this many times "
+            f"(default {DEFAULT_INFRA_RETRIES}, capped at {MAX_INFRA_RETRIES}; "
+            "semantic guard failures are not retried)"
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("openrouter", "native"),
+        default=None,
+        help=(
+            "Explicit model-call transport for every profile phase "
+            "(classify/research/implement/reply). When set, ambient "
+            "credentials/base URLs can never select the transport; the child "
+            "environment is pinned and this flag is forwarded to every "
+            "subprocess. Default: the canonical product route (openrouter), "
+            "pinned — never an ambient credential."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline-mode",
+        default=None,
+        choices=(None, "staged", "threaded"),
+        help="Executor pipeline mode (default staged). 'threaded' runs the single-session tool loop.",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        choices=(None, "baseline"),
+        help=(
+            "Executor lane selector. 'baseline' runs each scenario as ONE "
+            "tool-free model turn (problem + full fixture workflow JSON) "
+            "graded by the pinned judge — the no-tools counterpart of the "
+            "agentic lane, for paired tool-value measurement."
+        ),
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=DEFAULT_PROGRESS_EVERY,
+        help=(
+            "emit and persist aggregate progress every N completed scenarios "
+            f"(default {DEFAULT_PROGRESS_EVERY}; 0 disables stderr progress)"
+        ),
+    )
+    parser.add_argument(
+        "--prepare-failure-analysis",
+        action="store_true",
+        help="Write per-failed-scenario analysis briefs and index without calling subagents.",
+    )
+    parser.add_argument(
+        "--analyze-failures",
+        action="store_true",
+        help="After the run, launch one DeepSeek/Hermes diagnosis subagent per failed scenario.",
+    )
+    parser.add_argument(
+        "--analysis-model",
+        default=DEFAULT_ANALYSIS_MODEL,
+        help=f"Model for per-failure diagnosis agents (default {DEFAULT_ANALYSIS_MODEL}).",
+    )
+    parser.add_argument(
+        "--analysis-max-workers",
+        type=int,
+        default=DEFAULT_ANALYSIS_WORKERS,
+        help=f"Maximum concurrent failure diagnosis agents (default {DEFAULT_ANALYSIS_WORKERS}).",
+    )
+    parser.add_argument(
+        "--analysis-timeout",
+        type=int,
+        default=DEFAULT_AGENT_TIMEOUT_S,
+        help=f"Seconds before killing one failure diagnosis agent (default {DEFAULT_AGENT_TIMEOUT_S}).",
+    )
+    parser.add_argument(
+        "--restart-failure-analysis",
+        action="store_true",
+        help="Rerun every failed-scenario diagnosis, including ones already marked done.",
+    )
+    parser.add_argument(
+        "--recommend-fixes",
+        action="store_true",
+        help="Use Codex/GPT-5.5 to synthesize all failure diagnoses into ranked fix recommendations.",
+    )
+    parser.add_argument(
+        "--recommendations-model",
+        default=DEFAULT_RECOMMENDATIONS_MODEL,
+        help=f"Model for aggregate fix recommendations (default {DEFAULT_RECOMMENDATIONS_MODEL}).",
+    )
+    parser.add_argument(
+        "--recommendations-timeout",
+        type=int,
+        default=DEFAULT_AGENT_TIMEOUT_S,
+        help=f"Seconds before killing aggregate recommendations (default {DEFAULT_AGENT_TIMEOUT_S}).",
+    )
+    parser.add_argument(
+        "--analyze-existing-summary",
+        default=None,
+        help=(
+            "Analyze an existing run_summary.json or redirected summary JSON instead of running scenarios."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    scenarios_dir = Path(args.scenarios_dir) if args.scenarios_dir else Path(__file__).with_name("scenarios")
+
+    if args.analyze_existing_summary:
+        analysis = _run_failure_analysis_from_summary(
+            Path(args.analyze_existing_summary),
+            scenarios_dir=scenarios_dir,
+            analyze_failures_enabled=args.analyze_failures,
+            prepare_only=args.prepare_failure_analysis
+            or not (args.analyze_failures or args.recommend_fixes),
+            recommend_fixes=args.recommend_fixes,
+            analysis_model=args.analysis_model,
+            analysis_max_workers=args.analysis_max_workers,
+            analysis_timeout=args.analysis_timeout,
+            resume_failure_analysis=not args.restart_failure_analysis,
+            recommendations_model=args.recommendations_model,
+            recommendations_timeout=args.recommendations_timeout,
+        )
+        print(json.dumps({"failure_analysis": analysis}, indent=2, default=str))
+        return 0
+
+    if not args.tag:
+        parser.error("--tag is required unless --analyze-existing-summary is used")
+
+    if args.single:
+        out_file = Path(args.single_out) if args.single_out else None
+        ob = Path(args.output_base) if args.output_base else None
+        summary = run_single(args.single, args.tag, ob, out_file, transport=args.transport, profile=args.profile)
+        # Compact one-line stdout for liveness; the real payload is in --single-out.
+        print(json.dumps({"scenario_id": summary.get("scenario_id"),
+                          "ok": summary["guard"]["live_agentic_success"]}))
+        return 0 if summary["guard"]["live_agentic_success"] else 1
+
+    output_base = Path(args.output_base) if args.output_base else None
+    summary = run_tag(
+        args.tag,
+        scenarios_dir=scenarios_dir,
+        output_base=output_base,
+        max_workers=args.max_workers,
+        per_scenario_timeout=args.per_scenario_timeout,
+        progress_every=args.progress_every,
+        infra_retries=args.infra_retries,
+        manifest_path=Path(args.manifest) if args.manifest else None,
+        transport=args.transport,
+        profile=args.profile,
+        pipeline_mode=args.pipeline_mode,
+    )
+    if args.prepare_failure_analysis or args.analyze_failures or args.recommend_fixes:
+        run_summary_path = _run_dir_for(output_base, summary["tag"]) / "run_summary.json"
+        analysis = _run_failure_analysis_from_summary(
+            run_summary_path,
+            scenarios_dir=scenarios_dir,
+            analyze_failures_enabled=args.analyze_failures,
+            prepare_only=args.prepare_failure_analysis,
+            recommend_fixes=args.recommend_fixes,
+            analysis_model=args.analysis_model,
+            analysis_max_workers=args.analysis_max_workers,
+            analysis_timeout=args.analysis_timeout,
+            resume_failure_analysis=not args.restart_failure_analysis,
+            recommendations_model=args.recommendations_model,
+            recommendations_timeout=args.recommendations_timeout,
+        )
+        summary["failure_analysis"] = analysis
+
+    if args.json:
+        print(json.dumps(summary, indent=2, default=str))
+    else:
+        print(f"tag: {summary['tag']}")
+        print(f"scenarios: {summary['scenario_count']}")
+        print(f"score: {summary['passed']}/{summary['scenario_count']}")
+        print(
+            f"raw_first_attempt_score: "
+            f"{summary['raw_first_attempt_passed']}/{summary['scenario_count']}"
+        )
+        print(f"infra_failures: {summary['infra_failures']}")
+        print(f"product_or_assessment_failures: {summary['product_or_assessment_failures']}")
+        print(f"overall_success: {summary['overall_success']}")
+        for s in summary["scenarios"]:
+            assessment = s["guard"].get("assessment", {})
+            errors = assessment.get("error_count", 0)
+            print(
+                f"  {s['scenario_id']}: {s['status']} "
+                f"(live_agentic_success={s['guard']['live_agentic_success']}, "
+                f"assessment_errors={errors})"
+            )
+
+    return 0 if summary["overall_success"] or summary["scenario_count"] == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

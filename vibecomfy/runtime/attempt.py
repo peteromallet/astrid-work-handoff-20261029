@@ -1,0 +1,393 @@
+"""Attempt bundle builder — written before every queue boundary.
+
+Provides :func:`build_attempt_bundle` which collects the full pre-queue
+snapshot (prompt, id map, node lookups, model manifest, lockfile, version
+info, drift block) and atomically writes ``attempt.json`` into the run
+directory.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from pathlib import Path
+from typing import Any, Mapping
+
+from vibecomfy.utils import atomic_write_json
+from vibecomfy.workflow import VibeWorkflow
+from vibecomfy.workflow_bundle import ApprovedProjectionRecord, WorkflowBundle
+
+logger = logging.getLogger(__name__)
+
+
+def _collect_drift_for_bundle(workflow: VibeWorkflow) -> dict[str, Any]:
+    """Collect drift data for the attempt bundle (import-on-use to avoid
+    circular imports)."""
+    from vibecomfy.runtime.drift import collect_drift as _collect
+
+    return _collect(workflow)
+
+
+def build_attempt_bundle(
+    bundle: WorkflowBundle,
+    record: ApprovedProjectionRecord,
+    *,
+    backend: str,
+    config: Any = None,
+    adapter_kind: str | None = None,
+    adapter_endpoint: str | None = None,
+    schema_provenance: Mapping[str, Any] | None = None,
+    runtime_evidence: Mapping[str, Any] | None = None,
+    runtime_compatibility: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect the pre-queue attempt snapshot.
+
+    Parameters:
+        bundle:
+            The canonical source bundle whose approved revision is queued.
+        record:
+            The detached, immutable projection approved for this run.
+        backend:
+            Compilation backend used  (``"api"`` / ``"graphbuilder"``).
+        config:
+            Optional :class:`~vibecomfy.runtime.session.SessionConfig` for
+            model-root resolution (used when computing *actual_sha256*).
+        adapter_kind / adapter_endpoint:
+            Operational transport identity; never part of the approved
+            projection authority.
+        schema_provenance:
+            Operational object-info/cache validation evidence.
+    """
+    if not isinstance(bundle, WorkflowBundle) or not isinstance(record, ApprovedProjectionRecord):
+        raise TypeError("attempt evidence requires an ApprovedProjectionRecord and WorkflowBundle")
+    workflow = bundle.workflow
+    approved = record.to_dict()
+    api_dict = approved["api_projection"]
+
+    from vibecomfy.comfy_nodes.agent.audit import (
+        redact_audit_metadata,
+        runtime_intent_metadata_from_api,
+    )
+
+    redaction_categories: set[str] = set()
+
+    # --- compiled_prompt ----------------------------------------------------
+    compiled_redacted = redact_audit_metadata(dict(api_dict))
+    redaction_categories.update(compiled_redacted.categories)
+    compiled_prompt: dict[str, Any] = compiled_redacted.value if isinstance(compiled_redacted.value, dict) else {}
+
+    # --- id_map --------------------------------------------------------------
+    id_map: dict[str, str] = workflow.id_map()
+
+    # --- full node reverse-lookup map ---------------------------------------
+    node_lookups: dict[str, dict[str, Any]] = {}
+    for node_id in workflow.nodes:
+        redacted_lookup = redact_audit_metadata(workflow.lookup_id(node_id))
+        redaction_categories.update(redacted_lookup.categories)
+        node_lookups[str(node_id)] = redacted_lookup.value if isinstance(redacted_lookup.value, dict) else {}
+
+    # --- source_workflow metadata -------------------------------------------
+    source_redacted = redact_audit_metadata(dict(workflow.metadata) if isinstance(workflow.metadata, dict) else {})
+    redaction_categories.update(source_redacted.categories)
+    source_workflow: dict[str, Any] = source_redacted.value if isinstance(source_redacted.value, dict) else {}
+
+    # --- runtime-backed intent metadata -------------------------------------
+    runtime_intent_nodes = runtime_intent_metadata_from_api(api_dict)
+    if runtime_intent_nodes:
+        redaction_categories.add("runtime_source")
+
+    # --- model asset manifest -----------------------------------------------
+    model_manifest = _build_model_manifest(workflow, config=config)
+
+    # --- lockfile snapshot --------------------------------------------------
+    lockfile_snapshot = _read_lockfile_snapshot(config=config)
+
+    # --- runtime version ----------------------------------------------------
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        runtime_version: str | None = _pkg_version("vibecomfy")
+    except Exception:
+        runtime_version = None
+
+    # --- Comfy commit -------------------------------------------------------
+    comfy_commit: str | None = None
+    if isinstance(workflow.metadata, dict):
+        raw = workflow.metadata.get("comfy_commit")
+        if isinstance(raw, str) and raw:
+            comfy_commit = raw
+
+    # --- runtime dependency declaration and target comparison ---------------
+    from vibecomfy.runtime.dependencies import (
+        compare_runtime,
+        inspect_external_runtime,
+        runtime_requirements_from_workflow,
+    )
+    runtime_requirements = runtime_requirements_from_workflow(workflow)
+    runtime_report = (
+        dict(runtime_compatibility)
+        if runtime_compatibility is not None
+        else compare_runtime(
+            runtime_requirements,
+            target=inspect_external_runtime(adapter_endpoint)
+            if adapter_kind == "external" and adapter_endpoint else None,
+            runtime_root=None if adapter_kind == "external" else getattr(config, "runtime_root", None),
+        )
+    )
+    # A remote receipt must not embed a second, contradictory comparison
+    # against the CLI's installed packages/git checkout in its drift block.
+    if adapter_kind == "external":
+        drift: dict[str, Any] = {
+            "scope": "external_server", "status": "unverified",
+            "pinned": {"custom_node_packs": list(workflow.requirements.custom_nodes)},
+            "actual": {}, "mismatches": [], "runtime": runtime_report,
+        }
+        comfy_commit = runtime_report.get("actual", {}).get("comfy_commit")
+    else:
+        drift = _collect_drift_for_bundle(workflow)
+
+    result = {
+        "adapter": {
+            "kind": adapter_kind,
+            "backend": backend,
+            "endpoint": adapter_endpoint,
+        },
+        "schema_provenance": dict(schema_provenance or {}),
+        "compiled_prompt": compiled_prompt,
+        "id_map": id_map,
+        "node_lookups": node_lookups,
+        "source_workflow": source_workflow,
+        "runtime_intent_nodes": runtime_intent_nodes,
+        "redactions": sorted(redaction_categories),
+        "model_manifest": model_manifest,
+        "lockfile_snapshot": lockfile_snapshot,
+        "runtime_version": runtime_version,
+        "comfy_commit": comfy_commit,
+        "drift": drift,
+    }
+    if runtime_requirements is not None:
+        result["runtime_requirements"] = runtime_requirements.to_dict()
+        result["runtime_compatibility"] = runtime_report
+    if runtime_evidence is not None:
+        result["runtime_evidence"] = dict(runtime_evidence)
+    if config is not None:
+        extra = getattr(config, "extra", {})
+        if isinstance(extra, Mapping) and isinstance(extra.get("dependency_deviation"), Mapping):
+            # This is deliberately attempt evidence only.  The canonical
+            # requirements and the compatibility report remain unchanged.
+            result["dependency_deviation"] = dict(extra["dependency_deviation"])
+    return result
+
+
+def write_attempt_json(
+    run_dir: Path,
+    bundle: dict[str, Any],
+) -> Path:
+    """Atomically write *bundle* to ``<run_dir>/attempt.json``."""
+    return atomic_write_json(run_dir / "attempt.json", bundle)
+
+
+def _build_model_manifest(
+    workflow: VibeWorkflow,
+    *,
+    config: Any = None,
+) -> list[dict[str, Any]]:
+    """Build the model manifest with *expected_sha256* and *actual_sha256*.
+
+    Uses :func:`~vibecomfy.model_assets.resolve_referenced_assets` directly
+    (not ``_model_assets_from_workflow``, which raises on unresolved assets).
+    Missing files record ``actual_sha256: null`` per SD2.
+    """
+    from vibecomfy.model_assets import resolve_referenced_assets
+
+    try:
+        resolved, unresolved = resolve_referenced_assets(workflow)
+    except Exception:
+        logger.debug("model_assets.resolve_referenced_assets failed; manifest will be empty", exc_info=True)
+        resolved, unresolved = [], []
+
+    manifest: list[dict[str, Any]] = []
+    for asset in resolved:
+        entry: dict[str, Any] = {
+            "name": asset.get("name"),
+            "subdir": asset.get("subdir"),
+            "url": asset.get("url"),
+            "expected_sha256": asset.get("sha256"),
+            "actual_sha256": _compute_actual_sha256(asset, config=config),
+        }
+        if "target_path" in asset:
+            entry["target_path"] = asset["target_path"]
+        if asset.get("size_bytes") is not None:
+            entry["size_bytes"] = asset["size_bytes"]
+        if asset.get("hf_revision"):
+            entry["hf_revision"] = asset["hf_revision"]
+        for key in ("node_id", "class_type", "field", "value", "reference_type", "downloadable"):
+            if key in asset:
+                entry[key] = asset[key]
+        manifest.append(entry)
+
+    # Also include unresolved entries so the manifest is complete
+    for ref in unresolved:
+        manifest.append(
+            {
+                "name": ref.get("value"),
+                "subdir": ref.get("subdir"),
+                "node_id": ref.get("node_id"),
+                "class_type": ref.get("class_type"),
+                "field": ref.get("field"),
+                "value": ref.get("value"),
+                "reference_type": ref.get("reference_type"),
+                "downloadable": ref.get("downloadable", False),
+                "expected_sha256": None,
+                "actual_sha256": None,
+                "unresolved": True,
+            }
+        )
+
+    return manifest
+
+
+def _compute_actual_sha256(asset: dict[str, Any], *, config: Any = None) -> str | None:
+    """Compute the SHA-256 of the file on disk referenced by *asset*.
+
+    Returns ``None`` when the file is missing (SD2).
+    """
+    name = asset.get("name")
+    subdir = asset.get("subdir")
+    if not isinstance(name, str) or not isinstance(subdir, str):
+        return None
+
+    # Use the fetch owner's two-root resolver so custom-node target_path
+    # assets do not drift back under models_root/subdir/name.
+    from vibecomfy.runtime.model_policy import normalized_models_root
+    from vibecomfy.fetch import local_path
+
+    configured_root: Any = None
+    configured_root_present = False
+    if isinstance(config, dict):
+        configured_root_present = "models_root_normalized" in config or "models_root" in config
+        configured_root = config.get("models_root_normalized", config.get("models_root"))
+    elif config is not None:
+        extra = getattr(config, "extra", {})
+        if isinstance(extra, dict):
+            configured_root_present = "models_root_normalized" in extra or "models_root" in extra
+            configured_root = extra.get("models_root_normalized", extra.get("models_root"))
+    if configured_root_present and (
+        not isinstance(configured_root, (str, Path)) or not str(configured_root).strip()
+    ):
+        return None
+    try:
+        models_root = Path(normalized_models_root(configured_root if configured_root_present else None))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    try:
+        candidate_path = local_path(asset, root=models_root)
+    except (KeyError, ValueError, OSError):
+        return None
+    if not candidate_path.is_file():
+        return None
+
+    try:
+        expected_sha = asset.get("sha256")
+        if isinstance(expected_sha, str) and expected_sha and asset.get("gated") is not True:
+            # Reuse the same durable verification receipt as model preflight.
+            # This metadata path runs both before queueing and after completion;
+            # direct hashing here used to read every large model repeatedly.
+            from vibecomfy import fetch as fetch_assets
+
+            try:
+                fetch_assets.verify(asset, candidate_path, root=models_root)
+                return expected_sha.lower()
+            except (OSError, RuntimeError):
+                # Preserve the historical metadata behavior for an invalid or
+                # changing file: record the actual digest instead of masking it
+                # behind a verification exception.
+                pass
+        sha = hashlib.sha256()
+        with open(candidate_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                sha.update(chunk)
+        return sha.hexdigest()
+    except OSError:
+        return None
+
+
+def _read_lockfile_snapshot(*, config: Any = None) -> dict[str, Any] | None:
+    """Return a JSON-safe semantic snapshot of ``custom_nodes.lock``.
+
+    The lockfile is allowed to be either the legacy three-column format or
+    the current TOML format.  Keep the snapshot shape stable for artifact
+    consumers by exposing the entries under a ``nodepacks`` mapping.
+    """
+    configured = getattr(config, "extra", {}).get("lockfile") if config is not None else None
+    from vibecomfy.node_packs import resolve_lockfile_path
+
+    lockfile_path = resolve_lockfile_path(configured)
+    if not lockfile_path.is_file():
+        return None
+    try:
+        from vibecomfy.node_packs import read_lockfile
+
+        entries = read_lockfile(lockfile_path)
+        if not entries:
+            return {"nodepacks": {}}
+        nodepacks: dict[str, Any] = {}
+        for entry in entries:
+            item: dict[str, Any] = {
+                "name": entry.name,
+                "slug": entry.slug,
+                "source": entry.source,
+            }
+            for field in (
+                "version", "commit", "git_commit_sha", "url", "path",
+                "schema_hash", "semantic_label", "class_schema_sha256", "last_seen_at",
+            ):
+                value = getattr(entry, field, None)
+                if value is not None:
+                    item[field] = value
+            if entry.class_set:
+                item["class_set"] = list(entry.class_set)
+            if entry.pip_packages:
+                item["pip_packages"] = list(entry.pip_packages)
+            if entry.source_sha256:
+                item["source_sha256"] = dict(entry.source_sha256)
+            nodepacks[entry.name] = item
+        return {"nodepacks": nodepacks}
+    except (OSError, ValueError, TypeError):
+        logger.debug("Failed to read lockfile snapshot", exc_info=True)
+        return None
+
+
+def build_shared_fields(
+    bundle: WorkflowBundle,
+    record: ApprovedProjectionRecord,
+    *,
+    config: Any = None,
+    adapter_kind: str | None = None,
+    adapter_endpoint: str | None = None,
+    runtime_compatibility: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract the fields shared between *attempt.json* and *metadata.json*.
+
+    This is a lightweight subset so ``_run_metadata`` can reuse the same
+    derivation without duplicating logic.
+    """
+    evidence = build_attempt_bundle(
+        bundle, record, backend="api", config=config,
+        adapter_kind=adapter_kind, adapter_endpoint=adapter_endpoint,
+        runtime_compatibility=runtime_compatibility,
+    )
+    return {
+        "compiled_prompt": evidence["compiled_prompt"],
+        "id_map": evidence["id_map"],
+        "node_lookups": evidence["node_lookups"],
+        "source_workflow": evidence["source_workflow"],
+        "runtime_intent_nodes": evidence["runtime_intent_nodes"],
+        "redactions": evidence["redactions"],
+        "model_manifest": evidence["model_manifest"],
+        "lockfile_snapshot": evidence["lockfile_snapshot"],
+        "runtime_version": evidence["runtime_version"],
+        "comfy_commit": evidence["comfy_commit"],
+        "drift": evidence["drift"],
+    }

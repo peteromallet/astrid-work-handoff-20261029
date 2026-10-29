@@ -1,0 +1,39 @@
+{
+  "id": "video-image-to-video-conversion-with-moonvalley-d7853c",
+  "query": "Reduce the Moonvalley image-to-video generation steps from 100 to 80 for a faster preview. Keep prompt adherence at 7, and leave the prompt, resolution, image input, and SaveVideo connection unchanged.",
+  "workflow_path": "tests/fixtures/live_agentic_corpus/corpus/d7853cd7421f9ebc.json",
+  "network": true,
+  "timeout": 280,
+  "apply": true,
+  "assessment": {
+    "expect_graph_changed": true
+  },
+  "desired": {
+    "outcome": "The Moonvalley node uses 80 generation steps for a faster preview.",
+    "quality": "Only the generation-step count changes from 100 to 80; prompt adherence remains 7 and the image input, prompt, 16:9 resolution, seed controls, and SaveVideo wiring remain intact.",
+    "alternatives_ok": false
+  },
+  "_tags": {
+    "modality": "video",
+    "query_type": "edit",
+    "abstraction": "low",
+    "complexity": "low",
+    "manifest_complexity": 1,
+    "task_type": "other",
+    "requires_custom_nodes": true,
+    "techniques": [
+      "image-to-video",
+      "moonvalley",
+      "video-generation",
+      "custom-node"
+    ],
+    "source_workflow_id": "d7853cd7421f9ebc",
+    "source": "external_workflows/corpus",
+    "staged": true,
+    "authored_by": "deepseek-v4-flash",
+    "author_rationale": "A simple, concrete parameter edit that requires reasoning about frame count vs. fps to hit a target duration."
+  },
+  "classification": {
+    "kind": "edit"
+  }
+}

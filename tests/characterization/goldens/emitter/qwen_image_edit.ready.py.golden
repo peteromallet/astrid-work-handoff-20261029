@@ -1,0 +1,113 @@
+# vibecomfy: generated
+# For hand-editing, run: python -m vibecomfy.cli copy-to-recipe <id>
+# vibecomfy: surface=canonical
+"""Auto-generated ready_template — use python -m vibecomfy.cli copy-to-recipe <id> for hand-editing."""
+from __future__ import annotations
+
+from vibecomfy.templates import InputSpec, OutputSpec, ReadyMetadata, new_workflow, ref
+from vibecomfy.workflow import VibeWorkflow
+from vibecomfy.nodes.core import CFGNorm, CLIPLoader, ComfySwitchNode, KSampler, LoadImage, LoraLoaderModelOnly, ModelSamplingAuraFlow, SaveImage, TextEncodeQwenImageEdit, UNETLoader, VAEDecode, VAEEncode, VAELoader
+
+
+CLIP_NAME = 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
+DEFAULT_PROMPT = 'Remove all UI text elements from the image. Keep the feeling that the characters and scene are in water. Also, remove the green UI elements at the bottom.'
+DEFAULT_SEED = 344147753686358
+LORA_NAME = 'Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors'
+UNET_NAME = 'qwen_image_edit_fp8_e4m3fn.safetensors'
+VAE_NAME = 'qwen_image_vae.safetensors'
+DEFAULT_IMAGE = 'image_qwen_image_edit_input_image.png'
+
+
+PUBLIC_INPUT_METADATA = {
+    'model': InputSpec(node=ref('unetloader'), field='unet_name', default=None, infer_type=False),
+    'prompt': InputSpec(node=ref('textencodeqwenimageedit'), field='prompt', default=None, infer_type=False),
+    'seed': InputSpec(node=ref('ksampler'), field='seed', default=None, infer_type=False),
+    'image': InputSpec(node=ref('loadimage'), field='image', default=DEFAULT_IMAGE, type='IMAGE', required=True, aliases=('input_image',), media_semantics='image', infer_type=False),
+}
+
+
+READY_METADATA = ReadyMetadata.build(
+    capability='image',
+    template_id='edit/qwen_image_edit',
+    inputs=PUBLIC_INPUT_METADATA,
+    requirements={'models': ['Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors', 'qwen_2.5_vl_7b_fp8_scaled.safetensors', 'qwen_image_edit_fp8_e4m3fn.safetensors', 'qwen_image_vae.safetensors']},
+    source_path='ready_templates/sources/official/edit/qwen_image_edit.json',
+    source_id='edit/qwen_image_edit',
+    upstream_source_id='qwen_image_edit',
+    source_type='api',
+    source_workflow_path='ready_templates/sources/official/edit/qwen_image_edit.json',
+    output_mode='ready_template',
+    ready_id='edit/qwen_image_edit',
+    provenance={'source_path': 'ready_templates/sources/official/edit/qwen_image_edit.json', 'source_id': 'edit/qwen_image_edit', 'upstream_source_id': 'qwen_image_edit', 'source_type': 'api', 'source_workflow_path': 'ready_templates/sources/official/edit/qwen_image_edit.json', 'output_mode': 'ready_template', 'ready_id': 'edit/qwen_image_edit', 'source_workflow': 'ready_templates/sources/official/edit/qwen_image_edit.json'},
+)
+
+def build() -> VibeWorkflow:
+    """Build the workflow (auto-generated)."""
+    with new_workflow(READY_METADATA, source_path=__file__) as wf:
+
+        # Loaders
+        unetloader = UNETLoader(unet_name=UNET_NAME)
+        cliploader = CLIPLoader(clip_name=CLIP_NAME, type='qwen_image')
+        vaeloader = VAELoader(vae_name=VAE_NAME)
+        comfyswitchnode_2 = ComfySwitchNode(switch=False)
+        comfyswitchnode_3 = ComfySwitchNode(switch=False)
+
+        # Inputs
+        loadimage = LoadImage(image=DEFAULT_IMAGE)
+
+        textencodeqwenimageedit = TextEncodeQwenImageEdit(
+            prompt=DEFAULT_PROMPT,
+            clip=cliploader.out('CLIP'),
+            image=loadimage.out('IMAGE'),
+            vae=vaeloader.out('VAE'),
+        )
+
+        textencodeqwenimageedit_2 = TextEncodeQwenImageEdit(
+            prompt='',
+            clip=cliploader.out('CLIP'),
+            image=loadimage.out('IMAGE'),
+            vae=vaeloader.out('VAE'),
+        )
+
+        vaeencode = VAEEncode(pixels=loadimage.out('IMAGE'), vae=vaeloader.out('VAE'))
+
+        loraloadermodelonly = LoraLoaderModelOnly(
+            lora_name=LORA_NAME,
+            model=unetloader.out('MODEL'),
+        )
+
+        comfyswitchnode = ComfySwitchNode(
+            switch=False,
+            on_false=unetloader.out('MODEL'),
+            on_true=loraloadermodelonly.out('MODEL'),
+        )
+
+        modelsamplingauraflow = ModelSamplingAuraFlow(
+            shift=3,
+            model=comfyswitchnode.out('OUTPUT'),
+        )
+
+        cfgnorm = CFGNorm(widget_0=1, model=modelsamplingauraflow.out('MODEL'))
+
+        # Sampling
+        ksampler = KSampler(
+            seed=DEFAULT_SEED,
+            sampler_name='euler',
+            steps=comfyswitchnode_3.out('OUTPUT'),
+            cfg=comfyswitchnode_2.out('OUTPUT'),
+            latent_image=vaeencode.out('LATENT'),
+            model=cfgnorm.out('PATCHED_MODEL'),
+            negative=textencodeqwenimageedit_2.out('CONDITIONING'),
+            positive=textencodeqwenimageedit.out('CONDITIONING'),
+        )
+
+        # Decode
+        vaedecode = VAEDecode(samples=ksampler.out('LATENT'), vae=vaeloader.out('VAE'))
+
+        # Outputs
+        saveimage = SaveImage(images=vaedecode.out('IMAGE'))
+
+        wf = wf.finalize(PUBLIC_INPUT_METADATA, outputs=[OutputSpec(node=saveimage, output_type='SaveImage', name='image', artifact_kind='image', mime_type='image/png', filename_prefix='ComfyUI', expected_cardinality='one')])
+        wf.strict_types = False
+        return wf
+
