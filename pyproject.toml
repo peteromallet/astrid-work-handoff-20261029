@@ -1,0 +1,93 @@
+[project]
+name = "runpod"
+dynamic = ["version", "dependencies"]
+description = "🐍 | Python library for Runpod API and serverless worker SDK."
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = { text = "MIT License" }
+authors = [
+    { name = "Runpod", email = "engineer@runpod.io" },
+]
+keywords = [
+    "runpod",
+    "ai",
+    "gpu",
+    "serverless",
+    "SDK",
+    "API",
+    "python",
+    "library",
+]
+classifiers = [
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+]
+
+[project.urls]
+Homepage = "https://runpod.io"
+Documentation = "https://docs.runpod.io"
+Repository = "https://github.com/runpod/runpod-python"
+Changelog = "https://github.com/runpod/runpod-python/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/runpod/runpod-python/issues"
+
+
+[tool.setuptools.packages.find]
+include = ["runpod*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+runpod = [
+    "serverless/binaries/gpu_test",
+    "serverless/binaries/README.md",
+]
+
+[tool.setuptools_scm]
+version_file = "runpod/_version.py"
+local_scheme = "no-local-version"
+
+
+[project.scripts]
+runpod = "runpod.cli.entry:runpod_cli"
+
+
+[dependency-groups]
+dev = [
+    "build>=1.2.2.post1",
+    "twine>=6.1.0",
+]
+test = [
+    "asynctest",
+    "faker",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-timeout",
+    "pytest-watch",
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# Used by pytest coverage
+[tool.coverage.run]
+omit = [
+    "runpod/_version.py",
+    "runpod/serverless/binaries/*",
+]

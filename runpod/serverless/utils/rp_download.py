@@ -1,0 +1,180 @@
+"""
+PodWorker | modules | download.py
+
+Called when inputs are images or zip files.
+Downloads them into a temporary directory called "input_objects".
+This directory is cleaned up after the job is complete.
+"""
+
+import os
+import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Union, Dict
+from urllib.parse import urlparse
+
+import backoff
+from requests import RequestException
+
+from runpod.serverless.utils.rp_ssrf import (
+    iter_content_capped,
+    max_download_bytes,
+    safe_get,
+)
+
+HEADERS = {"User-Agent": "runpod-python/0.0.0 (https://runpod.io; support@runpod.io)"}
+
+
+def calculate_chunk_size(file_size: int) -> int:
+    """
+    Calculates the chunk size based on the file size.
+    """
+    if file_size <= 1024 * 1024:  # 1 MB
+        return 1024  # 1 KB
+    if file_size <= 1024 * 1024 * 1024:  # 1 GB
+        return 1024 * 1024  # 1 MB
+
+    return 1024 * 1024 * 10  # 10 MB
+
+
+def parse_content_length(headers) -> int:
+    """
+    Reads Content-Length for chunk sizing, tolerating a missing or malformed value.
+
+    The header is remote-controlled, so a non-integer value must not abort an
+    otherwise valid download; 0 simply yields the smallest chunk size. The real
+    size limit is enforced while streaming by iter_content_capped().
+    """
+    try:
+        return int(headers.get("Content-Length", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_disposition_params(content_disposition: str) -> Dict[str, str]:
+    parts = (p.strip() for p in content_disposition.split(";"))
+
+    params = {
+        key.strip().lower(): value.strip().strip('"')
+        for part in parts
+        if "=" in part
+        for key, value in [part.split("=", 1)]
+    }
+
+    return params
+
+
+def download_files_from_urls(job_id: str, urls: Union[str, List[str]]) -> List[str]:
+    """
+    Accepts a single URL or a list of URLs and downloads the files.
+    Returns the list of downloaded file absolute paths.
+    Saves the files in a directory called "downloaded_files" in the job directory.
+    """
+    download_directory = os.path.abspath(os.path.join("jobs", job_id, "downloaded_files"))
+    os.makedirs(download_directory, exist_ok=True)
+
+    @backoff.on_exception(backoff.expo, RequestException, max_tries=3)
+    def download_file(url: str, path_to_save: str) -> str:
+        with safe_get(url, stream=True, timeout=5, headers=HEADERS) as response:
+            response.raise_for_status()
+            content_disposition = response.headers.get("Content-Disposition")
+            file_extension = ""
+            if content_disposition:
+                params = extract_disposition_params(content_disposition)
+                file_extension = os.path.splitext(params.get("filename", ""))[1]
+
+            # If no extension could be determined from 'Content-Disposition', get it from the URL
+            if not file_extension:
+                file_extension = os.path.splitext(urlparse(url).path)[1]
+
+            chunk_size = calculate_chunk_size(parse_content_length(response.headers))
+
+            # write the content in chunks to the file, aborting past the size cap
+            with open(path_to_save + file_extension, "wb") as file_path:
+                for chunk in iter_content_capped(response, chunk_size, max_download_bytes()):
+                    file_path.write(chunk)
+
+            return file_extension
+
+    def download_file_to_path(url: str) -> str:
+        if url is None:
+            return None
+
+        file_name = f"{uuid.uuid4()}"
+        output_file_path = os.path.join(download_directory, file_name)
+
+        try:
+            file_extension = download_file(url, output_file_path)
+        except RequestException as err:
+            print(f"Failed to download {url}: {err}")
+            return None
+
+        return os.path.abspath(f"{output_file_path}{file_extension}")
+
+    if isinstance(urls, str):
+        urls = [urls]
+
+    with ThreadPoolExecutor() as executor:
+        downloaded_files = list(executor.map(download_file_to_path, urls))
+
+    return downloaded_files
+
+
+def file(file_url: str) -> dict:
+    """
+    Downloads a single file from a given URL, file is given a random name.
+    First checks if the content-disposition header is set, if so, uses the file name from there.
+    If the file is a zip file, it is extracted into a directory with the same name.
+
+    Returns an object that contains:
+    - The absolute path to the downloaded file
+    - File type
+    - Original file name
+    """
+    os.makedirs("job_files", exist_ok=True)
+
+    with safe_get(file_url, stream=True, timeout=30, headers=HEADERS) as download_response:
+        # Fail on an error response rather than saving the error page as the
+        # file; for a .zip that body would go straight to the extractor.
+        download_response.raise_for_status()
+
+        content_disposition = download_response.headers.get("Content-Disposition")
+
+        original_file_name = ""
+        if content_disposition:
+            params = extract_disposition_params(content_disposition)
+
+            original_file_name = params.get("filename", "")
+
+        if not original_file_name:
+            download_path = urlparse(file_url).path
+            original_file_name = os.path.basename(download_path)
+
+        file_type = os.path.splitext(original_file_name)[1].replace(".", "")
+
+        file_name = f"{uuid.uuid4()}"
+
+        output_file_path = os.path.join("job_files", f"{file_name}.{file_type}")
+
+        # Stream to disk in chunks (aborting past the size cap) instead of
+        # buffering the entire untrusted body in memory.
+        chunk_size = calculate_chunk_size(parse_content_length(download_response.headers))
+        with open(output_file_path, "wb") as output_file:
+            for chunk in iter_content_capped(download_response, chunk_size, max_download_bytes()):
+                output_file.write(chunk)
+
+    if file_type == "zip":
+        unzipped_directory = os.path.join("job_files", file_name)
+        os.makedirs(unzipped_directory, exist_ok=True)
+        with zipfile.ZipFile(output_file_path, "r") as zip_ref:
+            zip_ref.extractall(unzipped_directory)
+        unzipped_directory = os.path.abspath(unzipped_directory)
+    else:
+        unzipped_directory = None
+
+    return {
+        "file_path": os.path.abspath(output_file_path),
+        "type": file_type,
+        "original_name": original_file_name,
+        "extracted_path": unzipped_directory,
+    }

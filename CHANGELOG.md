@@ -1,0 +1,574 @@
+# Changelog
+
+## [1.12.0](https://github.com/runpod/runpod-python/compare/v1.11.0...v1.12.0) (2026-08-10)
+
+
+### Features
+
+* **serverless:** network-volume warm cache (VolumeCache) with adaptive transport ([#538](https://github.com/runpod/runpod-python/issues/538)) ([7aee321](https://github.com/runpod/runpod-python/commit/7aee321583c479d45c1a88607d3f73a273dbbf1c))
+* SLS-389: add batch ID to log messages ([#562](https://github.com/runpod/runpod-python/issues/562)) ([799479f](https://github.com/runpod/runpod-python/commit/799479f6adb5e399ce0d9eb999f1faf8053f8654))
+
+
+### Bug Fixes
+
+* **serverless:** block SSRF in job-input downloads ([#533](https://github.com/runpod/runpod-python/issues/533)) ([b510d2a](https://github.com/runpod/runpod-python/commit/b510d2a989e6ce17c7316c333697754da6d99f5e))
+
+## [1.11.0](https://github.com/runpod/runpod-python/compare/v1.10.1...v1.11.0) (2026-07-21)
+
+
+### Features
+
+* **serverless:** report fitness failure to host before force-exit ([#537](https://github.com/runpod/runpod-python/issues/537)) ([f95aef8](https://github.com/runpod/runpod-python/commit/f95aef892f673875f2cc9801e440486c40b1bc48))
+
+
+### Bug Fixes
+
+* **serverless:** force-kill worker on fitness check failure ([#536](https://github.com/runpod/runpod-python/issues/536)) ([08e07cb](https://github.com/runpod/runpod-python/commit/08e07cb5dded275b1bab0451940433fe2a1c8244))
+
+## [1.10.1](https://github.com/runpod/runpod-python/compare/v1.10.0...v1.10.1) (2026-07-08)
+
+
+### Bug Fixes
+
+* stop funneling all jobs to one worker (JobsProgress shared state) ([#517](https://github.com/runpod/runpod-python/issues/517)) ([6c2cd64](https://github.com/runpod/runpod-python/commit/6c2cd64bb8efa2dd1c5294946ab809ba1d25f29b))
+
+## [1.10.0](https://github.com/runpod/runpod-python/compare/v1.9.1...v1.10.0) (2026-06-24)
+
+
+### Features
+
+* add agent source tracking to user-agent header ([#508](https://github.com/runpod/runpod-python/issues/508)) ([92239c8](https://github.com/runpod/runpod-python/commit/92239c817a64dada82b578e3447c1b4015afef9a))
+* add per-job stop capability to serverless worker ([#510](https://github.com/runpod/runpod-python/issues/510)) ([21c4786](https://github.com/runpod/runpod-python/commit/21c4786847bd2e5fd2ca6d15f85737203a3044a1))
+* detect all coding agents in user-agent, not just Claude Code ([#519](https://github.com/runpod/runpod-python/issues/519)) ([d14c67c](https://github.com/runpod/runpod-python/commit/d14c67c4e82963e61396b58a11dfd7046abbdde0))
+* support Python 3.10-3.14, drop EOL 3.8/3.9 ([#512](https://github.com/runpod/runpod-python/issues/512)) ([8e9d94e](https://github.com/runpod/runpod-python/commit/8e9d94e69105859c159e70fa9ae6bbf094297a2e))
+
+
+### Bug Fixes
+
+* **deps:** bump cryptography floor to &gt;=48.0.1 for OpenSSL fix ([#516](https://github.com/runpod/runpod-python/issues/516)) ([18c6841](https://github.com/runpod/runpod-python/commit/18c6841f77388e9f48f0b82d14e32bc6a0e26f7c)), closes [#511](https://github.com/runpod/runpod-python/issues/511)
+
+## [1.9.1](https://github.com/runpod/runpod-python/compare/v1.9.0...v1.9.1) (2026-05-05)
+
+
+### Bug Fixes
+
+* fix config credential updates preserving profiles ([#474](https://github.com/runpod/runpod-python/issues/474)) ([7272cd7](https://github.com/runpod/runpod-python/commit/7272cd770fe243a95f3b42bbf1083a014a079835))
+* poll for jobs while tasks are running ([#473](https://github.com/runpod/runpod-python/issues/473)) ([13e25e7](https://github.com/runpod/runpod-python/commit/13e25e7c1b2beb0878b51fea2dc7a38c5d20b704))
+
+
+### Documentation
+
+* **serverless:** document missing fitness-check env vars ([#497](https://github.com/runpod/runpod-python/issues/497)) ([a786a89](https://github.com/runpod/runpod-python/commit/a786a892747160447ccc189402d3e866d60cf4b5))
+
+## [1.9.0](https://github.com/runpod/runpod-python/compare/v1.8.2...v1.9.0) (2026-04-08)
+
+
+### Features
+
+* **fitness:** comprehensive system fitness checks for worker startup validation ([#472](https://github.com/runpod/runpod-python/issues/472)) ([781ed27](https://github.com/runpod/runpod-python/commit/781ed27cd0ad4c778e6ed1f19c2cf48569a023ab))
+
+
+### Bug Fixes
+
+* **e2e:** increase workerMax from 1 to 3 for provisioned endpoints ([#490](https://github.com/runpod/runpod-python/issues/490)) ([93dbe40](https://github.com/runpod/runpod-python/commit/93dbe405e920b3b9a7779196b6d22f241c305efd))
+* **test:** update flashBootType assertion to match enum value ([#491](https://github.com/runpod/runpod-python/issues/491)) ([16a9b41](https://github.com/runpod/runpod-python/commit/16a9b41627601b8a886dbd8605a2353fae4f8c4f))
+
+## [1.8.2](https://github.com/runpod/runpod-python/compare/v1.8.1...v1.8.2) (2026-03-24)
+
+
+### Bug Fixes
+
+* **config:** handle corrupted config.toml in credential functions ([#481](https://github.com/runpod/runpod-python/issues/481)) ([9894894](https://github.com/runpod/runpod-python/commit/9894894ee2022e7db0777c9dd24c23208e52f90c))
+* use flashBootType instead of appending -fb ([#484](https://github.com/runpod/runpod-python/issues/484)) ([7938936](https://github.com/runpod/runpod-python/commit/7938936158c351d6e00caebbf4242e085f7565ae))
+
+## [1.8.1](https://github.com/runpod/runpod-python/compare/v1.8.0...v1.8.1) (2025-11-19)
+
+
+### Bug Fixes
+
+* prevent PyPI local version rejection ([#468](https://github.com/runpod/runpod-python/issues/468)) ([c3cd473](https://github.com/runpod/runpod-python/commit/c3cd4730f6faf93fe2b454f1c18c884b3d41afb9))
+
+## [1.8.0](https://github.com/runpod/runpod-python/compare/v1.7.13...v1.8.0) (2025-11-13)
+
+
+### Features
+
+* add manual workflow dispatch for PyPI publishing ([05b2d72](https://github.com/runpod/runpod-python/commit/05b2d720f725390cddbf1aebfcbbe1c5385827e7))
+
+
+### Bug Fixes
+
+* pypi package verification ([95015dc](https://github.com/runpod/runpod-python/commit/95015dcdcfefaeec1f52c7f39e5c15d3ddcdfab1))
+* PyPI publishing issues ([6992b10](https://github.com/runpod/runpod-python/commit/6992b102977924dc00bd847681ab94f559942576))
+
+
+### Performance Improvements
+
+* **serverless:** lazy-load boto3, fastapi, and pydantic to reduce cold start time ([#466](https://github.com/runpod/runpod-python/issues/466)) ([cc05a5b](https://github.com/runpod/runpod-python/commit/cc05a5bec7a81fd809b3a40c73e47f4316de1de4))
+
+## [1.7.13](https://github.com/runpod/runpod-python/compare/1.7.12...v1.7.13) (2025-07-17)
+
+### Bug Fixes
+
+* allowedCudaVersions is treated as float without the quotes ([#431](https://github.com/runpod/runpod-python/issues/431)) ([b2bf0ce](https://github.com/runpod/runpod-python/commit/b2bf0ce68c38d5a6ade1365634aa83266d882ece))
+* label creation permission ([#445](https://github.com/runpod/runpod-python/issues/445)) ([0ca6da2](https://github.com/runpod/runpod-python/commit/0ca6da29919a1274567f5bd1d4c6cae56bc5c47e))
+* No module named 'fcntl' ([#434](https://github.com/runpod/runpod-python/issues/434)) ([88d2e4a](https://github.com/runpod/runpod-python/commit/88d2e4a2edc366ead08039691e43f1ebeeae843b))
+* proper public exports by __all__ ([#437](https://github.com/runpod/runpod-python/issues/437)) ([0a52c70](https://github.com/runpod/runpod-python/commit/0a52c70868685ee633ebfef160ab5d914dc79369))
+
+---
+
+## Release 1.7.12 (2024-06-16)
+
+### Fixed
+
+- Resolved multiprocess local development issue.
+
+---
+
+## Release 1.7.11 (2024-06-12)
+
+### Added
+
+- Added sync function for workspace copying.
+
+### Changed
+
+- README.md name update.
+- Dependency updates.
+
+### Fixed
+
+- Fixed ping failures.
+
+---
+
+## Release 1.7.10 (2024-05-28)
+
+### Fixed
+
+- Corrected CUDA versions typing.
+- Improved Content-Disposition parsing.
+- Dependency updates.
+
+---
+
+## Release 1.7.9 (2024-04-09)
+
+### Added
+
+- CPU Pod Creation support.
+
+### Changed
+
+- Retired sls-core.
+- Improved exception handling.
+
+---
+
+## Release 1.7.8 (2024-04-05)
+
+### Added
+
+- Added allowed CUDA versions parameter.
+- Improved async job streaming.
+
+### Changed
+
+- Enhanced error handling for Serverless workers.
+- Updated GraphQL API key authorization.
+
+---
+
+## Release 1.7.7 (2024-12-10)
+
+### Added
+
+- Added utility function for model-cache paths.
+
+### Changed
+
+- Dependency updates.
+
+### Fixed
+
+- Fixed streamed error handling.
+
+---
+
+## Release 1.7.6 (2024-12-05)
+
+### Fixed
+
+- Resolved JobScaler request failures.
+- Improved input validation.
+
+---
+
+## Release 1.7.5 (2024-11-20)
+
+### Fixed
+
+- Addressed race conditions in job queue.
+
+---
+
+## Release 1.7.4 (2024-10-24)
+
+### Added
+
+- Added minimum network speed parameters for pod creation.
+
+### Fixed
+
+- Fixed long-running jobs crash.
+
+---
+
+## Release 1.7.3 (2024-10-15)
+
+### Fixed
+
+- Performance improvements and bug fixes.
+
+---
+
+## Release 1.7.2 (2024-10-07)
+
+### Fixed
+
+- Additional stability improvements.
+
+---
+
+## Release 1.7.1 (2024-09-26)
+
+### Fixed
+
+- Bug fixes and improvements.
+
+---
+
+## Release 1.7.0 (2024-08-07)
+
+### Added
+
+- Major version release with new features.
+
+### Changed
+
+- Breaking changes and improvements.
+
+---
+
+## Release 1.6.3 (2/14/24)
+
+### Fixed
+
+- Bug fixes and stability improvements.
+
+---
+
+## Change Log
+
+## Release 1.6.2 (2/12/24)
+
+### Fixed
+
+- Reorder FastAPI endpoints for clarity.
+- Truncate long logs to avoid overloading the server.
+
+---
+
+## Release 1.6.1 (2/11/24)
+
+### Added
+
+- User-Agent for better analytics tracking.
+- Expose the ability to create container auth.
+- Emulate webhooks for local testing when using `rp_serve_api` flag.
+
+### Changed
+
+- Updated aiohttp from 3.9.2 to 3.9.3
+- [BREAKING] rename `registry_auth` to `registry_auth_id` for clarity.
+- Added additional details to the FastAPI page.
+
+---
+
+## Release 1.6.0 (1/29/24)
+
+### Fixed
+
+- Rust Serverless Core Passing all tests.
+- GitHub Action and Python package updates
+- Changelog date typo
+
+---
+
+## Release 1.5.3 (1/25/24)
+
+### Added
+
+- Expose cuda selection when creating a pod.
+- Expose `flashboot` when creating a new endpoint.
+- Expose bucket name for rp_upload.
+- Exposed `containerRegistryAuthId` for template creation.
+
+### Fixed
+
+- ReadMe typo *start_pod* -> *resume_pod*
+
+---
+
+## Release 1.5.2 (1/16/24)
+
+### Fixed
+
+- Edge case when using Runpod Serverless Core that return `None` for function output.
+- Missing Job ID for logging.
+- Concurrency modifier not adhering to the maximum concurrency.
+- Improved in progress job tracking and counting.
+
+### Added
+
+- Expanded Runpod Serverless Core testing.
+
+---
+
+## Release 1.5.1 (1/11/24)
+
+### Fixed
+
+- Prevent stream from hanging on the final output.
+- Allow `GET` method for `stream` test endpoint.
+- Updated async runner for endpoint API calls.
+
+### Changed
+
+- Updated sls-core to `0.0.2`
+
+---
+
+## Release 1.5.0 (12/28/23)
+
+### Added
+
+- Optional serverless core implementation, use with environment variable `RUNPOD_USE_CORE=True` or `RUNPOD_CORE_PATH=/path/to/core.so`
+
+### Changed
+
+- Reduced *await asyncio.sleep* calls to 0 to reduce execution time.
+
+---
+
+## Release 1.4.2 (12/14/23)
+
+### Fixed
+
+- Added defaults for optional parameters in `rp_fastapi` to be compatible with pydantic.
+
+## Release 1.4.1 (12/13/23)
+
+### Added
+
+- Local test API server includes simulated endpoints that mimic the behavior of `run`, `runsync`, `stream`, and `status`.
+- Internal job tracker can be used to track job inputs.
+
+---
+
+## Release 1.4.0 (12/4/23)
+
+### Changed
+
+- [BREAKING] concurrency is now handled by `concurrency_modifier` which is a user provided function that takes in the current concurrency and returns the new concurrency. This allows for more complex concurrency logic to be implemented by the user.
+- Updated the `colorama` requirement version to `>= 0.2.5, < 0.4.5`
+
+### Added
+
+- Streaming support for calling endpoints.
+
+---
+
+## Release 1.3.8 (12/1/23)
+
+### Added
+
+- Stream support for calling endpoints.
+
+---
+
+## Release 1.3.7 (11/29/23)
+
+### Fixed
+
+- Catch timeouts when checking for available jobs.
+
+### Changed
+
+- Updated and pinned aiohttp to 3.9.1
+
+---
+
+## Release 1.3.6 (11/23/23)
+
+## Fixed
+
+- Restrict version of `aiohttp` to 3.8.6 to avoid breaking changes in 3.9.0
+
+---
+
+## Release 1.3.5 (11/23/23)
+
+### Fixed
+
+- Robust `get_job` error handling
+- `project.toml` now includes required dependencies
+
+---
+
+## Release 1.3.4 (11/14/23)
+
+### Changed
+
+- Logs are now JSON formatted
+- Exposed logging `job_id` now `request_id`
+
+### Added
+
+- `get_endpoints` exposed to return all endpoints for a given user
+
+---
+
+## Release 1.3.3 (11/8/23)
+
+### Added
+
+- Method of creating logs with job id.
+
+### Fixed
+
+- Reduced polling when checking for job completion.
+- Removed print statements for endpoint calls.
+- Serverless progress updates no longer restricted to only strings.
+
+## Changed
+
+- Removed `pillow` dependency.
+- Removed `python-dotenv` dependency.
+- Removed `setuptools_scm` from required dependencies.
+
+---
+
+## Release 1.3.2 (11/3/23)
+
+### Changed
+
+- Removed `setup.cfg` and moved all configuration to `setup.py`
+- [BETA] Clean exit CLI when ctl+c is pressed.
+
+---
+
+## Release 1.3.1 (10/30/23)
+
+### Added
+
+- `test_output` can be passed in as an arg to compare the results of `test_input`
+- Generator/Streaming handlers supported with local testing
+- [BETA] CLI DevEx functionality to create development projects.
+
+---
+
+## Release 1.3.0 (10/12/23)
+
+### Changed
+
+- Backwards compatibility with Python >= 3.8
+- Consolidated install dependencies to `requirements.txt`
+
+### Fixed
+
+- Corrected helper link for rp_uploads, closes issue #169
+
+---
+
+## Release 1.2.6 (10/6/23)
+
+### Changed
+
+- Force `urllib3` logging to `WARNING` level to avoid spamming the console if global logging level is set to `DEBUG`.
+
+---
+
+## Release 1.2.5 (10/5/23)
+
+### Fixed
+
+- Handler called twice.
+- Default container disk size removed if template is provided when creating a new pod.
+
+---
+
+## ~~Release (Patch) 1.2.3 (10/4/23)~~ Replaced by 1.2.5
+
+### Fixed
+
+- Job outputs that were not dictionaries, bool, or str were swallowed by the serverless worker. This has been fixed.
+
+---
+
+## ~~Release 1.2.2 (10/4/23)~~ Replaced by 1.2.5
+
+### Added
+
+- User queries and mutations are now available in the python API wrapper.
+- `start_ssh` added with default `True` when creating new pods.
+- `network_volume_id` can now be passed in when creating new pods, correct data center is automatically selected.
+- `template_id` can now be passed in when creating new pods.
+
+### Changed
+
+- Dependencies updated to latest versions.
+- Reduced circular imports for version reference.
+- `support_public_ip` is not default to `True` when creating new pods.
+
+### Fixed
+
+- Reduce pool_connections for ping requests to 10.
+- Double timeout for ping requests.
+
+---
+
+## Release 1.2.1 (9/22/23)
+
+### Added
+
+- Version reported when an error is returned in serverless.
+- Log level can be set with `RUNPOD_LOG_LEVEL` environment variable.
+- SIGTERM handler initialized when starting serverless worker to avoid hung workers.
+- Progress update method exposed `runpod.serverless.progress_update` can be called with the job object and string.
+
+### Fixed
+
+- Region is included when using S3 storage via rp_upload, automatically filled in for Amazon S3 buckets and Digital Ocean Spaces.
+
+---
+
+## Release 1.2.0 (8/29/23)
+
+### Added
+
+- Command Line Interface (CLI)
+- Can generate a credentials file from the CLI to store your API key.
+- `get_gpu` now supports `gpu_quantity` as a parameter.
+
+### Changed
+
+- Minimized the use of pytests in favor of unittests.
+- Re-named `api_wrapper` to `api` for consistency.
+- `aiohttp_retry` packaged replaced `rp_retry.py` implementation.
+
+### Fixed
+
+- Serverless bug that would not remove task if it failed to submit the results.
+- Added missing `get_pod`
+- Remove extra print statement when making API calls.
