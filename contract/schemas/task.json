@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/task.json",
+  "title": "Task and run state",
+  "type": "object", "additionalProperties": false,
+  "required": ["task_id", "run_id", "project_id", "state", "version", "capability_id", "capability_digest", "idempotency_key", "created_at", "updated_at", "runtime_epoch", "input_object_ids"],
+  "properties": {
+    "task_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
+    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
+    "project_id": { "type": ["string", "null"], "minLength": 1 },
+    "state": { "type": "string", "enum": ["queued", "ready", "running", "succeeded", "failed", "cancel_requested", "cancelled", "retrying"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "capability_id": { "type": "string", "minLength": 1 },
+    "capability_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "protocol": { "type": "string", "const": "workspace.v1" },
+    "schema_version": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "attempt_id": { "type": ["string", "null"] },
+    "runtime_epoch": { "type": "integer", "minimum": 1 },
+    "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "execution_request": { "$ref": "#/definitions/ExecutionRequest" },
+    "execution_binding": { "$ref": "#/definitions/ExecutionBinding" },
+    "required_facts": { "$ref": "#/definitions/RequiredFacts" },
+    "spec": { "type": "object", "additionalProperties": true },
+    "generation_intent": { "type": "object", "additionalProperties": true },
+    "expected_effect": { "type": "object", "additionalProperties": true },
+    "storage_estimate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scratch_bytes", "output_bytes"],
+      "properties": {
+        "scratch_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "output_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
+    ,"waiting_reason": { "type": "string" }
+    ,"lease_fence": { "type": "integer", "minimum": 1 }
+    ,"lease_expires_at": { "type": "string", "format": "date-time" }
+    ,"result": { "type": "object", "additionalProperties": true }
+  },
+  "definitions": {
+    "ExecutionTarget": {
+      "type": "object", "additionalProperties": true,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["default", "profile", "machine", "runpod"] },
+        "id": { "type": "string" }, "profile_alias": { "type": "string" },
+        "machine_id": { "type": "string" }, "pod_id": { "type": "string" },
+        "provider_account_ref": { "type": "string" },
+        "profile_revision": { "type": "string" }, "profile_digest": { "type": "string" },
+        "release_digest": { "type": "string" }, "storage": { "type": "object" },
+        "mounts": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "ExecutionRequest": {
+      "type": "object", "additionalProperties": true,
+      "required": ["target"],
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "target": { "$ref": "#/definitions/ExecutionTarget" },
+        "remote_activation_required": { "type": "boolean" },
+        "inputs": { "type": "array", "items": { "type": "object" } },
+        "workflow": { "type": "object" }, "execution": { "type": "object" },
+        "retry_policy": { "type": "object" }, "lifecycle": { "type": "object" },
+        "limits": { "type": "object" }, "checks": { "type": "object" }
+      }
+    },
+    "ExecutionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binding_id", "task_id", "run_id", "session_id", "runtime_epoch", "capability_id", "target_kind", "resolved_target", "status"],
+      "properties": {
+        "binding_id": { "type": "string", "minLength": 1 }, "task_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 }, "attempt_id": { "type": ["string", "null"] },
+        "lease_id": { "type": ["string", "null"] }, "fence": { "type": "integer", "minimum": 0 },
+        "executor_id": { "type": ["string", "null"] }, "session_id": { "type": "string", "minLength": 1 },
+        "runtime_epoch": { "type": "integer", "minimum": 1 }, "capability_id": { "type": "string", "minLength": 1 },
+        "profile_revision": { "type": ["string", "null"] }, "profile_digest": { "type": ["string", "null"] },
+        "release_digest": { "type": ["string", "null"] }, "target_kind": { "type": "string" },
+        "target_id": { "type": ["string", "null"] }, "provider_account_ref": { "type": ["string", "null"] },
+        "pod_id": { "type": ["string", "null"] }, "storage": { "type": ["object", "null"] },
+        "mounts": { "type": ["array", "null"], "items": { "type": "object" } }, "resolved_target": { "$ref": "#/definitions/ExecutionTarget" },
+        "effective_target": { "$ref": "#/definitions/ExecutionTarget" },
+        "original_target": { "$ref": "#/definitions/ExecutionTarget" },
+        "placement_version": { "type": "integer", "minimum": 0 },
+        "recovery_decision_digest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+        "placement_recovery": { "type": "object" },
+        "actual_target": { "$ref": "#/definitions/ExecutionTarget" },
+        "verification": { "$ref": "#/definitions/ExecutionBindingVerification" },
+        "executor_incarnation": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "status": { "type": "string", "enum": ["prepared", "claimed", "released", "stale"] },
+        "created_at": { "type": "string" }, "updated_at": { "type": "string" }
+      },
+      "allOf": [{
+        "if": { "properties": { "status": { "enum": ["claimed", "released", "stale"] } } },
+        "then": { "required": ["attempt_id", "lease_id", "executor_id", "actual_target", "verification", "executor_incarnation"] }
+      }]
+    },
+    "ExecutionBindingVerification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method", "evidence_digest", "verified"],
+      "properties": {
+        "method": { "type": "string", "const": "credential_claim" },
+        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "verified": { "type": "boolean", "const": true }
+      }
+    },
+    "RequiredFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "exact": { "$ref": "#/definitions/ExactFacts" },
+        "minimum": { "$ref": "#/definitions/MinimumFacts" }
+      }
+    },
+    "ExactFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "interpreter": { "type": "string", "minLength": 1 },
+        "runtime_lock": { "type": "string", "minLength": 1 },
+        "engine_lock": { "type": "string", "minLength": 1 },
+        "model_digest": { "type": "string", "minLength": 1 },
+        "custom_node_digest": { "type": "string", "minLength": 1 },
+        "driver": { "type": "string", "minLength": 1 },
+        "root": { "type": "string", "minLength": 1 },
+        "port": { "type": ["string", "integer"], "minimum": 0 }
+      }
+    },
+    "MinimumFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "vram_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "scratch_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
+  }
+}

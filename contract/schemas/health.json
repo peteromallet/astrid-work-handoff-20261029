@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/health.json",
+  "title": "Health response",
+  "type": "object", "additionalProperties": false,
+  "required": ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id", "identity"],
+  "properties": {
+    "status": { "type": "string", "enum": ["ok", "degraded"] },
+    "protocol": { "type": "string", "const": "workspace.v1" },
+    "schema_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "runtime_epoch": { "type": "integer", "minimum": 1 },
+    "runtime_session_id": { "type": "string", "minLength": 1 },
+    "runtime_instance_id": { "type": "string", "minLength": 1 },
+    "identity": {
+      "description": "Immutable identity captured for the owner bound to runtime_instance_id; null is used only by a raw RuntimeService response with no daemon owner.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["release", "managed_by"],
+          "properties": {
+            "release": { "type": "integer", "minimum": 0 },
+            "managed_by": { "type": ["string", "null"], "enum": [null, "pinokio"] }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["release", "managed_by", "runtime_head", "agent_head", "dirty", "dirty_hash"],
+          "properties": {
+            "release": { "type": "integer", "const": 0 },
+            "managed_by": { "type": "string", "const": "source" },
+            "runtime_head": { "type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" },
+            "agent_head": { "type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" },
+            "dirty": { "type": "boolean" },
+            "dirty_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "state", "last_exit", "restart_count"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "state": {
+            "description": "starting until the process survives two seconds or writes its declared readiness file; running after that point; restarting during retry backoff; failed after three consecutive failures before completing two seconds of running (backoff continues) or a terminal on-failure exit.",
+            "enum": ["starting", "running", "restarting", "failed"]
+          },
+          "last_exit": {"type": ["integer", "null"]},
+          "restart_count": {"type": "integer", "minimum": 0},
+          "reason": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

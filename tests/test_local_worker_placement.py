@@ -1,0 +1,1369 @@
+from __future__ import annotations
+
+import os
+import stat
+import threading
+import time
+import uuid
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from http_helpers import Api
+from runtime_protocol.auth import AuthorizationError, CredentialStore
+from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR, WORKER_SCOPES
+from runtime_protocol.errors import ConflictError
+from runtime_protocol import platform as runtime_platform
+from runtime_protocol.local_worker import (
+    PREPARATION_VERSION,
+    LocalWorkerLauncher,
+    LocalWorkerObservation,
+    LocalWorkerProfile,
+    ProcessIdentity,
+)
+from runtime_protocol.store import RealmStore
+
+
+def _digest(char: str) -> str:
+    return "sha256:" + char * 64
+
+
+def _profile(tmp_path, workspace_uuid: str) -> LocalWorkerProfile:
+    return LocalWorkerProfile(
+        profile_id="astrid",
+        workspace_uuid=workspace_uuid,
+        realm_root=tmp_path / "realm",
+        support_root=tmp_path / "support",
+        machine_id="machine-local",
+        worker_executable=tmp_path / "worker-python",
+        host_executable=tmp_path / "host-python",
+        engine_executable=tmp_path / "vibecomfy-daemon-python",
+        engine_listener_executable=tmp_path / "comfy-listener-python",
+        engine_endpoint="http://127.0.0.1:8188",
+        worker_artifact_digest=_digest("a"),
+        host_artifact_digest=_digest("b"),
+        engine_artifact_digest=_digest("c"),
+        engine_listener_artifact_digest=_digest("7"),
+        session_config_digest=_digest("d"),
+        profile_revision="profile-r1",
+        profile_digest=_digest("e"),
+        release_digest=_digest("f"),
+    )
+
+
+def _process(pid, parent, executable, digest, *, group=None, session=None) -> ProcessIdentity:
+    return ProcessIdentity(
+        pid=pid,
+        birth_id=f"birth-{pid}",
+        uid=runtime_platform.current_user(),
+        parent_pid=parent,
+        process_group=pid if group is None else group,
+        session_id=pid if session is None else session,
+        executable=executable,
+        artifact_digest=digest,
+    )
+
+
+def _observation(profile: LocalWorkerProfile, runtime_pid: int, *, base=1000) -> LocalWorkerObservation:
+    worker = _process(base, runtime_pid, profile.worker_executable, profile.worker_artifact_digest)
+    host = _process(base + 1, base, profile.host_executable, profile.host_artifact_digest)
+    engine = _process(base + 2, base, profile.engine_executable, profile.engine_artifact_digest)
+    engine_listener = _process(
+        base + 3,
+        engine.pid,
+        profile.engine_listener_executable,
+        profile.engine_listener_artifact_digest,
+        group=engine.pid,
+        session=engine.pid,
+    )
+    return LocalWorkerObservation(
+        machine_id=profile.machine_id,
+        uid=runtime_platform.current_user(),
+        workspace_uuid=profile.workspace_uuid,
+        realm_root=profile.realm_root,
+        support_root=profile.support_root,
+        worker=worker,
+        host=host,
+        engine=engine,
+        engine_listener=engine_listener,
+        engine_listener_socket_owner_pid=engine_listener.pid,
+        engine_endpoint=profile.engine_endpoint,
+        session_config_digest=profile.session_config_digest,
+    )
+
+
+class FakePreparer:
+    """Fake boundary: no OS process or engine is started by these tests."""
+
+    def __init__(self, store, observation, *, reconnect=True):
+        self.store = store
+        self.observation = observation
+        self.reconnect_enabled = reconnect
+        self.events = []
+        self.operation_id = self.channel_id = None
+        self.aborted = False
+        self.handle = None
+
+    def prepare(self, _profile, *, operation_id, channel_id):
+        assert self.store.actor_metadata(WORKER_ACTOR) is None
+        self.operation_id, self.channel_id = operation_id, channel_id
+        self.events.append("prepare")
+        self.handle = object()
+        return self.handle
+
+    def report(self, _handle):
+        self.events.append("report")
+        return {
+            "version": PREPARATION_VERSION,
+            "operation_id": self.operation_id,
+            "channel_id": self.channel_id,
+            "processes": {
+                name: {"pid": value.pid, "birth_id": value.birth_id}
+                for name, value in (
+                    ("worker", self.observation.worker),
+                    ("host", self.observation.host),
+                    ("engine", self.observation.engine),
+                    ("engine_listener", self.observation.engine_listener),
+                )
+            },
+            "engine_binding": {
+                "supervisor_pid": self.observation.engine.pid,
+                "listener_pid": self.observation.engine_listener.pid,
+                "listener_parent_pid": self.observation.engine_listener.parent_pid,
+                "socket_owner_pid": self.observation.engine_listener_socket_owner_pid,
+            },
+            "session_config_digest": self.observation.session_config_digest,
+        }
+
+    def activate(self, _handle, grant):
+        token = self.store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+        identity = self.store.actor_metadata(WORKER_ACTOR)
+        assert identity["execution_binding"]["executor_incarnation"] == grant["executor_incarnation"]
+        with pytest.raises(AuthorizationError):
+            self.store.load(token)
+        self.events.append("activate")
+
+    def abort(self, _handle):
+        self.aborted = True
+        self.events.append("abort")
+        if self.handle is _handle:
+            self.handle = None
+
+    def reconnect(self, _receipt):
+        self.events.append("reconnect")
+        if not self.reconnect_enabled:
+            return None
+        self.handle = object()
+        return self.handle
+
+    def control_alive(self, handle):
+        return self.handle is handle and not self.aborted
+
+    def current_handle(self):
+        return self.handle
+
+
+class FakeInspector:
+    """Fake boundary: returns deterministic independent OS observations."""
+
+    def __init__(self, store, observation, *, assert_unissued=True):
+        self.store = store
+        self.observation = observation
+        self.assert_unissued = assert_unissued
+        self.calls = 0
+
+    def observe(self, _handle):
+        self.calls += 1
+        if self.assert_unissued and self.calls <= 2:
+            assert self.store.actor_metadata(WORKER_ACTOR) is None
+        elif self.calls >= 3:
+            token = self.store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+            with pytest.raises(AuthorizationError):
+                self.store.load(token)
+        return self.observation
+
+
+def _launcher(store, profile, preparer, inspector, runtime_pid):
+    return LocalWorkerLauncher(
+        credentials=store,
+        profiles={profile.profile_id: profile},
+        preparer=preparer,
+        inspector=inspector,
+        workspace_uuid=profile.workspace_uuid,
+        realm_root=profile.realm_root,
+        support_root=profile.support_root,
+        runtime_pid=runtime_pid,
+        actor=WORKER_ACTOR,
+        scopes=WORKER_SCOPES,
+    )
+
+
+def test_owner_transaction_issues_only_after_two_observations_then_activates(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    inspector = FakeInspector(store, observed)
+
+    result = _launcher(store, profile, preparer, inspector, 77).start("astrid", workspace_uuid)
+
+    assert result["state"] == "active"
+    assert inspector.calls == 4
+    assert preparer.events == ["prepare", "report", "activate"]
+    metadata = store.actor_metadata(WORKER_ACTOR)
+    receipt = metadata["local_launch_receipt"]
+    assert metadata["execution_binding"]["actual"]["kind"] == "machine"
+    assert metadata["execution_binding"]["verification"]["evidence_digest"] == result["evidence_digest"]
+    assert receipt["executor_incarnation"] == result["executor_incarnation"]
+    assert receipt["engine"]["pid"] == observed.engine.pid
+    assert receipt["engine_listener"]["pid"] == observed.engine_listener.pid
+    assert receipt["engine_binding"] == {
+        "supervisor_pid": observed.engine.pid,
+        "listener_pid": observed.engine_listener.pid,
+        "listener_parent_pid": observed.engine.pid,
+        "socket_owner_pid": observed.engine_listener.pid,
+        "endpoint": profile.engine_endpoint,
+    }
+    assert observed.engine_listener.process_group == observed.engine.pid
+    assert observed.engine_listener.session_id == observed.engine.pid
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+    assert store.load(token)["execution_binding"]["executor_incarnation"] == result["executor_incarnation"]
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda value: replace(value, machine_id="other-machine"), "machine identity"),
+        (lambda value: replace(value, workspace_uuid=str(uuid.uuid4())), "workspace identity"),
+        (lambda value: replace(value, realm_root=value.realm_root.parent / "other"), "roots"),
+        (lambda value: replace(value, support_root=value.support_root.parent / "other"), "roots"),
+        (lambda value: replace(value, worker=replace(value.worker, uid=value.worker.uid + 1)), "uid"),
+        (lambda value: replace(value, host=replace(value.host, parent_pid=999)), "parent lineage"),
+        (lambda value: replace(value, engine=replace(value.engine, session_id=999)), "process group and session"),
+        (lambda value: replace(value, host=replace(value.host, executable=Path("/wrong-host"))), "executable pin"),
+        (lambda value: replace(value, engine=replace(value.engine, artifact_digest=_digest("9"))), "artifact pin"),
+        (lambda value: replace(value, host=replace(value.host, artifact_digest=_digest("9"))), "artifact pin"),
+        (
+            lambda value: replace(
+                value, engine_listener=replace(value.engine_listener, parent_pid=value.worker.pid)
+            ),
+            "parent lineage",
+        ),
+        (
+            lambda value: replace(
+                value, engine_listener=replace(value.engine_listener, executable=Path("/wrong-listener"))
+            ),
+            "executable pin",
+        ),
+        (
+            lambda value: replace(
+                value, engine_listener=replace(value.engine_listener, artifact_digest=_digest("8"))
+            ),
+            "artifact pin",
+        ),
+        (lambda value: replace(value, engine_listener_socket_owner_pid=999), "socket"),
+        (
+            lambda value: replace(
+                value,
+                engine_listener=replace(
+                    value.engine_listener,
+                    pid=value.engine.pid,
+                    birth_id=value.engine.birth_id,
+                ),
+            ),
+            "distinct",
+        ),
+        (
+            lambda value: replace(
+                value,
+                engine_listener=replace(value.engine_listener, birth_id=value.engine.birth_id),
+            ),
+            "report conflicts",
+        ),
+        (lambda value: replace(value, worker=replace(value.worker, birth_id="reused-pid")), "report conflicts"),
+    ],
+)
+def test_identity_failures_abort_without_credential(tmp_path, change, message):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    canonical = _observation(profile, 77)
+    preparer = FakePreparer(store, canonical)
+    inspector = FakeInspector(store, change(canonical))
+
+    with pytest.raises(ConflictError, match=message):
+        _launcher(store, profile, preparer, inspector, 77).start("astrid", profile.workspace_uuid)
+
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert preparer.aborted is True
+
+
+def test_workspace_precondition_and_wrong_channel_fail_before_bearer_activation(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+
+    with pytest.raises(ConflictError, match="workspace identity"):
+        launcher.start("astrid", str(uuid.uuid4()))
+    assert preparer.events == []
+
+    class WrongChannelPreparer(FakePreparer):
+        def report(self, handle):
+            report = dict(super().report(handle))
+            report["channel_id"] = "forged-channel"
+            return report
+
+    wrong_channel = WrongChannelPreparer(store, observed)
+    with pytest.raises(ConflictError, match="wrong private channel"):
+        _launcher(store, profile, wrong_channel, FakeInspector(store, observed), 77).start(
+            "astrid", profile.workspace_uuid
+        )
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert wrong_channel.aborted is True
+
+
+def test_forged_listener_binding_report_fails_before_issuance(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class ForgedBindingPreparer(FakePreparer):
+        def report(self, handle):
+            report = dict(super().report(handle))
+            report["engine_binding"] = dict(report["engine_binding"])
+            report["engine_binding"]["socket_owner_pid"] = observed.engine.pid
+            return report
+
+    preparer = ForgedBindingPreparer(store, observed)
+    with pytest.raises(ConflictError, match="conflicts with engine observation"):
+        _launcher(store, profile, preparer, FakeInspector(store, observed), 77).start(
+            "astrid", profile.workspace_uuid
+        )
+
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert preparer.aborted is True
+
+
+def test_restart_reuses_survivor_and_replacement_rotates_bearer(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    first_observation = _observation(profile, 77)
+    first_preparer = FakePreparer(store, first_observation)
+    first = _launcher(store, profile, first_preparer, FakeInspector(store, first_observation), 77).start("astrid", profile.workspace_uuid)
+    first_token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+
+    # A restarted owner disables the durable bearer before any request can use
+    # it, then allows the same surviving process to have been reparented.
+    reparented_observation = replace(
+        first_observation,
+        worker=replace(first_observation.worker, parent_pid=1),
+    )
+    reconnect_preparer = FakePreparer(store, reparented_observation)
+    reconnect_launcher = _launcher(
+        store,
+        profile,
+        reconnect_preparer,
+        FakeInspector(store, reparented_observation, assert_unissued=False),
+        88,
+    )
+    with pytest.raises(AuthorizationError):
+        store.load(first_token)
+    reconnect = reconnect_launcher.start("astrid", profile.workspace_uuid)
+    assert reconnect["state"] == "reconnected"
+    assert reconnect["executor_incarnation"] == first["executor_incarnation"]
+    assert reconnect["evidence_digest"] == first["evidence_digest"]
+    assert store.path_for(WORKER_ACTOR).read_text(encoding="utf-8") == first_token
+    assert store.load(first_token)["actor"] == WORKER_ACTOR
+
+    replacement_observation = _observation(profile, 77, base=2000)
+    replacement_preparer = FakePreparer(store, replacement_observation, reconnect=False)
+    replacement = _launcher(store, profile, replacement_preparer, FakeInspector(store, replacement_observation), 77).start("astrid", profile.workspace_uuid)
+    assert replacement["executor_incarnation"] != first["executor_incarnation"]
+    assert store.path_for(WORKER_ACTOR).read_text(encoding="utf-8") != first_token
+    with pytest.raises(AuthorizationError):
+        store.load(first_token)
+
+
+@pytest.mark.parametrize("replacement_field", ["pid", "birth_id"])
+def test_reconnect_rejects_listener_replacement(tmp_path, replacement_field):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    first = _launcher(
+        store,
+        profile,
+        FakePreparer(store, observed),
+        FakeInspector(store, observed),
+        77,
+    ).start("astrid", profile.workspace_uuid)
+    first_token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+
+    listener_changes = {
+        "pid": {"pid": observed.engine_listener.pid + 100},
+        "birth_id": {"birth_id": "replacement-listener-birth"},
+    }
+    replaced_listener = replace(observed.engine_listener, **listener_changes[replacement_field])
+    replaced = replace(
+        observed,
+        worker=replace(observed.worker, parent_pid=1),
+        engine_listener=replaced_listener,
+        engine_listener_socket_owner_pid=replaced_listener.pid,
+    )
+    preparer = FakePreparer(store, replaced)
+
+    with pytest.raises(ConflictError, match="surviving local worker identity changed"):
+        _launcher(
+            store,
+            profile,
+            preparer,
+            FakeInspector(store, replaced, assert_unissued=False),
+            88,
+        ).start("astrid", profile.workspace_uuid)
+
+    assert first["state"] == "active"
+    assert preparer.aborted is True
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    with pytest.raises(AuthorizationError):
+        store.load(first_token)
+
+
+def test_death_after_issue_and_activation_failure_revoke_disabled_bearer(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    observed = _observation(profile, 77)
+
+    class DiesBeforeActivation(FakeInspector):
+        def observe(self, handle):
+            if self.calls == 2:
+                self.calls += 1
+                raise ProcessLookupError("fake Worker died after issuance")
+            return super().observe(handle)
+
+    store = CredentialStore(tmp_path / "death-credentials")
+    preparer = FakePreparer(store, observed)
+    with pytest.raises(ProcessLookupError, match="after issuance"):
+        _launcher(store, profile, preparer, DiesBeforeActivation(store, observed), 77).start(
+            "astrid", profile.workspace_uuid
+        )
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert preparer.events == ["prepare", "report", "abort"]
+
+    class RejectsActivation(FakePreparer):
+        def activate(self, handle, grant):
+            self.rejected_token = self.store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+            with pytest.raises(AuthorizationError):
+                self.store.load(self.rejected_token)
+            raise RuntimeError("fake activation rejection")
+
+    store = CredentialStore(tmp_path / "activation-credentials")
+    preparer = RejectsActivation(store, observed)
+    with pytest.raises(RuntimeError, match="activation rejection"):
+        _launcher(store, profile, preparer, FakeInspector(store, observed), 77).start(
+            "astrid", profile.workspace_uuid
+        )
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    with pytest.raises(AuthorizationError):
+        store.load(preparer.rejected_token)
+    assert preparer.aborted is True
+
+
+def test_concurrent_start_is_refused_without_issuing_a_second_bearer(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class BlockingPreparer(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def prepare(self, profile, *, operation_id, channel_id):
+            handle = super().prepare(profile, operation_id=operation_id, channel_id=channel_id)
+            self.entered.set()
+            assert self.release.wait(timeout=5), "test did not release fake preparation"
+            return handle
+
+    preparer = BlockingPreparer(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    completed = []
+    failed = []
+
+    def run_first():
+        try:
+            completed.append(launcher.start("astrid", profile.workspace_uuid))
+        except Exception as exc:  # pragma: no cover - asserted below
+            failed.append(exc)
+
+    thread = threading.Thread(target=run_first, name="fake-local-worker-start")
+    thread.start()
+    assert preparer.entered.wait(timeout=5), "first fake preparation did not start"
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    with pytest.raises(ConflictError, match="already in progress"):
+        launcher.start("astrid", profile.workspace_uuid)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    preparer.release.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failed == []
+    assert completed[0]["state"] == "active"
+    assert len(list((tmp_path / "credentials").glob("*.token"))) == 1
+
+
+def test_interrupted_credential_generation_fails_closed(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials")
+    old_token, _ = store.provision("worker", ["worker:execute"], metadata={"generation": "old"})
+    original = store._atomic_replace
+
+    def fail_commit(path, value):
+        if path.suffix == ".commit":
+            raise OSError("simulated commit interruption")
+        return original(path, value)
+
+    monkeypatch.setattr(store, "_atomic_replace", fail_commit)
+    with pytest.raises(OSError, match="simulated"):
+        store.provision("worker", ["worker:execute"], metadata={"generation": "new"})
+    with pytest.raises(AuthorizationError):
+        store.load(old_token)
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {},
+        {"version": "runtime.local-worker-receipt/v2"},
+        {"version": "runtime.local-worker-receipt/v3"},
+    ],
+)
+def test_new_owner_revokes_legacy_or_malformed_worker_bearer(tmp_path, receipt):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    metadata = {} if receipt is None else {"local_launch_receipt": receipt}
+    old_token, _ = store.provision(WORKER_ACTOR, list(WORKER_SCOPES), metadata=metadata)
+    assert store.load(old_token)["actor"] == WORKER_ACTOR
+    observed = _observation(profile, 77)
+
+    _launcher(
+        store,
+        profile,
+        FakePreparer(store, observed),
+        FakeInspector(store, observed),
+        77,
+    )
+
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    with pytest.raises(AuthorizationError):
+        store.load(old_token)
+
+
+@pytest.mark.parametrize("lost", ["worker", "host", "engine", "listener", "endpoint", "control"])
+def test_liveness_loss_revokes_bearer_before_cleanup(tmp_path, lost):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class WatchPreparer(FakePreparer):
+        control_ok = True
+
+        def control_alive(self, _handle):
+            return self.control_ok
+
+    preparer = WatchPreparer(store, observed)
+    inspector = FakeInspector(store, observed)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    launcher.start("astrid", profile.workspace_uuid)
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+
+    if lost == "control":
+        preparer.control_ok = False
+    elif lost == "endpoint":
+        inspector.observation = replace(observed, engine_endpoint="http://127.0.0.1:8189")
+    else:
+        name = "engine_listener" if lost == "listener" else lost
+        process = getattr(observed, name)
+        inspector.observation = replace(
+            observed,
+            **{name: replace(process, birth_id=f"dead-{name}")},
+        )
+
+    assert launcher.check_liveness() is False
+    with pytest.raises(AuthorizationError):
+        store.load(token)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert preparer.aborted is True
+
+
+def test_old_liveness_watcher_cannot_fence_replacement_generation(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher = _launcher(store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77)
+    old_handle = object()
+    new_handle = object()
+    with launcher._state_lock:
+        launcher._active_handle = new_handle
+        launcher._active_profile = profile
+        launcher._active_identity = {"generation": "new"}
+
+    assert launcher.check_liveness(old_handle) is True
+    assert launcher._active_handle is new_handle
+
+
+def test_installing_replacement_retires_old_watcher_generation(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher = _launcher(store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77)
+    old_handle = object()
+    new_handle = object()
+    old_stop = threading.Event()
+    with launcher._state_lock:
+        launcher._active_handle = old_handle
+        launcher._active_profile = profile
+        launcher._active_identity = {"generation": "old"}
+        launcher._watch_stop = old_stop
+
+    launcher._install_active(new_handle, profile, {"generation": "new"}, {})
+
+    assert old_stop.is_set()
+    assert launcher._active_handle is new_handle
+
+
+def test_fenced_generation_cannot_reenable_after_durable_revoke_failure(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher = _launcher(store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77)
+    stale, _ = store.provision(WORKER_ACTOR, list(WORKER_SCOPES))
+    handle = object()
+    launcher._install_active(handle, profile, {"generation": "active"}, {})
+
+    def fail_revoke(_actor):
+        raise OSError("simulated durable revoke failure")
+
+    monkeypatch.setattr(store, "revoke", fail_revoke)
+    launcher.begin_shutdown()
+
+    with pytest.raises(ConflictError, match="no longer active"):
+        launcher._enable_active_generation(handle)
+    with pytest.raises(AuthorizationError):
+        store.load(stale)
+
+
+def test_shutdown_fences_auth_before_hung_abort_and_is_bounded(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    entered_abort = threading.Event()
+    release_abort = threading.Event()
+    shutdown_http = threading.Event()
+
+    class HungAbort(FakePreparer):
+        def abort(self, _handle):
+            assert store.actor_metadata(WORKER_ACTOR) is None
+            assert daemon.httpd.accepting_authenticated_requests is False
+            assert shutdown_http.is_set()
+            entered_abort.set()
+            release_abort.wait(timeout=10)
+
+    preparer = HungAbort(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    launcher.start("astrid", profile.workspace_uuid)
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+
+    daemon = RuntimeDaemon(tmp_path / "daemon-realm", support_root=tmp_path / "daemon-support")
+    daemon.local_worker_launcher = launcher
+    daemon.httpd = SimpleNamespace(accepting_authenticated_requests=True)
+    daemon.service = None
+    monkeypatch.setattr(daemon.discovery, "clear", lambda _instance: None)
+    monkeypatch.setattr(daemon, "_shutdown_http", shutdown_http.set)
+
+    try:
+        # A hung abort must not block shutdown, but it is a failed cleanup:
+        # finish_shutdown reports the uncertain graph instead of hiding it.
+        with pytest.raises(ConflictError, match="bounded deadline"):
+            daemon.stop()
+        assert entered_abort.wait(timeout=1)
+        assert shutdown_http.is_set()
+        with pytest.raises(AuthorizationError):
+            store.load(token)
+    finally:
+        release_abort.set()
+
+
+def test_shutdown_race_cannot_reenable_revoked_bearer(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class BlockingActivation(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def activate(self, _handle, _grant):
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+
+    preparer = BlockingActivation(store, observed)
+    launcher = _launcher(
+        store,
+        profile,
+        preparer,
+        SimpleNamespace(observe=lambda _handle: observed),
+        77,
+    )
+    failures = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(
+            failures, launcher.start, "astrid", profile.workspace_uuid
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert preparer.entered.wait(timeout=5)
+    handles = launcher.begin_shutdown()
+    preparer.release.set()
+    thread.join(timeout=5)
+    launcher.finish_shutdown(handles)
+
+    assert not thread.is_alive()
+    assert failures and isinstance(failures[0], ConflictError)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+
+
+def test_shutdown_captures_worker_blocked_inside_prepare(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class HungPrepare(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.abort_calls = 0
+
+        def prepare(self, profile, *, operation_id, channel_id):
+            self.handle = object()
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            raise ConflictError("prepare interrupted")
+
+        def abort(self, handle):
+            self.abort_calls += 1
+            self.aborted = True
+            self.release.set()
+            if self.handle is handle:
+                self.handle = None
+
+    preparer = HungPrepare(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    failures = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(
+            failures, launcher.start, "astrid", profile.workspace_uuid
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert preparer.entered.wait(timeout=5)
+
+    handles = launcher.begin_shutdown()
+    launcher.finish_shutdown(handles)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failures and isinstance(failures[0], ConflictError)
+    assert preparer.aborted is True
+    assert preparer.abort_calls == 1
+
+
+def test_shutdown_cancels_prepare_before_handle_publication(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class PrePublishHung(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.cancelled = False
+
+        def prepare(self, profile, *, operation_id, channel_id):
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            raise ConflictError("prepare interrupted before handle publication")
+
+        def cancel_current(self):
+            self.cancelled = True
+            self.release.set()
+
+    preparer = PrePublishHung(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    failures = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(
+            failures, launcher.start, "astrid", profile.workspace_uuid
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert preparer.entered.wait(timeout=5)
+
+    handles = launcher.begin_shutdown()
+    launcher.finish_shutdown(handles)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert preparer.cancelled is True
+    assert failures and isinstance(failures[0], ConflictError)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+
+
+def _capture_failure(target, function, *args):
+    try:
+        function(*args)
+    except BaseException as exc:
+        target.append(exc)
+
+
+def test_private_owner_route_does_not_take_sqlite_mutex(tmp_path):
+    """Preparation and OS observation run outside the SQLite mutex.
+
+    The start route takes the mutex only for the durable claim-fence admission
+    check (``_assert_local_claim_admission``), which reads the claim fence. The
+    long-running boundary calls (prepare, activate, observe) must never run
+    while the request thread holds it, so every one of them probes the mutex
+    from a second thread.
+    """
+    root = tmp_path / "realm"
+    initialized = RealmStore.initialize(root)
+    workspace_uuid = initialized.realm["id"]
+    initialized.close()
+    profile = _profile(tmp_path, workspace_uuid)
+    store_probe = {}
+    probes = []
+
+    def mutex_is_free():
+        mutex = store_probe["daemon"].service.store._mutex
+        outcome = []
+
+        def attempt():
+            acquired = mutex.acquire(blocking=False)
+            outcome.append(acquired)
+            if acquired:
+                mutex.release()
+
+        thread = threading.Thread(target=attempt)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive() and len(outcome) == 1
+        return outcome[0]
+
+    class ProbingPreparer(FakePreparer):
+        def prepare(self, *args, **kwargs):
+            probes.append(("prepare", mutex_is_free()))
+            return super().prepare(*args, **kwargs)
+
+        def activate(self, *args, **kwargs):
+            probes.append(("activate", mutex_is_free()))
+            return super().activate(*args, **kwargs)
+
+    class ProbingInspector(FakeInspector):
+        def observe(self, *args, **kwargs):
+            probes.append(("observe", mutex_is_free()))
+            return super().observe(*args, **kwargs)
+
+    # The daemon constructs the CredentialStore; bind fakes after start through
+    # a tiny proxy that resolves it lazily.
+    class StoreProxy:
+        def __getattr__(self, name):
+            return getattr(store_probe["store"], name)
+
+    proxy = StoreProxy()
+    observed = _observation(profile, os.getpid())
+    preparer = ProbingPreparer(proxy, observed)
+    inspector = ProbingInspector(proxy, observed)
+    daemon = RuntimeDaemon(
+        root,
+        support_root=profile.support_root,
+        local_worker_profiles={"astrid": profile},
+        local_worker_preparer=preparer,
+        local_worker_inspector=inspector,
+    ).start()
+    store_probe["store"] = daemon.credentials
+    store_probe["daemon"] = daemon
+    try:
+        # Positive control: the probe really detects a held mutex.
+        with daemon.service.store._mutex:
+            assert mutex_is_free() is False
+        assert mutex_is_free() is True
+        result = Api(daemon.endpoint, daemon.token).request(
+            "POST",
+            "/v1/control/local-worker/start",
+            {"profile_id": "astrid", "expected_workspace_uuid": workspace_uuid},
+        )
+        assert result["state"] == "active"
+        names = {name for name, _free in probes}
+        assert {"prepare", "activate", "observe"} <= names
+        assert all(free for _name, free in probes), probes
+        worker_token = daemon.credentials.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+        with pytest.raises(RuntimeError) as forbidden:
+            Api(daemon.endpoint, worker_token).request(
+                "POST",
+                "/v1/control/local-worker/start",
+                {"profile_id": "astrid", "expected_workspace_uuid": workspace_uuid},
+            )
+        assert forbidden.value.status == 401
+    finally:
+        daemon.stop()
+
+
+def _relay_activation_fixture(tmp_path, *, lose_ack=False, before_request=None, at_binding=None):
+    """Actual Runtime/relay/activation code with synthetic owned process facts."""
+    import copy
+    import json
+    import socket
+    from types import SimpleNamespace
+    from test_local_execution_supervisor import _prepare_case, _cleaned_reply
+    from runtime_protocol.local_execution_supervisor import (
+        NativeHostSession, LocalExecutionRelay, serve_control, send_frame, receive_frame,
+        HOST_PREPARATION_VERSION, RelayError, digest,
+    )
+    from runtime_protocol.local_worker_composition import CrossProcessWorkerPreparer, _PreparedWorker
+    from runtime_protocol.local_worker import _selected_profile_payload
+    selected, _ = _prepare_case()
+    profile = replace(_profile(tmp_path, "workspace"), engine_launch=selected["profile"]["engine_launch"], session_config_digest=selected["profile"]["session_config_digest"])
+    observed = _observation(profile, 77)
+    observed = replace(observed, engine=replace(observed.engine, parent_pid=observed.host.pid))
+    scope = tmp_path / "support" / "local-execution-custody" / "fixture"
+    scope.mkdir(parents=True, mode=0o700)
+    refs = {}
+    for role, identity in (("relay", observed.worker), ("host", observed.host), ("engine", observed.engine), ("engine_listener", observed.engine_listener)):
+        refs[role] = {"version": "runtime.role-custody-reference/v1", "scope_root": str(scope), "role": role, "generation": 1,
+            "target": {"pid": identity.pid, "birth_id": identity.birth_id, "uid": runtime_platform.current_user(), "audit_token_sha256": "sha256:" + "2" * 64, "audit_token_pidversion": identity.pid + 1}}
+    observed = replace(observed, owner_epoch="runtime-epoch", custody_scope=str(scope), custody_capabilities=refs)
+    store = CredentialStore(tmp_path / "credentials")
+    runtime, relay = socket.socketpair()
+    host_control, host_peer = socket.socketpair()
+    activation, activation_peer = socket.socketpair()
+    for channel in (runtime, relay, host_control, host_peer, activation, activation_peer):
+        channel.settimeout(2)
+    events = []
+    errors = []
+    host_prepared = {"version": HOST_PREPARATION_VERSION, "status": "prepared", "owner_epoch": "runtime-epoch",
+        "processes": {role: {"pid": getattr(observed, role).pid, "birth_id": getattr(observed, role).birth_id} for role in ("host", "engine", "engine_listener")},
+        "engine_binding": {"supervisor_pid": observed.engine.pid, "listener_pid": observed.engine_listener.pid, "listener_parent_pid": observed.engine.pid, "socket_owner_pid": observed.engine_listener.pid},
+        "session_config_digest": profile.session_config_digest, "custody_capabilities": {role: refs[role] for role in ("engine", "engine_listener")}}
+
+    class Retained:
+        def __init__(self, identity):
+            self.child = SimpleNamespace(pid=identity.pid)
+        def poll(self):
+            return None
+        def verify(self):
+            return {"pid": self.child.pid}
+
+    session = NativeHostSession.__new__(NativeHostSession)
+    session.config = {"credential_file": str(store.path_for(WORKER_ACTOR))}
+    session.activation = activation
+    session.retained = Retained(observed.host)
+    session.reap_host = lambda: events.append("host-wait") or 0
+    def exchange(value):
+        send_frame(host_control, value)
+        return receive_frame(host_control)
+    session.bridge = LocalExecutionRelay(host_pid=observed.host.pid, host_birth_id=observed.host.birth_id, exchange=exchange, verify_host=session.retained.verify)
+    def factory(preparation, _config, *, retain):
+        session.preparation = preparation
+        retain(session)
+        return session
+    def host_loop():
+        try:
+            while True:
+                value = receive_frame(host_peer)
+                if value["command"] == "abort_local_execution":
+                    send_frame(host_peer, _cleaned_reply(value, host_prepared))
+                    return
+                send_frame(host_peer, host_prepared)
+        except RelayError as exc:
+            if "channel closed" not in str(exc):
+                errors.append(exc)
+    def host_activation_loop():
+        try:
+            grant = receive_frame(activation_peer)
+            events.append("grant")
+            token = store.path_for(WORKER_ACTOR).read_text()
+            with pytest.raises(AuthorizationError):
+                store.load(token)
+            assert grant["acceptance_mode"] == "runtime-owner-receipt/v1"
+            if before_request:
+                before_request(store, grant)
+            request = {"version": "astrid.local-worker-activation-request/v1", "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+                "grant": {k: grant[k] for k in ("activation_id", "credential_file", "executor_incarnation", "evidence_digest")}, "host": grant["host"]}
+            send_frame(activation_peer, request)
+            recorded = receive_frame(activation_peer)
+            assert recorded == {**request, "version": "runtime.local-worker-activation-recorded/v1"}
+            record = json.loads((scope / "activation-record.json").read_text())
+            assert record["receipt"] == recorded
+            assert record["original_owner_epoch"] == "runtime-epoch"
+            assert record["custody_capabilities"] == refs
+            assert "credential" not in record
+            assert token not in json.dumps(record)
+            events.append("record-visible")
+            with pytest.raises(AuthorizationError):
+                store.load(token)
+            assert activation_peer.recv(1) == b""
+            events.append("activation-eof")
+            if lose_ack:
+                activation_peer.close()
+                return
+            send_frame(activation_peer, {"version": "astrid.local-worker-activation-accepted/v1", **{k: grant[k] for k in ("operation_id", "channel_id", "activation_id", "executor_incarnation", "evidence_digest", "host")}})
+            events.append("final-ack")
+        except (RelayError, OSError) as exc:
+            if before_request is None:
+                errors.append(exc)
+        except BaseException as exc:
+            errors.append(exc)
+    def relay_loop():
+        try:
+            serve_control(relay, session_factory=factory, reference_reader=lambda _, role: refs[role], relay_identity=lambda: {"pid": observed.worker.pid, "birth_id": observed.worker.birth_id})
+        except (RelayError, OSError) as exc:
+            if "channel closed" not in str(exc) and not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                errors.append(exc)
+
+    class Preparer(CrossProcessWorkerPreparer):
+        def bind_activation_acceptor(self, handle, grant, acceptor):
+            super().bind_activation_acceptor(handle, grant, acceptor)
+            if at_binding:
+                at_binding(handle, grant, acceptor)
+        def prepare(self, profile, *, operation_id, channel_id):
+            from runtime_protocol.local_execution_supervisor import host_prepare_request, CONTROL_VERSION
+            host_prepared.update(operation_id=operation_id, channel_id=channel_id)
+            preparation = host_prepare_request(operation_id=operation_id, channel_id=channel_id, owner_epoch="runtime-epoch", runtime_owner={"pid": 77, "uid": runtime_platform.current_user(), "birth_id": "runtime-birth", "runtime_instance_id": "runtime-epoch", "coordinator_epoch": "runtime-epoch"}, profile=_selected_profile_payload(profile), custody_scope=str(scope))
+            handle = _PreparedWorker(SimpleNamespace(pid=observed.worker.pid), observed.worker.birth_id, runtime, {}, tmp_path / "config.json", relay=True, retained=Retained(observed.worker), owner_epoch="runtime-epoch", custody_scope=str(scope))
+            self._active = handle
+            handle.report_value = self._rpc(handle, {"version": CONTROL_VERSION, "command": "prepare", "preparation": preparation, "config": {}})["report"]
+            return handle
+        def _birth(self, _pid):
+            return observed.worker.birth_id
+        def abort(self, _handle):
+            events.append("cleanup-retained")
+        def control_alive(self, handle):
+            return handle is self._active
+
+    preparer = Preparer(profile=profile, config={}, environment={})
+    inspector = FakeInspector(store, observed)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    threads = [threading.Thread(target=host_loop), threading.Thread(target=host_activation_loop), threading.Thread(target=relay_loop)]
+    for thread in threads:
+        thread.start()
+    def close():
+        launcher._watch_stop.set()
+        for channel in (runtime, activation_peer, host_control):
+            try:
+                channel.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            channel.close()
+        for thread in threads:
+            thread.join(3)
+        for channel in (relay, host_peer, activation):
+            channel.close()
+        assert all(not thread.is_alive() for thread in threads)
+    return launcher, store, profile, scope, events, errors, close
+
+
+def test_identified_relay_activation_records_before_eof_ack_and_enablement(tmp_path):
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path)
+    launcher._start_watcher = lambda: None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        # The host thread appends "final-ack" after send_frame returns, so start() can return first.
+        deadline = time.monotonic() + 5
+        while "final-ack" not in events and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert events == ["grant", "record-visible", "activation-eof", "final-ack"]
+        assert store.load(store.path_for(WORKER_ACTOR).read_text())["actor"] == WORKER_ACTOR
+        assert (scope / "activation-record.json").exists()
+        assert errors == []
+    finally:
+        close()
+
+
+def test_lost_final_relay_activation_ack_retains_record_and_fences_credential(tmp_path):
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path, lose_ack=True)
+    try:
+        with pytest.raises(ConflictError, match="acknowledgement"):
+            launcher.start(profile.profile_id, profile.workspace_uuid)
+        assert (scope / "activation-record.json").exists()
+        assert store.actor_metadata(WORKER_ACTOR) is None
+        assert events[-1] == "cleanup-retained"
+        assert launcher._active_handle is None
+        assert errors == []
+    finally:
+        close()
+
+
+def test_activation_record_exact_replay_and_conflict_without_republishing(tmp_path):
+    import json
+    seen = []
+    def replay(_handle, grant, accept):
+        request = {"version": "astrid.local-worker-activation-request/v1", "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+            "grant": {k: grant[k] for k in ("activation_id", "credential_file", "executor_incarnation", "evidence_digest")}, "host": {"pid": 1001, "birth_id": "birth-1001"}}
+        first = accept(request)
+        second = accept(request)
+        assert second == first
+        changed = {**request, "host": {"pid": 1001, "birth_id": "different"}}
+        with pytest.raises(ConflictError, match="exact grant/host"):
+            accept(changed)
+        seen.append(first)
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path, at_binding=replay)
+    launcher._start_watcher = lambda: None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        assert len(seen) == 1
+        assert json.loads((scope / "activation-record.json").read_text())["receipt"] == seen[0]
+        assert errors == []
+    finally:
+        close()
+
+
+def test_changed_credential_generation_before_activation_request_is_fenced(tmp_path):
+    def rotate(store, _grant):
+        metadata = store.actor_metadata(WORKER_ACTOR)
+        store.provision(WORKER_ACTOR, metadata["scopes"], metadata={k: v for k, v in metadata.items() if k not in {"actor", "scopes"}}, rotate=True, enabled=False)
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path, before_request=rotate)
+    try:
+        with pytest.raises(ConflictError, match="generation changed"):
+            launcher.start(profile.profile_id, profile.workspace_uuid)
+        assert not (scope / "activation-record.json").exists()
+        assert store.actor_metadata(WORKER_ACTOR) is None
+        assert events[-1] == "cleanup-retained"
+    finally:
+        close()
+
+
+def test_restarted_relay_owner_honors_existing_durable_cleanup_fence(tmp_path):
+    import json
+    from test_local_execution_supervisor import _prepare_case
+    profile = replace(_profile(tmp_path, "workspace"), engine_launch=_prepare_case()[0]["profile"]["engine_launch"])
+    profile.support_root.mkdir(parents=True)
+    (profile.support_root / "orderly-handoff-cleanup-uncertain.json").write_text(json.dumps({"version": 1, "state": "cleanup_uncertain"}))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        launcher.start(profile.profile_id, profile.workspace_uuid)
+    assert preparer.events == []
+
+
+def test_handoff_preserves_original_activation_evidence_and_fences_ready(tmp_path):
+    from runtime_protocol.local_worker import _credential_commit_generation
+    from runtime_protocol.local_execution_handoff import FENCE_VERSION, read_protected
+    from runtime_protocol.service import RuntimeService
+    launcher, credentials, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path)
+    launcher._start_watcher = lambda: None
+    service = None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        original = (scope / "activation-record.json").read_bytes()
+        generation = _credential_commit_generation(credentials, WORKER_ACTOR)
+        receipt = credentials.actor_metadata(WORKER_ACTOR)["local_launch_receipt"]
+        root = tmp_path / "fence-realm"; RealmStore.initialize(root)
+        support = tmp_path / "fence-support"; support.mkdir(mode=0o700)
+        service = RuntimeService(root, support_root=support)
+        service.set_local_claim_generation_verifier(lambda f, i: _credential_commit_generation(credentials, WORKER_ACTOR), actor=WORKER_ACTOR)
+        fence = {"version": FENCE_VERSION, "state": "held", "workspace_uuid": service.realm["id"], "executor_incarnation": receipt["executor_incarnation"], "credential_generation_digest": generation,
+                 "operation_id": "op", "handoff_id": "handoff", "intent_digest": "sha256:" + "1" * 64, "source_owner_epoch": "A", "target_owner_epoch": "B", "fence_generation": 1, "release_ack_digest": None}
+        service.hold_local_claim_fence(fence, assert_no_work=lambda: None)
+        with pytest.raises(ConflictError, match="claims are fenced"):
+            service.claim_next({"executor_id": WORKER_ACTOR, "capability_ids": [], "runtime_epoch": service.health()["runtime_epoch"]})
+        assert read_protected(service._local_claim_fence_path()) == fence
+        assert (scope / "activation-record.json").read_bytes() == original
+        assert credentials.actor_metadata(WORKER_ACTOR)["local_launch_receipt"] == receipt
+        assert _credential_commit_generation(credentials, WORKER_ACTOR) == generation
+        assert errors == []
+    finally:
+        if service is not None:
+            service.close()
+        close()
+
+
+def _host_only_fixture(tmp_path, runtime_pid=77):
+    from dataclasses import replace
+    from test_local_worker import host_only_profile_case
+    profile=replace(host_only_profile_case(),realm_root=tmp_path/'realm',support_root=tmp_path/'support')
+    profile.support_root.mkdir(exist_ok=True)
+    host=_process(2001,runtime_pid,profile.host_executable,profile.host_artifact_digest)
+    ref={'version':'runtime.role-custody-reference/v1','scope_root':str(tmp_path/'scope'),'role':'host','generation':1,
+        'target':{'pid':host.pid,'birth_id':host.birth_id,'uid':runtime_platform.current_user(),'audit_token_sha256':_digest('2'),'audit_token_pidversion':3}}
+    observation=LocalWorkerObservation(profile.machine_id,runtime_platform.current_user(),profile.workspace_uuid,profile.realm_root,profile.support_root,
+        None,host,None,None,0,'',profile.session_config_digest,'epoch',str(tmp_path/'scope'),{'host':ref})
+    return profile,observation
+
+
+def test_host_only_transaction_durable_acceptance_precedes_enable(tmp_path):
+    from runtime_protocol.local_worker import RELAY_PREPARATION_VERSION, _digest, _selected_profile_payload
+    profile,observation=_host_only_fixture(tmp_path)
+    store=CredentialStore(tmp_path/'credentials')
+    class HostOnlyPreparer(FakePreparer):
+        def report(self,handle):
+            return {'version':RELAY_PREPARATION_VERSION,'execution_mode':'host_only_cpu','operation_id':self.operation_id,'channel_id':self.channel_id,
+                'processes':{'host':{'pid':observation.host.pid,'birth_id':observation.host.birth_id}},
+                'session_config_digest':profile.session_config_digest,'owner_epoch':observation.owner_epoch,
+                'custody_scope':observation.custody_scope,'custody_capabilities':observation.custody_capabilities,
+                'profile_binding_digest':_digest(_selected_profile_payload(profile))}
+        def bind_activation_acceptor(self,handle,grant,acceptor): self.acceptor=acceptor
+        def activate(self,handle,grant):
+            super().activate(handle,grant)
+            request={'version':'astrid.local-worker-activation-request/v1','operation_id':grant['operation_id'],'channel_id':grant['channel_id'],
+                'grant':{k:grant[k] for k in ('activation_id','credential_file','executor_incarnation','evidence_digest')},
+                'host':{'pid':observation.host.pid,'birth_id':observation.host.birth_id}}
+            receipt=self.acceptor(request)
+            assert receipt=={**request,'version':'runtime.local-worker-activation-recorded/v1'}
+    import json
+    class HostOnlyInspector(FakeInspector):
+        def observe(self,handle):
+            if self.calls >= 5:
+                self.calls += 1; return self.observation
+            return super().observe(handle)
+    preparer=HostOnlyPreparer(store,observation);inspector=HostOnlyInspector(store,observation)
+    launcher=_launcher(store,profile,preparer,inspector,77)
+    launcher._start_watcher=lambda:None
+    result=launcher.start(profile.profile_id,profile.workspace_uuid)
+    metadata=store.actor_metadata(WORKER_ACTOR)
+    assert result['state']=='active' and inspector.calls==5
+    assert metadata['execution_binding']['actual']['kind']=='machine'
+    assert 'engine' not in metadata['local_launch_receipt'] and 'worker' not in metadata['local_launch_receipt']
+    assert launcher._receipt_shape_valid(metadata)
+    record=json.loads((Path(observation.custody_scope)/'activation-record.json').read_text())
+    assert record['executor_incarnation']==metadata['execution_binding']['executor_incarnation']
+    assert store.load(store.path_for(WORKER_ACTOR).read_text())
+    assert launcher.start(profile.profile_id,profile.workspace_uuid)['state']=='reconnected'
+    launcher.finish_shutdown(launcher.begin_shutdown())
+
+
+def test_activation_acceptance_replay_flushes_record_with_writable_handle(tmp_path, monkeypatch):
+    import runtime_protocol.local_worker as worker_module
+    from runtime_protocol.local_worker import RELAY_PREPARATION_VERSION, _digest, _selected_profile_payload
+
+    profile, observation = _host_only_fixture(tmp_path)
+    credentials = CredentialStore(tmp_path / "credentials")
+    replay_flushes = []
+
+    class ReplayPreparer(FakePreparer):
+        def report(self, handle):
+            return {
+                "version": RELAY_PREPARATION_VERSION, "execution_mode": "host_only_cpu",
+                "operation_id": self.operation_id, "channel_id": self.channel_id,
+                "processes": {"host": {"pid": observation.host.pid, "birth_id": observation.host.birth_id}},
+                "session_config_digest": profile.session_config_digest,
+                "owner_epoch": observation.owner_epoch, "custody_scope": observation.custody_scope,
+                "custody_capabilities": observation.custody_capabilities,
+                "profile_binding_digest": _digest(_selected_profile_payload(profile)),
+            }
+
+        def bind_activation_acceptor(self, handle, grant, acceptor):
+            self.acceptor = acceptor
+
+        def activate(self, handle, grant):
+            request = {
+                "version": "astrid.local-worker-activation-request/v1",
+                "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+                "grant": {key: grant[key] for key in (
+                    "activation_id", "credential_file", "executor_incarnation", "evidence_digest",
+                )},
+                "host": {"pid": observation.host.pid, "birth_id": observation.host.birth_id},
+            }
+            recorded = self.acceptor(request)
+            real_fsync = worker_module.os.fsync
+
+            def writable_fsync(fd):
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.write(fd, b"")
+                    replay_flushes.append(fd)
+                return real_fsync(fd)
+
+            with monkeypatch.context() as replay_patch:
+                replay_patch.setattr(worker_module.os, "fsync", writable_fsync)
+                assert self.acceptor(request) == recorded
+
+    class ReplayInspector(FakeInspector):
+        def observe(self, handle):
+            # Both acceptance observations happen before credential enable.
+            if self.calls >= 5:
+                self.calls += 1
+                return self.observation
+            return super().observe(handle)
+
+    preparer = ReplayPreparer(credentials, observation)
+    inspector = ReplayInspector(credentials, observation)
+    launcher = _launcher(credentials, profile, preparer, inspector, 77)
+    launcher._start_watcher = lambda: None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        assert len(replay_flushes) == 1
+        assert inspector.calls == 6
+    finally:
+        launcher.finish_shutdown(launcher.begin_shutdown())
+
+
+@pytest.mark.parametrize('field,value',[('machine_id','other'),('engine_endpoint','http://127.0.0.1:8188'),('session_config_digest','sha256:'+'3'*64)])
+def test_host_only_observation_mismatch_cannot_issue_credential(tmp_path,field,value):
+    from dataclasses import replace
+    profile,observation=_host_only_fixture(tmp_path)
+    store=CredentialStore(tmp_path/'credentials');preparer=FakePreparer(store,observation);inspector=FakeInspector(store,observation)
+    launcher=_launcher(store,profile,preparer,inspector,77)
+    with pytest.raises(ConflictError):
+        launcher._validate_observation(profile,replace(observation,**{field:value}),report=None)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+
+
+@pytest.mark.parametrize("stderr_fails", [False, True])
+def test_start_failure_diagnostic_redacts_values_and_preserves_original_exception(tmp_path, monkeypatch, capsys, stderr_fails):
+    import json
+    import runtime_protocol.local_worker as worker_module
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    secret = "never-publish-exception-message-or-local"
+    original = ValueError(secret)
+    original_handles = []
+
+    class FailedInspector(FakeInspector):
+        def observe(self, handle):
+            original_handles.append(handle)
+            private_value = secret
+            assert private_value
+            raise original
+
+    if stderr_fails:
+        class FailedStderr:
+            def write(self, value):
+                raise OSError("private stderr unavailable")
+        monkeypatch.setattr(worker_module.sys, "stderr", FailedStderr())
+    launcher = _launcher(store, profile, preparer, FailedInspector(store, observed), 77)
+    with pytest.raises(ValueError) as caught:
+        launcher.start(profile.profile_id, profile.workspace_uuid)
+    assert caught.value is original
+    assert preparer.aborted is True and store.actor_metadata(WORKER_ACTOR) is None
+    assert launcher._cleanup_handles == original_handles and len(original_handles) == 1
+    if not stderr_fails:
+        output = capsys.readouterr().err
+        assert secret not in output and str(tmp_path) not in output and str(Path(__file__).parent) not in output
+        record = json.loads(output)
+        assert set(record) == {"event", "exception_type", "frames"}
+        assert record["event"] == "local_worker_start_failed" and record["exception_type"] == "ValueError"
+        assert 1 <= len(record["frames"]) <= 16
+        assert record["frames"][-1]["function"] == "observe"
+        assert all(set(frame) == {"file", "function", "line"} and '/' not in frame['file'] and isinstance(frame['line'], int) for frame in record["frames"])

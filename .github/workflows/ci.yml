@@ -1,0 +1,148 @@
+# Default run per push (testing plan UR.5); the second-client boundary test as its own job.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-realm-publication:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pip install -e packages/python
+      - name: Verify Windows update backup daemon from a selected venv
+        run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
+      - name: Verify native realm creation, ownership, and rollback
+        run: >-
+          python -m pytest -q
+          tests/test_realm_creation_publication.py
+          tests/test_realm_replacement_publication.py
+          tests/test_platform_windows.py::test_windows_directory_mutex_uses_global_user_scoped_identity
+          tests/test_m1_review.py
+      - name: Verify native Windows signal and foreground cleanup paths
+        run: >-
+          python -m pytest -q -m ""
+          tests/test_platform_signaling.py
+          tests/test_runtime_cli_serve_cleanup.py
+          tests/test_service_stop.py
+      - name: Verify Runtime service cleanup receipt contract
+        run: >-
+          python -m pytest -q
+          tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env
+          tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved
+          tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
+          tests/test_profile_services.py::test_pack_host_cleanup_receipt_refuses_corrupt_history_without_overwriting
+          tests/test_profile_services.py::test_shutdown_retry_publishes_pack_host_cleanup_receipt
+          'tests/test_profile_services.py::test_invalid_declaration_is_refused[document18]'
+          'tests/test_profile_services.py::test_invalid_declaration_is_refused[document19]'
+
+  unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system media tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        shell: bash
+      - name: Install system media tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q -n 2
+
+  darwin-native:
+    # The darwin_native lane is deselected by default and skipped off macOS; this
+    # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: brew install ffmpeg
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q -m darwin_native
+
+  typescript-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+        working-directory: packages/typescript
+      - run: npm test
+        working-directory: packages/typescript
+
+  boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q tests/test_second_client_e2e.py -m ""
+
+  sandbox-process-control:
+    # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
+    # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/seccomp/run-suite.sh
+
+  portability-lifecycle:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pip install -e packages/python
+      - run: >-
+          python -m pytest -q -m ""
+          tests/test_platform.py
+          tests/test_platform_signaling.py
+          tests/test_platform_windows.py
+          tests/test_windows_worker_handoff.py
+          tests/test_platform_filesystem.py
+          tests/test_dirfd_windows.py
+          tests/test_windows_filesystem_native.py
+          tests/test_runtime_upgrade.py
+          tests/test_runtime_compact.py
+          tests/test_relocation_plan.py
+          tests/test_local_worker_placement.py::test_activation_acceptance_replay_flushes_record_with_writable_handle
+          tests/test_profile_services.py
+          tests/test_service_stop.py
+          tests/test_m1_review.py
+          tests/test_windows_runtime_sweep.py
+          tests/test_foreground.py
+          tests/test_native_custody.py
+          tests/test_portable_lifecycle.py

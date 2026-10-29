@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/document.json",
+  "title": "Versioned project document",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["document_id", "project_id", "kind", "content", "version", "created_at", "updated_at"],
+  "properties": {
+    "document_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "kind": { "type": "string", "minLength": 1 },
+    "content": {},
+    "version": { "type": "integer", "minimum": 1 },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "media.transcript" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "document_id": { "type": "string", "pattern": "^transcript:[0-9a-f]{64}$" },
+          "content": { "$ref": "#/$defs/MediaTranscript" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "document_id": { "pattern": "^transcript:" } },
+        "required": ["document_id"]
+      },
+      "then": {
+        "properties": { "kind": { "const": "media.transcript" } }
+      }
+    }
+  ],
+  "$defs": {
+    "MediaTranscript": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "media_id", "source_id", "segments"],
+      "properties": {
+        "schema": { "const": "media.transcript/v1" },
+        "media_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "segments": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/TranscriptSegment" }
+        }
+      }
+    },
+    "TranscriptSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "start", "end", "text"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "start": { "type": "number", "minimum": 0, "maximum": 1000000000 },
+        "end": { "type": "number", "minimum": 0, "maximum": 1000000000 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "speaker": { "type": ["string", "null"], "maxLength": 256 },
+        "words": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TranscriptWord" }
+        }
+      }
+    },
+    "TranscriptWord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "start", "end", "text"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "start": { "type": "number", "minimum": 0, "maximum": 1000000000 },
+        "end": { "type": "number", "minimum": 0, "maximum": 1000000000 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 16384 }
+      }
+    }
+  }
+}

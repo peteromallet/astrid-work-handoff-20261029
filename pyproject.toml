@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astrid-runtime"
+version = "0.1.0"
+description = "Independent neutral local workspace runtime and bootstrap"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-timeout>=2.4", "pytest-xdist>=3", "jsonschema>=4", "PyYAML>=6", "setuptools>=70.1"]
+
+[project.scripts]
+astrid-runtime-protocol = "runtime_protocol.cli:main"
+astrid-runtime = "astrid_runtime.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["tests", "packages/python"]
+testpaths = ["tests"]
+addopts = "-ra -m 'not integration and not darwin_native and not live'"
+# Hang guard only (testing plan UR.4): durations never fail a run; a test that
+# has not finished in ten minutes is hung.
+timeout = 600
+
+[tool.setuptools.packages.find]
+include = ["runtime_protocol*", "astrid_runtime*"]
+exclude = ["build*", "tests*"]
